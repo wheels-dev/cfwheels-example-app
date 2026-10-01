@@ -14,6 +14,16 @@ component extends="app.models.Model"
 		validatesPresenceOf(properties="email,password");
 		validatesFormatOf(property="email", allowBlank=true, type="email");
 		authenticateThis(required=false);
+		beforeValidation("mirrorPasswordConfirmation");
+	}
+
+	// The login form has no "confirm password" field, but authenticateThis() registers
+	// validatesConfirmationOf("password"), which since Wheels 2.3 fails when the
+	// confirmation property is missing. Mirror the password so that check passes.
+	private function mirrorPasswordConfirmation(){
+		if(structKeyExists(this, "password")){
+			this.passwordConfirmation = this.password;
+		}
 	}
 
 	// Authenticates
