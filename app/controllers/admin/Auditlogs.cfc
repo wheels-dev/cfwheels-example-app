@@ -28,8 +28,10 @@ component extends="app.controllers.Controller" {
 		local.from 	= CreateDateTime(year(params.from), month(params.from), day(params.from), 0, 0, 0);
 		local.to 	= CreateDateTime(year(params.to), month(params.to), day(params.to), 23, 59, 59);
 
-		arrayAppend(local.where, "createdAt >= '#local.from#'");
-		arrayAppend(local.where, "createdAt < '#local.to#'");
+		// Format the bounds explicitly: interpolating a date object yields {ts '...'},
+		// whose inner quotes break the WHERE literal (Wheels 4.1.2 rejects it).
+		arrayAppend(local.where, "createdAt >= '#DateTimeFormat(local.from, "yyyy-mm-dd HH:nn:ss")#'");
+		arrayAppend(local.where, "createdAt < '#DateTimeFormat(local.to, "yyyy-mm-dd HH:nn:ss")#'");
 
 		if(len(params.type)){
 			arrayAppend(local.where, "type = '#params.type#'");
