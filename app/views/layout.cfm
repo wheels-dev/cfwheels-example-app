@@ -13,7 +13,7 @@
           CSS
           Include Bootstrap 4 and Font Awesome via CDN
         Yes, I could technically put these all in a stylesheetLinkTag, but I think this is slightly more readable
-          Also include custom.css from /stylesheets/
+          Also include custom.css from /stylesheets/ (public/stylesheets/)
     --->
     <link rel="stylesheet" type="text/css" href="https://stackpath.bootstrapcdn.com/bootstrap/4.1.1/css/bootstrap.min.css" />
     <link rel="stylesheet" type="text/css" href="https://use.fontawesome.com/releases/v5.0.13/css/all.css" />
@@ -58,7 +58,7 @@
   Javascript
   Include jQuery and Bootstrap JS, moment js & daterangepicker from CDN
   Yes, I could technically put these all in a javascriptIncludeTag, but I think this is slightly more readable
-  Also include custom.js from /javascripts/
+  Also include custom.js from /javascripts/ (public/javascripts/)
 --->
 <script type="text/javascript" src="https://cdn.jsdelivr.net/jquery/latest/jquery.min.js"></script>
 <script type="text/javascript" src="https://stackpath.bootstrapcdn.com/bootstrap/4.1.1/js/bootstrap.min.js"></script>
@@ -70,7 +70,7 @@
   Additional JS Set in view files
   Sometimes for development it's a load easier to just have a cfsavecontent block of javascript in the same file as
   the form/page you're dealing with. As JS is loaded *after* the template, we're delaying it's execution to after
-  jQuery etc is loaded. See /views/admin/auditlogs/_filter.cfm as an example of using this.
+  jQuery etc is loaded. See /app/views/admin/auditlogs/_filter.cfm as an example of using this.
 --->
 <cfif structKeyExists(request, "js")>
     <cfloop collection="#request.js#" item="i">

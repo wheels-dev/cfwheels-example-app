@@ -8,10 +8,10 @@ if (StructKeyExists(server, "lucee")) {
 	include "logging.cfm";
 	include "utils.cfm";
 } else {
-	// TODO: Check this doesn't break when in a subdir?
-	include "/global/install.cfm";
-	include "/global/auth.cfm";
-	include "/global/logging.cfm";
-	include "/global/utils.cfm";
+	// Root-relative includes resolve through the /app mapping in public/Application.cfc
+	include "/app/global/install.cfm";
+	include "/app/global/auth.cfm";
+	include "/app/global/logging.cfm";
+	include "/app/global/utils.cfm";
 }
 </cfscript>

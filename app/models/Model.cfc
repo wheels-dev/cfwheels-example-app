@@ -48,7 +48,7 @@ component extends="wheels.Model" {
 	 * Attempt to work out which model is calling a function
 	 */
 	private function getCallingModelName() {
-		return replace(getMetaData(this)['fullname'], "wheels....models.", "", "all");
+		return reReplaceNoCase(getMetaData(this)["fullname"], "^.*models\.", "");
 	}
 
 }
