@@ -2,7 +2,7 @@ component extends="Model"
 {
 	function config() {
 		// Associations
-		hasMany(name="rolepermissions", jointype="left");
+		hasMany(name="rolepermissions", joinType="outer");
 		hasMany(name="userpermissions");
 		nestedProperties(associations="rolepermissions,userpermissions", allowDelete=true);
 
