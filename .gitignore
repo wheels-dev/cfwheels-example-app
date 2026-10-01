@@ -15,3 +15,8 @@ cfwheels.*.zip
 settings.json
 .vscode
 /plugins/**/
+
+# Environment files (contain secrets)
+.env
+.env.*
+!.env.example

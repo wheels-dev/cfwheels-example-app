@@ -14,9 +14,10 @@
 		To run with rewriting set to "on", you need to apply the necessary rewrite rules on the web server first.
 	*/
 
-	// Reload your application with ?reload=true&password=changeme
-	// Obviously, change this.
-	set(reloadPassword="changeme");
+	// Reload your application with ?reload=true&password=<your WHEELS_RELOAD_PASSWORD>
+	// The secret comes from .env (git-ignored) or the OS environment. An empty value
+	// disables URL reloads entirely: Wheels 4 fails closed rather than allowing them.
+	set(reloadPassword=env("WHEELS_RELOAD_PASSWORD", ""));
 
 	// Your Apps datasource name
 	set(dataSourceName="exampleApp");
