@@ -31,12 +31,10 @@
         }
     ],
     "dependencies":{
-        "wheels-core":"4.1.2",
-        "cfwheels-authenticateThis":"^1.0.1"
+        "wheels-core":"4.1.2"
     },
     "installPaths":{
-        "wheels-core":"vendor/wheels/",
-        "cfwheels-authenticateThis":"plugins/authenticateThis"
+        "wheels-core":"vendor/wheels/"
     },
     "scripts":{
         "postVersion":"package set location='cfwheels/cfwheels-example-app#v`package version`'",

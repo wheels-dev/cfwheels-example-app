@@ -29,9 +29,15 @@ component extends="Model" {
 		beforeValidation("sanitize,setIgnoreLogProperties");
 		beforeUpdate("setPasswordLastChanged");
 
-		// Authenticate This Plugin
-		// Handles passwordHash and passwordConfirmations
-		authenticateThis();
+		// Password handling: formerly the authenticateThis plugin, now app code on the
+		// framework's bcryptHash()/bcryptVerify() helpers (Wheels 4.1).
+		validatesPresenceOf(property="password", when="onCreate");
+		validatesPresenceOf(property="password", when="onUpdate", condition="StructKeyExists(this, 'updatePassword')");
+		validatesFormatOf(
+			property="password", regEx="^.*(?=.{8,})(?=.*\d)(?=.*[a-z]).*$", allowBlank=true,
+			message="Password must be at least 8 characters long and contain a mixture of numbers and letters");
+		validatesConfirmationOf(property="password");
+		beforeValidation("hashPassword");
 
 	}
 
@@ -106,6 +112,50 @@ component extends="Model" {
 	function setPasswordLastChanged(){
 		if(structKeyExists(this, "passwordHash") && this.hasChanged("passwordHash"))
 			this.passwordResetAt = now();
+	}
+
+	/**
+	* Hashes a plaintext `password` into `passwordHash` (bcrypt, cost 12, as the plugin used).
+	* Runs before validation whenever a password has been set.
+	**/
+	function hashPassword() {
+		if(structKeyExists(this, "password"))
+			this.passwordHash = bcryptHash(this.password, 12);
+	}
+
+	/**
+	* Checks a plaintext password against the stored hash. bcryptVerify() compares in
+	* constant time and accepts the existing $2a$ hashes the plugin's BCrypt.class wrote.
+	**/
+	boolean function checkPassword(required string password) {
+		return bcryptVerify(arguments.password, this.passwordHash);
+	}
+
+	/**
+	* Sets a random temporary password and flags that it must be changed on next login.
+	* Saves without validation (the caller hashes it afterwards, see admin.Users.reset()).
+	**/
+	boolean function resetPassword() {
+		this.password = generateRandomPassword();
+		this.passwordChangeRequired = true;
+		return this.update(validate=false);
+	}
+
+	/**
+	* Generates a 12 character random password with at least one lowercase letter,
+	* one uppercase letter and one number.
+	**/
+	string function generateRandomPassword() {
+		local.charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+		local.result = [
+			Mid(local.charset, RandRange(1, 26, "SHA1PRNG"), 1),
+			Mid(local.charset, RandRange(27, 52, "SHA1PRNG"), 1),
+			Mid(local.charset, RandRange(53, 62, "SHA1PRNG"), 1)
+		];
+		for(local.i = 1; local.i <= 9; local.i++)
+			ArrayAppend(local.result, Mid(local.charset, RandRange(1, 62, "SHA1PRNG"), 1));
+		CreateObject("java", "java.util.Collections").shuffle(local.result);
+		return ArrayToList(local.result, "");
 	}
 
 	/**
