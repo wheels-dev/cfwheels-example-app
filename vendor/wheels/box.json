@@ -1,11 +1,38 @@
 {
-    "devDependencies":{
-        "testbox":"^6.2.1+400"
+    "name":"Wheels Core",
+    "version":"4.1.2",
+    "author":"Wheels Core Team and Community",
+    "shortDescription":"Wheels Framework Core Directory",
+    "location":"ForgeboxStorage",
+    "slug":"wheels-core",
+    "directory":"vendor",
+    "createPackageDirectory":true,
+    "packageDirectory":"wheels",
+    "homepage":"https://wheels.dev/",
+    "documentation":"https://wheels.dev/docs",
+    "changelog":"https://github.com/wheels-dev/wheels/blob/main/CHANGELOG.md",
+    "bugs":"https://github.com/wheels-dev/wheels/issues",
+		"contributors":[
+			"Peter Amiri <peter@alurium.com>"
+		],
+    "repository":{
+        "type":"git",
+        "URL":"https://github.com/wheels-dev/wheels"
     },
-    "installPaths":{
-        "testbox":"testbox"
-    },
-    "testbox":{
-        "runner":"/tests/runner.cfm"
-    }
+    "keywords":[
+        "mvc",
+        "rails",
+        "wheels",
+        "wheels.dev",
+        "core"
+    ],
+    "ignore":[],
+    "type":"mvc",
+    "private":false,
+    "license":[
+        {
+            "type":"Apache License 2.0",
+            "URL":"https://github.com/wheels-dev/wheels/blob/main/LICENSE"
+        }
+    ]
 }

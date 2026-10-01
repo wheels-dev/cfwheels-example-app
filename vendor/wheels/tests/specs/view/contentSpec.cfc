@@ -1,0 +1,150 @@
+component extends="wheels.WheelsTest" {
+
+	function run() {
+
+		g = application.wo
+
+		describe("Tests that includePartial", () => {
+
+			beforeEach(() => {
+				params = {controller = "test", action = "test"}
+				_controller = g.controller("test", params)
+			})
+
+			it("is including partial", () => {
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(partial = "partialTemplate"))
+				}
+
+				expect(result).toInclude("partial template content")
+			})
+
+			it("is including partial loading data", () => {
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(partial = "partialDataImplicitPrivate"))
+				}
+
+				expect(result).toBe("Apple,Banana,Kiwi")
+			})
+
+			it("is including partial loading data allowed from explicit public method", () => {
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(partial = "partialDataExplicitPublic", dataFunction = "partialDataExplicitPublic"))
+				}
+
+				expect(result).toBe("Apple,Banana,Kiwi")
+			})
+
+			it("is including partial loading data allowed from explicit public method with arg", () => {
+				savecontent variable="result" {
+					WriteOutput(
+						_controller.includePartial(
+							partial = "partialDataExplicitPublic",
+							dataFunction = "partialDataExplicitPublic",
+							passThrough = 1
+						)
+					)
+				}
+
+				expect(result).toBe("Apple,Banana,Kiwi,passThroughWorked")
+			})
+
+			it("is not allowing partial loading data to be included from implicit public method", () => {
+				result = ""
+				try {
+					savecontent variable="result" {
+						WriteOutput(_controller.includePartial(partial = "partialDataImplicitPublic"))
+					}
+				} catch (any e) {
+					result = e
+				}
+
+				expect(issimplevalue(result)).toBeFalse()
+				// Engines classify undefined-variable errors under different cfcatch.type values, so assert
+				// the missing key name (proof the implicit data function was NOT invoked) instead of the type.
+				expect(result.message).toInclude("fruit")
+			})
+
+			it("is including partial with query", () => {
+				usersQuery = g.model("user").findAll(order = "firstName")
+				request.partialTests.currentTotal = 0
+				request.partialTests.thirdUserName = ""
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(query = usersQuery, partial = "user"))
+				}
+
+				expect(request.partialTests.currentTotal).toBe(15)
+				expect(request.partialTests.thirdUserName).toBe("Per")
+			})
+
+			it("is including partial with special query argument", () => {
+				usersQuery = g.model("user").findAll(order = "firstName")
+				request.partialTests.currentTotal = 0
+				request.partialTests.thirdUserName = ""
+				request.partialTests.noQueryArg = true
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(partial = "custom", query = usersQuery))
+				}
+
+				expect(request.partialTests.noQueryArg).toBeTrue()
+				expect(request.partialTests.currentTotal).toBe(15)
+				expect(request.partialTests.thirdUserName).toBe("Per")
+			})
+
+			it("is including partial with query grouped by a column", () => {
+				groupQuery = QueryNew(
+					"dept,name",
+					"varchar,varchar",
+					[{dept: "a", name: "x"}, {dept: "a", name: "y"}, {dept: "b", name: "z"}]
+				)
+				savecontent variable="result" {
+					// Partial name stays lowercase on purpose: $generateIncludeTemplatePath
+					// LCase()s the whole resolved path, so a camelCase view filename is
+					// unreachable on a case-sensitive filesystem. Adobe enforces that;
+					// Lucee and BoxLang resolve the mismatch anyway, which is why the
+					// original `groupRow` / `_groupRow.cfm` pair only failed on the two
+					// Adobe legs of the matrix. Pinned by ViewFileNamingGuardSpec.
+					WriteOutput(_controller.includePartial(partial = "grouprow", query = groupQuery, group = "dept"))
+				}
+
+				expect(REReplace(result, "\s", "", "all")).toBe("a:2;b:1;")
+			})
+
+			it("is including partial with normal query argument", () => {
+				usersQuery = g.model("user").findAll(order = "firstName");
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(partial = "custom", customQuery = usersQuery));
+				}
+
+				expect(Trim(result)).toBe("Per")
+			})
+
+			it("is including partial with special objects argument", () => {
+				usersArray = g.model("user").findAll(order = "firstName", returnAs = "objects")
+				request.partialTests.currentTotal = 0
+				request.partialTests.thirdUserName = ""
+				request.partialTests.thirdObjectExists = false
+				request.partialTests.noObjectsArg = true
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(partial = "custom", objects = usersArray))
+				}
+
+				expect(request.partialTests.thirdObjectExists).toBeTrue()
+				expect(request.partialTests.noObjectsArg).toBeTrue()
+				expect(request.partialTests.currentTotal).toBe(15)
+				expect(request.partialTests.thirdUserName).toBe("Per")
+			})
+
+			it("is including partial with object", () => {
+				userObject = g.model("user").findOne(order = "firstName")
+				request.wheelsTests.objectTestsPassed = false
+				savecontent variable="result" {
+					WriteOutput(_controller.includePartial(userObject))
+				}
+
+				expect(request.wheelsTests.objectTestsPassed).toBeTrue()
+				expect(trim(result)).toBe("Chris")
+			})
+		})
+	}
+}

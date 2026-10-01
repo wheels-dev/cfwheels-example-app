@@ -72,6 +72,7 @@ component extends="wheels.migrator.Base"{
 	public string function addColumnOptions(required string sql, struct options = "#StructNew()#") {
 		if (StructKeyExists(arguments.options, 'type') && arguments.options.type != 'primaryKey') {
 			if (StructKeyExists(arguments.options, 'default') && optionsIncludeDefault(argumentCollection = arguments.options)) {
+				$rejectEmptyStringDefault(arguments.options);
 				if (
 					arguments.options.default eq "NULL"
 					|| (
@@ -82,8 +83,6 @@ component extends="wheels.migrator.Base"{
 					arguments.sql = arguments.sql & " DEFAULT NULL";
 				} else if (arguments.options.type == 'boolean') {
 					arguments.sql = arguments.sql & " DEFAULT #IIf(arguments.options.default, 1, 0)#";
-				} else if (arguments.options.type == 'string' && arguments.options.default eq "") {
-					arguments.sql = arguments.sql;
 				} else {
 					arguments.sql = arguments.sql & " DEFAULT #quote(value = arguments.options.default, options = arguments.options)#";
 				}
@@ -97,14 +96,35 @@ component extends="wheels.migrator.Base"{
 			}
 		}
 		if (StructKeyExists(arguments.options, "afterColumn") And Len(Trim(arguments.options.afterColumn)) GT 0) {
-			arguments.sql = arguments.sql & " AFTER #arguments.options.afterColumn#";
+			arguments.sql = arguments.sql & " AFTER " & quoteColumnName(arguments.options.afterColumn);
 		}
 		return arguments.sql;
 	}
 
 	// what's the purpose of this?
-	public boolean function optionsIncludeDefault(string type, string default = "", boolean allowNull = true) {
+	public boolean function optionsIncludeDefault(string type, default = "", boolean allowNull = true) {
 		return true;
+	}
+
+	/**
+	 * Fail-loud contract for `default=""` on string-like columns. Abstract
+	 * used to omit the DEFAULT clause; PostgreSQL used to emit `DEFAULT ''`.
+	 * Both now throw `Wheels.InvalidDefault` so the adapters cannot silently
+	 * diverge.
+	 */
+	public void function $rejectEmptyStringDefault(required struct options) {
+		if (
+			StructKeyExists(arguments.options, "default")
+			&& arguments.options.default eq ""
+			&& StructKeyExists(arguments.options, "type")
+			&& ListFindNoCase("string,text,char", arguments.options.type)
+		) {
+			Throw(
+				type = "Wheels.InvalidDefault",
+				message = "An empty string default is not allowed for #arguments.options.type# columns.",
+				extendedInfo = "Omit the default, pass a non-empty value, or use default='NULL'. Abstract used to omit the DEFAULT clause and PostgreSQL used to emit DEFAULT ''."
+			);
+		}
 	}
 
 	/**
@@ -116,13 +136,13 @@ component extends="wheels.migrator.Base"{
 		}
 		if (
 			StructKeyExists(arguments.options, 'type') && ListFindNoCase(
-				"binary,date,datetime,time,timestamp",
+				"binary,char,date,datetime,time,timestamp,text,string",
 				arguments.options.type
 			)
 		) {
-			arguments.value = "'#arguments.value#'";
-		} else if (StructKeyExists(arguments.options, 'type') && ListFindNoCase("text,string", arguments.options.type)) {
-			arguments.value = "'#ReplaceNoCase(arguments.value, "'", "''")#'";
+			// Escape every embedded single quote (not just the first) so the
+			// generated DDL stays balanced for values like "O'Brien's".
+			arguments.value = "'#Replace(arguments.value, "'", "''", "all")#'";
 		}
 		return arguments.value;
 	}
@@ -250,6 +270,24 @@ component extends="wheels.migrator.Base"{
 	}
 
 	/**
+	 * Inline CREATE TABLE foreign-key fragment. Quotes identifiers through
+	 * the adapter so reserved/mixed-case names stay valid.
+	 */
+	public string function addForeignKeyOptions(required string sql, struct options = {}) {
+		if (StructKeyExists(arguments.options, "column")) {
+			arguments.sql = arguments.sql & " FOREIGN KEY (" & quoteColumnName(arguments.options.column) & ")";
+		}
+		if (
+			StructKeyExists(arguments.options, "referenceTable")
+			&& StructKeyExists(arguments.options, "referenceColumn")
+		) {
+			arguments.sql = arguments.sql & " REFERENCES " & quoteTableName(arguments.options.referenceTable);
+			arguments.sql = arguments.sql & " (" & quoteColumnName(arguments.options.referenceColumn) & ")";
+		}
+		return arguments.sql;
+	}
+
+	/**
 	 * generates sql for foreign key constraint
 	 */
 	public string function foreignKeySQL(
@@ -261,23 +299,35 @@ component extends="wheels.migrator.Base"{
 		string onUpdate = "",
 		string onDelete = ""
 	) {
-		local.sql = "CONSTRAINT #quoteTableName(arguments.name)# FOREIGN KEY (#quoteColumnName(arguments.column)#) REFERENCES #objectCase(arguments.referenceTable)#(#quoteColumnName(arguments.referenceColumn)#)";
+		local.sql = "CONSTRAINT #quoteTableName(arguments.name)# FOREIGN KEY (#quoteColumnName(arguments.column)#) REFERENCES #quoteTableName(arguments.referenceTable)#(#quoteColumnName(arguments.referenceColumn)#)";
 		for (local.item in ListToArray("onUpdate,onDelete")) {
 			if (Len(arguments[local.item])) {
-				switch (arguments[local.item]) {
-					case "none":
-						local.sql = local.sql & " " & UCase(humanize(local.item)) & " NO ACTION";
-						break;
-					case "null":
-						local.sql = local.sql & " " & UCase(humanize(local.item)) & " SET NULL";
-						break;
-					default:
-						local.sql = local.sql & " " & UCase(humanize(local.item)) & " CASCADE";
-						break;
-				}
+				local.sql = local.sql & $referentialActionSQL(item = local.item, action = arguments[local.item]);
 			}
 		}
 		return local.sql;
+	}
+
+	/**
+	 * Maps a known onUpdate/onDelete value. Unknown values throw instead of
+	 * silently becoming CASCADE.
+	 */
+	public string function $referentialActionSQL(required string item, required string action) {
+		switch (arguments.action) {
+			case "none":
+				return " " & UCase(humanize(arguments.item)) & " NO ACTION";
+			case "null":
+				return " " & UCase(humanize(arguments.item)) & " SET NULL";
+			case "cascade":
+			case "true":
+				return " " & UCase(humanize(arguments.item)) & " CASCADE";
+			default:
+				Throw(
+					type = "Wheels.InvalidReferentialAction",
+					message = "The referential action `#arguments.action#` is not supported.",
+					extendedInfo = "Use none, null, cascade, or true. Unknown onUpdate/onDelete values used to silently become CASCADE."
+				);
+		}
 	}
 
 	/**

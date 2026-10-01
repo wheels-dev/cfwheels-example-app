@@ -1,83 +1,58 @@
 component extends="wheels.databaseAdapters.Base" output=false {
 
+	variables.mssqlTypeMap = {
+		"bigint": "cf_sql_bigint",
+		"binary": "cf_sql_binary",
+		"geography": "cf_sql_binary",
+		"geometry": "cf_sql_binary",
+		"timestamp": "cf_sql_binary",
+		"bit": "cf_sql_bit",
+		"char": "cf_sql_char",
+		"nchar": "cf_sql_char",
+		"uniqueidentifier": "cf_sql_char",
+		"date": "cf_sql_date",
+		"datetime": "cf_sql_timestamp",
+		"datetime2": "cf_sql_timestamp",
+		"smalldatetime": "cf_sql_timestamp",
+		"datetimeoffset": "cf_sql_timestamp",
+		"decimal": "cf_sql_decimal",
+		"money": "cf_sql_decimal",
+		"smallmoney": "cf_sql_decimal",
+		"float": "cf_sql_float",
+		"int": "cf_sql_integer",
+		"image": "cf_sql_longvarbinary",
+		"text": "cf_sql_longvarchar",
+		"ntext": "cf_sql_longvarchar",
+		"xml": "cf_sql_longvarchar",
+		"numeric": "cf_sql_numeric",
+		"real": "cf_sql_real",
+		"smallint": "cf_sql_smallint",
+		"time": "cf_sql_time",
+		"tinyint": "cf_sql_tinyint",
+		"varbinary": "cf_sql_varbinary",
+		"varchar": "cf_sql_varchar",
+		"nvarchar": "cf_sql_varchar",
+		"hierarchyid": "cf_sql_varchar",
+		"cursor": "cf_sql_refcursor"
+	};
+
 	/**
 	 * Map database types to the ones used in CFML.
 	 */
 	public string function $getType(required string type, string scale, string details) {
-		switch (arguments.type) {
-			case "bigint":
-				local.rv = "cf_sql_bigint";
-				break;
-			case "binary":
-			case "geography":
-			case "geometry":
-			case "timestamp":
-				local.rv = "cf_sql_binary";
-				break;
-			case "bit":
-				local.rv = "cf_sql_bit";
-				break;
-			case "char":
-			case "nchar":
-			case "uniqueidentifier":
-				local.rv = "cf_sql_char";
-				break;
-			case "date":
-				local.rv = "cf_sql_date";
-				break;
-			case "datetime":
-			case "datetime2":
-			case "smalldatetime":
-			case "datetimeoffset":
-				local.rv = "cf_sql_timestamp";
-				break;
-			case "decimal":
-			case "money":
-			case "smallmoney":
-				local.rv = "cf_sql_decimal";
-				break;
-			case "float":
-				local.rv = "cf_sql_float";
-				break;
-			case "int":
-				local.rv = "cf_sql_integer";
-				break;
-			case "image":
-				local.rv = "cf_sql_longvarbinary";
-				break;
-			case "text":
-			case "ntext":
-			case "xml":
-				local.rv = "cf_sql_longvarchar";
-				break;
-			case "numeric":
-				local.rv = "cf_sql_numeric";
-				break;
-			case "real":
-				local.rv = "cf_sql_real";
-				break;
-			case "smallint":
-				local.rv = "cf_sql_smallint";
-				break;
-			case "time":
-				local.rv = "cf_sql_time";
-				break;
-			case "tinyint":
-				local.rv = "cf_sql_tinyint";
-				break;
-			case "varbinary":
-				local.rv = "cf_sql_varbinary";
-				break;
-			case "varchar":
-			case "nvarchar":
-			case "hierarchyid":
-				local.rv = "cf_sql_varchar";
-				break;
-			case "cursor":
-				local.rv = "cf_sql_refcursor";
-				break;
+		local.key = LCase(arguments.type);
+		if (StructKeyExists(variables.mssqlTypeMap, local.key)) {
+			return variables.mssqlTypeMap[local.key];
 		}
-		return local.rv;
+		$throwUnknownColumnType(arguments.type);
+	}
+
+	/**
+	 * The nested TOP queries in $querySetup() return the last `limit` rows rather than the requested
+	 * window when limit + offset exceeds the matching rows, so callers must clamp the limit first.
+	 */
+	public boolean function $offsetNeedsRowCount() {
+		return true;
 	}
 
 	/**
@@ -90,6 +65,33 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		required boolean parameterize,
 		string $primaryKey = ""
 	) {
+		// An INSERT that supplies its own primary-key value may need IDENTITY_INSERT
+		// (#3647). This runs before the BoxLang branch below on purpose: a wrapped
+		// statement no longer starts with INSERT INTO, so no SCOPE_IDENTITY() is
+		// appended — correctly, since the caller already has the key.
+		if (
+			Len(Trim(arguments.$primaryKey))
+			&& IsSimpleValue(arguments.sql[1])
+			&& Left(arguments.sql[1], 11) == "INSERT INTO"
+		) {
+			arguments.sql = $identityInsertSQL(sql = arguments.sql, primaryKey = arguments.$primaryKey);
+		}
+
+		// Same-batch identity retrieval for engines whose query result carries no
+		// driver-supplied generated key (currently BoxLang). SCOPE_IDENTITY() is
+		// batch-scoped, so it must ride in the INSERT's own batch; Base.$executeQuery
+		// passes the resulting resultset to $identitySelect as returningIdentity
+		// (the same plumbing the CockroachDB adapter uses for RETURNING). Bulk paths
+		// pass no primary-key hint and are skipped.
+		if (
+			$isBoxLangEngine()
+			&& Len(Trim(arguments.$primaryKey))
+			&& IsSimpleValue(arguments.sql[1])
+			&& Left(arguments.sql[1], 11) == "INSERT INTO"
+		) {
+			ArrayAppend(arguments.sql, ";SELECT SCOPE_IDENTITY() AS lastId");
+		}
+
 		if (StructKeyExists(arguments, "maxrows") && arguments.maxrows > 0) {
 			if (arguments.maxrows > 0) {
 				arguments.sql[1] = ReplaceNoCase(arguments.sql[1], "SELECT ", "SELECT TOP #arguments.maxrows# ", "one");
@@ -137,10 +139,15 @@ component extends="wheels.databaseAdapters.Base" output=false {
 			local.firstSelect = $columnAlias(list = $tableName(list = local.thirdSelect, action = "remove"), action = "keep");
 
 			// We need to add columns from the inner order clause to the select clauses in the inner two queries.
+			// Strip identifier quotes once up front (and keep the stripped list in sync with appends below)
+			// instead of re-stripping the whole select list on every loop iteration.
+			local.thirdSelectStripped = $stripIdentifierQuotes(local.thirdSelect);
 			local.iEnd = ListLen(local.thirdOrder);
 			for (local.i = 1; local.i <= local.iEnd; local.i++) {
 				local.item = ReReplace(ReReplace(ListGetAt(local.thirdOrder, local.i), " ASC\b", ""), " DESC\b", "");
-				if (!ListFindNoCase(local.thirdSelect, local.item)) {
+				// Strip identifier quotes for comparison since SELECT may have different quoting than ORDER BY
+				local.itemStripped = $stripIdentifierQuotes(local.item);
+				if (!ListFindNoCase(local.thirdSelectStripped, local.itemStripped) && !ListFindNoCase(local.thirdSelect, local.item)) {
 					// The test "order_clause_with_paginated_include_and_ambiguous_columns" passes in a complex order (CASE WHEN registration IN ('foo') THEN 0 ELSE 1 END DESC).
 					// This gets moved up to the SELECT clause to support pagination.
 					// However, we need to add "AS" to it otherwise we get a "No column name was specified" error.
@@ -150,6 +157,7 @@ component extends="wheels.databaseAdapters.Base" output=false {
 					}
 
 					local.thirdSelect = ListAppend(local.thirdSelect, local.item);
+					local.thirdSelectStripped = ListAppend(local.thirdSelectStripped, $stripIdentifierQuotes(local.item));
 				}
 				if (local.containsGroup) {
 					local.item = ReReplace(local.item, "[[:space:]]AS[[:space:]][A-Za-z1-9]+", "", "all");
@@ -187,7 +195,7 @@ component extends="wheels.databaseAdapters.Base" output=false {
 			if (local.containsGroup) {
 				local.afterWhere = "GROUP BY " & local.thirdGroup & " ";
 			}
-			local.afterWhere = "ORDER BY " & local.thirdOrder & ") AS tmp1 ORDER BY " & local.secondOrder & ") AS tmp2 ORDER BY " & local.firstOrder;
+			local.afterWhere &= "ORDER BY " & local.thirdOrder & ") AS tmp1 ORDER BY " & local.secondOrder & ") AS tmp2 ORDER BY " & local.firstOrder;
 			ArrayDeleteAt(arguments.sql, 1);
 			ArrayDeleteAt(arguments.sql, 1);
 			ArrayDeleteAt(arguments.sql, ArrayLen(arguments.sql));
@@ -209,6 +217,110 @@ component extends="wheels.databaseAdapters.Base" output=false {
 	}
 
 	/**
+	 * SQL Server rejects an explicit value for an IDENTITY column unless
+	 * IDENTITY_INSERT is ON for the table, so `create(id = 41, ...)` failed here while
+	 * every other supported database accepts it (#3647). This wraps an INSERT whose
+	 * column list includes a primary-key column (the caller supplied that value) in the
+	 * ON/OFF pair. Three rules shape the wrapper:
+	 *
+	 * - One batch. IDENTITY_INSERT is session-scoped, so the ON, the INSERT and the OFF
+	 *   must share a connection; a single statement guarantees that whether or not the
+	 *   caller opened a transaction.
+	 * - Guarded by the catalog. The ON/OFF only runs when one of those key columns is
+	 *   in sys.identity_columns. A natural or UUID key has no identity property, and
+	 *   SET IDENTITY_INSERT on such a table is an error.
+	 * - No TRY/CATCH. The OFF must run even when the INSERT fails: with inlined values
+	 *   (parameterize=false) the batch runs as-is and the setting outlives it, so the
+	 *   pooled connection's next insert into the table would fail. A constraint
+	 *   violation only ends its own statement, so the trailing OFF still runs.
+	 *   Re-raising from a CATCH block (THROW) does not work: Lucee drops an error raised
+	 *   after a batch's first result, so a duplicate key came back as success.
+	 *
+	 * Returns the SQL array unchanged when no primary-key column is supplied.
+	 *
+	 * @sql The INSERT statement as a `$querySetup()` SQL array.
+	 * @primaryKey The table's primary-key column name(s).
+	 */
+	public array function $identityInsertSQL(required array sql, required string primaryKey) {
+		// Parse the INSERT's column list from the fragment strings only (the values are
+		// param structs), the same parse $identitySelect uses.
+		local.text = "";
+		for (local.part in arguments.sql) {
+			if (IsSimpleValue(local.part)) {
+				local.text &= local.part;
+			}
+		}
+		local.insertColumns = $parseInsertColumnList(local.text);
+
+		local.names = "";
+		for (local.key in ListToArray(arguments.primaryKey)) {
+			local.column = $stripIdentifierQuotes(Trim(local.key));
+			if (ListFindNoCase(local.insertColumns, local.column)) {
+				local.names = ListAppend(local.names, "N'" & Replace(local.column, "'", "''", "all") & "'");
+			}
+		}
+		if (!Len(local.names)) {
+			return arguments.sql;
+		}
+
+		// "INSERT INTO [table] (" -> "[table]"
+		local.table = Trim(SpanExcluding(Mid(arguments.sql[1], 12, Len(arguments.sql[1])), "("));
+		local.tableLiteral = Replace(local.table, "'", "''", "all");
+
+		ArrayPrepend(
+			arguments.sql,
+			"DECLARE @wheelsIdentityInsert bit = CASE WHEN EXISTS (SELECT 1 FROM sys.identity_columns"
+			& " WHERE object_id = OBJECT_ID(N'" & local.tableLiteral & "') AND name IN (" & local.names & "))"
+			& " THEN 1 ELSE 0 END; IF @wheelsIdentityInsert = 1 SET IDENTITY_INSERT " & local.table & " ON;"
+		);
+		ArrayAppend(arguments.sql, "; IF @wheelsIdentityInsert = 1 SET IDENTITY_INSERT " & local.table & " OFF;");
+		return arguments.sql;
+	}
+
+	/**
+	 * Acquire a SQL Server application lock using sp_getapplock.
+	 * The lock is scoped to the current session.
+	 */
+	public void function $acquireAdvisoryLock(required string name, numeric timeout = 10) {
+		queryExecute(
+			"EXEC sp_getapplock @Resource = ?, @LockMode = 'Exclusive', @LockTimeout = ?",
+			[arguments.name, arguments.timeout * 1000],
+			{datasource: variables.dataSource, username: variables.username, password: variables.password}
+		);
+	}
+
+	/**
+	 * Release a SQL Server application lock.
+	 */
+	public void function $releaseAdvisoryLock(required string name) {
+		queryExecute(
+			"EXEC sp_releaseapplock @Resource = ?",
+			[arguments.name],
+			{datasource: variables.dataSource, username: variables.username, password: variables.password}
+		);
+	}
+
+	/**
+	 * SQL Server's sp_getapplock requires an active user transaction; calling
+	 * `withAdvisoryLock` outside one raises "The statement or function must be
+	 * executed in the context of a user transaction." Until the locking path
+	 * grows an implicit transaction wrapper, report as unsupported so the test
+	 * suite (and any capability-aware callers) skip rather than error.
+	 */
+	public boolean function $supportsAdvisoryLocks() {
+		return false;
+	}
+
+	/**
+	 * SQL Server uses table hints (WITH (UPDLOCK)) instead of trailing FOR UPDATE.
+	 * Table hints require modifying the FROM clause which is too complex for initial implementation.
+	 * Returns empty string to no-op.
+	 */
+	public string function $forUpdateClause() {
+		return "";
+	}
+
+	/**
 	 * Override Base adapter's function.
 	 */
 	public string function $generatedKey() {
@@ -216,39 +328,39 @@ component extends="wheels.databaseAdapters.Base" output=false {
 	}
 
 	/**
-	 * Override Base adapter's function.
+	 * Override Base adapter's $identitySelect hook.
 	 */
-	public any function $identitySelect(
+	public any function $lastIdLookup(
 		required struct queryAttributes,
 		required struct result,
-		required string primaryKey
+		required string primaryKey,
+		any returningIdentity = "",
+		required string insertSql
 	) {
-		var query = {};
-		local.sql = Trim(arguments.result.sql);
-		if (Left(local.sql, 11) == "INSERT INTO" && !StructKeyExists(arguments.result, $generatedKey())) {
-			local.startPar = Find("(", local.sql) + 1;
-			local.endPar = Find(")", local.sql);
-			local.columnList = ReplaceList(
-				Mid(local.sql, local.startPar, (local.endPar - local.startPar)),
-				"#Chr(10)#,#Chr(13)#, ",
-				",,"
-			);
-			if (!ListFindNoCase(local.columnList, ListFirst(arguments.primaryKey))) {
-				local.rv = {};
-				
-				// Use @@IDENTITY instead of SCOPE_IDENTITY() for BoxLang compatibility
-				// SCOPE_IDENTITY() returns empty values in BoxLang with SQL Server
-				query = $query(sql = "SELECT @@IDENTITY AS lastId", argumentCollection = arguments.queryAttributes);
-				
-				// Fallback to SCOPE_IDENTITY() if @@IDENTITY fails (for other CFML engines)
-				if (!len(query.lastId)) {
-					query = $query(sql = "SELECT SCOPE_IDENTITY() AS lastId", argumentCollection = arguments.queryAttributes);
-				}
-				
-				local.rv[$generatedKey()] = query.lastId;
-				return local.rv;
-			}
+		// Prefer the driver-supplied generated key: mssql-jdbc retrieves it in the
+		// insert's own batch, so it is both scope-safe and trigger-safe — a trigger
+		// that inserts into another identity table cannot leak its key in here.
+		// StructKeyExists is case-insensitive, so Lucee's lowercase `generatedkey`
+		// result key matches. ListFirst because multi-row inserts can return a list.
+		if (StructKeyExists(arguments.result, "generatedKey") && Len(arguments.result.generatedKey)) {
+			return ListFirst(arguments.result.generatedKey);
 		}
+
+		// Same-batch retrieval: when the engine surfaces no driver key, $querySetup
+		// appended `;SELECT SCOPE_IDENTITY() AS lastId` to the INSERT's own batch
+		// (SCOPE_IDENTITY() is batch-scoped, so it must ride along — a standalone
+		// `SELECT SCOPE_IDENTITY()` executes in its own scope and returns NULL).
+		// Base.$executeQuery pipes the batch's resultset in here as returningIdentity.
+		if (
+			IsQuery(arguments.returningIdentity)
+			&& arguments.returningIdentity.recordCount
+			&& ListFindNoCase(arguments.returningIdentity.columnList, "lastId")
+			&& Len(arguments.returningIdentity.lastId[1])
+		) {
+			return arguments.returningIdentity.lastId[1];
+		}
+
+		$throwIdentityNotFound();
 	}
 
 	/**
@@ -258,5 +370,84 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		return "NEWID()";
 	}
 
+	/**
+	 * Override Base adapter's function.
+	 * SQL Server uses square brackets to quote identifiers.
+	 */
+	public string function $quoteIdentifier(required string name) {
+		return "[#arguments.name#]";
+	}
+
+	/**
+	 * SQL Server upsert using MERGE statement syntax.
+	 */
+	public array function $upsertSQL(
+		required string tableName,
+		required array columns,
+		required array uniqueBy,
+		required array updateColumns,
+		required array validProperties,
+		required array records,
+		required numeric batchStart,
+		required numeric batchEnd,
+		required struct propertyInfo
+	) {
+		local.sql = [];
+
+		// Build column list for SELECT.
+		local.colList = "";
+		local.selectCols = "";
+		for (local.c = 1; local.c <= ArrayLen(arguments.columns); local.c++) {
+			if (Len(local.colList)) {
+				local.colList &= ", ";
+				local.selectCols &= ", ";
+			}
+			local.colList &= $quoteIdentifier(arguments.columns[local.c]);
+			local.selectCols &= "source." & $quoteIdentifier(arguments.columns[local.c]);
+		}
+
+		// MERGE INTO target USING (VALUES rows) AS source(cols) ON match
+		ArrayAppend(local.sql, "MERGE INTO #arguments.tableName# WITH (HOLDLOCK) AS target USING (VALUES ");
+
+		// Build value rows.
+		for (local.r = arguments.batchStart; local.r <= arguments.batchEnd; local.r++) {
+			if (local.r > arguments.batchStart) {
+				ArrayAppend(local.sql, ", ");
+			}
+			ArrayAppend(local.sql, "(");
+			for (local.p = 1; local.p <= ArrayLen(arguments.validProperties); local.p++) {
+				if (local.p > 1) ArrayAppend(local.sql, ", ");
+				local.propName = arguments.validProperties[local.p];
+				local.val = StructKeyExists(arguments.records[local.r], local.propName) ? arguments.records[local.r][local.propName] : "";
+				ArrayAppend(local.sql, $buildBulkParam(value=local.val, propName=local.propName, propertyInfo=arguments.propertyInfo));
+			}
+			ArrayAppend(local.sql, ")");
+		}
+
+		ArrayAppend(local.sql, ") AS source (#local.colList#) ON ");
+
+		// ON clause.
+		local.onClause = "";
+		for (local.u in arguments.uniqueBy) {
+			if (Len(local.onClause)) local.onClause &= " AND ";
+			local.onClause &= "target." & $quoteIdentifier(local.u) & " = source." & $quoteIdentifier(local.u);
+		}
+		ArrayAppend(local.sql, local.onClause);
+
+		// WHEN MATCHED THEN UPDATE.
+		if (ArrayLen(arguments.updateColumns)) {
+			local.setClause = "";
+			for (local.uc in arguments.updateColumns) {
+				if (Len(local.setClause)) local.setClause &= ", ";
+				local.setClause &= "target." & $quoteIdentifier(local.uc) & " = source." & $quoteIdentifier(local.uc);
+			}
+			ArrayAppend(local.sql, " WHEN MATCHED THEN UPDATE SET #local.setClause#");
+		}
+
+		// WHEN NOT MATCHED THEN INSERT.
+		ArrayAppend(local.sql, " WHEN NOT MATCHED THEN INSERT (#local.colList#) VALUES (#local.selectCols#);");
+
+		return local.sql;
+	}
 
 }

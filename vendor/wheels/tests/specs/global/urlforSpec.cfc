@@ -1,0 +1,329 @@
+component extends="wheels.WheelsTest" {
+
+	function run() {
+
+		g = application.wo
+
+		describe("Tests that URLFor", () => {
+
+			beforeEach(() => {
+				config = {path = "wheels", fileName = "Mapper", method = "$init"}
+				_params = {controller = "test", action = "index"}
+				_originalRoutes = Duplicate(application.wheels.routes)
+				_originalStaticRoutes = StructKeyExists(application.wheels, "staticRoutes") ? StructCopy(application.wheels.staticRoutes) : {}
+				_originalNamedRoutePositions = StructKeyExists(application.wheels, "namedRoutePositions") ? StructCopy(application.wheels.namedRoutePositions) : {}
+				_originalUrlRewriting = application.wheels.URLRewriting
+				_originalObfuscateUrls = application.wheels.obfuscateUrls
+			})
+
+			afterEach(() => {
+				application.wheels.routes = _originalRoutes
+				application.wheels.staticRoutes = _originalStaticRoutes
+				application.wheels.namedRoutePositions = _originalNamedRoutePositions
+				application.wheels.URLRewriting = _originalUrlRewriting
+				application.wheels.obfuscateUrls = _originalObfuscateUrls
+			})
+
+			it("issue 455", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.$match(name = "user_2", pattern = "user/[user_id]/[controller]/[action]")
+					.end()
+				g.$setNamedRoutePositions()
+				application.wheels.URLRewriting = "Off"
+				application.wheels.obfuscateUrls = true
+				r = g.urlFor(route = "user_2", user_id = "5559", controller = "SurveyTemplates", action = "index")
+
+				expect(r).toInclude("b24dae")
+			})
+
+			it("properly hyphenates the links", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.$match(name = "user_2", pattern = "user/[user_id]/[controller]/[action]")
+					.end()
+				g.$setNamedRoutePositions()
+				application.wheels.URLRewriting = "On"
+				e = "/user/5559/survey-templates/index"
+				r = g.urlFor(route = "user_2", user_id = "5559", controller = "SurveyTemplates", action = "index")
+				
+				expect(r).toInclude(e)
+			})
+
+			it("properly adds route with format", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.$match(name = "user_2", pattern = "user/[user_id]/[controller]/[action].[format]")
+					.end()
+				g.$setNamedRoutePositions()
+				application.wheels.URLRewriting = "On"
+				e = "/user/5559/survey-templates/index.csv"
+				r = g.urlFor(route = "user_2", user_id = "5559", controller = "SurveyTemplates", action = "index", format = "csv")
+
+				expect(r).toInclude(e)
+			})
+
+			it("correctly detects https using onlypath", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.$match(name = "user_2", pattern = "user/[user_id]/[controller]/[action].[format]")
+					.end()
+				g.$setNamedRoutePositions()
+				request.cgi.server_protocol = ""
+				request.cgi.server_port_secure = 1
+				r = g.urlFor(
+					route = "user_2",
+					user_id = "5559",
+					controller = "SurveyTemplates",
+					action = "index",
+					format = "csv",
+					onlyPath = false
+				)
+
+				expect(left(r,5)).toBe("https")
+			})
+
+			it("issue 1046 no route argument", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.wildcard(mapKey = true)
+					.end()
+				g.$setNamedRoutePositions()
+				r1 = g.urlFor(controller = "Example")
+				r2 = g.urlFor(controller = "Example", action = "MyAction")
+				r3 = g.urlFor(controller = "Example", action = "MyAction", key = 123)
+
+				if (application.wheels.URLRewriting eq 'On') {
+					expect(r1).toBe("/example/index")
+					expect(r2).toBe("/example/my-action")
+					expect(r3).toBe("/example/my-action/123")
+				} else if (application.wheels.URLRewriting eq 'Off') {
+					expect(r1).toBe("/index.cfm?controller=example&action=index")
+					expect(r2).toBe("/index.cfm?controller=example&action=my-action")
+					expect(r3).toBe("/index.cfm?controller=example&action=my-action&key=123")
+				} else {
+					expect(r1).toBe("/index.cfm/example/index")
+					expect(r2).toBe("/index.cfm/example/my-action")
+					expect(r3).toBe("/index.cfm/example/my-action/123")
+				}
+
+			})
+
+			it("encodes URL parameters with special characters when encode=true", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.wildcard(mapKey = true)
+					.end()
+				g.$setNamedRoutePositions()
+				
+				// Test with special characters in parameters
+				htmlParam = "<strong>bold</strong>"
+				ampParam = "first&second"
+				quotesParam = 'quotes"in"param'
+				
+				// Test with encode=true
+				r1 = g.urlFor(controller = "example", action = "show", key = htmlParam, encode = true)
+				r2 = g.urlFor(controller = "example", action = "show", key = ampParam, encode = true)
+				r3 = g.urlFor(controller = "example", action = "show", key = quotesParam, encode = true)
+				
+				// Expected encoded results
+				if (application.wheels.URLRewriting eq 'On') {
+					expect(r1).toBe("/example/show/%3Cstrong%3Ebold%3C%2Fstrong%3E")
+					expect(r2).toBe("/example/show/first%26second")
+					expect(r3).toBe("/example/show/quotes%22in%22param")
+				} else if (application.wheels.URLRewriting eq 'Off') {
+					expect(r1).toBe("/index.cfm?controller=example&action=show&key=%3Cstrong%3Ebold%3C%2Fstrong%3E")
+					expect(r2).toBe("/index.cfm?controller=example&action=show&key=first%26second")
+					expect(r3).toBe("/index.cfm?controller=example&action=show&key=quotes%22in%22param")
+				} else {
+					expect(r1).toBe("/index.cfm/example/show/%3Cstrong%3Ebold%3C%2Fstrong%3E")
+					expect(r2).toBe("/index.cfm/example/show/first%26second")
+					expect(r3).toBe("/index.cfm/example/show/quotes%22in%22param")
+				}
+			})
+			
+			it("does not encode URL parameters with special characters when encode=false", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.wildcard(mapKey = true)
+					.end()
+				g.$setNamedRoutePositions()
+
+				// Test with special characters in parameters
+				htmlParam = "<strong>bold</strong>"
+				ampParam = "first&second"
+				quotesParam = 'quotes"in"param'
+
+				// Test with encode=false
+				r1 = g.urlFor(controller = "example", action = "show", key = htmlParam, encode = false)
+				r2 = g.urlFor(controller = "example", action = "show", key = ampParam, encode = false)
+				r3 = g.urlFor(controller = "example", action = "show", key = quotesParam, encode = false)
+
+				// Expected unencoded results
+				if (application.wheels.URLRewriting eq 'On') {
+					expect(r1).toBe("/example/show/<strong>bold</strong>")
+					expect(r2).toBe("/example/show/first&second")
+					expect(r3).toBe('/example/show/quotes"in"param')
+				} else if (application.wheels.URLRewriting eq 'Off') {
+					expect(r1).toBe("/index.cfm?controller=example&action=show&key=<strong>bold</strong>")
+					expect(r2).toBe("/index.cfm?controller=example&action=show&key=first&second")
+					expect(r3).toBe('/index.cfm?controller=example&action=show&key=quotes"in"param')
+				} else {
+					expect(r1).toBe("/index.cfm/example/show/<strong>bold</strong>")
+					expect(r2).toBe("/index.cfm/example/show/first&second")
+					expect(r3).toBe('/index.cfm/example/show/quotes"in"param')
+				}
+			})
+
+			it("encodes a custom route variable exactly once when URL rewriting is off", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.get(name = "encodeOnceBlog", pattern = "blogs/[slug]", to = "blogs##show")
+					.end()
+				g.$setNamedRoutePositions()
+				application.wheels.URLRewriting = "Off"
+
+				// The route pattern is replaced by the `?controller=...` query string, so `slug` is appended
+				// as a query parameter. A space must become `+`, not the double-encoded `%2B`.
+				r1 = g.urlFor(route = "encodeOnceBlog", slug = "a b")
+				r2 = g.urlFor(route = "encodeOnceBlog", slug = "first&second")
+				r3 = g.urlFor(route = "encodeOnceBlog", slug = "x=y")
+
+				expect(r1).toBe("/index.cfm?controller=blogs&action=show&slug=a+b")
+				expect(r2).toBe("/index.cfm?controller=blogs&action=show&slug=first%26second")
+				expect(r3).toBe("/index.cfm?controller=blogs&action=show&slug=x%3Dy")
+			})
+
+			it("HTML-encodes a custom route variable exactly once when URL rewriting is off", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.get(name = "encodeOnceBlog", pattern = "blogs/[slug]", to = "blogs##show")
+					.end()
+				g.$setNamedRoutePositions()
+				application.wheels.URLRewriting = "Off"
+
+				r = g.urlFor(route = "encodeOnceBlog", slug = "a b", $encodeForHtmlAttribute = true)
+
+				expect(r).toBe("/index.cfm?controller=blogs&action=show&slug=" & EncodeForHTMLAttribute("a+b"))
+			})
+
+			it("encodes a custom route variable once when URL rewriting is partial", () => {
+				mapper = $mapper()
+				mapper
+					.$draw()
+					.get(name = "encodeOnceBlog", pattern = "blogs/[slug]", to = "blogs##show")
+					.end()
+				g.$setNamedRoutePositions()
+				application.wheels.URLRewriting = "Partial"
+
+				r = g.urlFor(route = "encodeOnceBlog", slug = "a b")
+
+				expect(r).toInclude("/blogs/a+b")
+				expect(r).notToInclude("%2B")
+			})
+
+			describe("controller/action route lookup cache (issue 2955)", () => {
+
+				beforeEach(() => {
+					_originalUrlForCache = StructKeyExists(application.wheels, "urlForCache") ? StructCopy(application.wheels.urlForCache) : {}
+				})
+
+				afterEach(() => {
+					if (StructKeyExists(application.wheels, "urlForCache")) {
+						StructClear(application.wheels.urlForCache)
+						StructAppend(application.wheels.urlForCache, _originalUrlForCache)
+					}
+				})
+
+				it("memo lives in application scope so it survives across requests", () => {
+					mapper = $mapper()
+					mapper
+						.$draw()
+						.get(name = "hit_cache", pattern = "hit-cache", to = "hits##show")
+						.end()
+					g.$setNamedRoutePositions()
+
+					expect(StructKeyExists(application.wheels, "urlForCache")).toBeTrue()
+					initialKeys = StructCount(application.wheels.urlForCache)
+
+					g.urlFor(controller = "hits", action = "show")
+
+					expect(StructCount(application.wheels.urlForCache)).toBeGT(initialKeys)
+				})
+
+				it("negative-caches misses so wildcard-only apps don't re-scan", () => {
+					mapper = $mapper()
+					mapper
+						.$draw()
+						.wildcard(mapKey = true)
+						.end()
+					g.$setNamedRoutePositions()
+
+					g.urlFor(controller = "noSuchController", action = "noSuchAction")
+
+					missKey = ""
+					for (cacheKey in application.wheels.urlForCache) {
+						if (cacheKey contains "noSuchController" && cacheKey contains "noSuchAction") {
+							missKey = cacheKey
+							break
+						}
+					}
+
+					expect(missKey).notToBe("")
+					expect(application.wheels.urlForCache[missKey]).toBe("")
+				})
+
+				it("invalidates the cache when a new route is added via the mapper", () => {
+					mapper = $mapper()
+					mapper
+						.$draw()
+						.get(name = "before", pattern = "before", to = "first##show")
+						.end()
+					g.$setNamedRoutePositions()
+					g.urlFor(controller = "first", action = "show")
+
+					expect(StructCount(application.wheels.urlForCache)).toBeGT(0)
+
+					mapper2 = $mapper()
+					mapper2
+						.$draw()
+						.get(name = "after", pattern = "after", to = "second##show")
+						.end()
+
+					expect(StructCount(application.wheels.urlForCache)).toBe(0)
+				})
+
+				it("invalidates the cache when routes are reloaded via $lockedLoadRoutes", () => {
+					if (!StructKeyExists(application.wheels, "urlForCache")) {
+						application.wheels.urlForCache = {}
+					}
+					application.wheels.urlForCache["stale##entry"] = "stale_route_name"
+
+					g.$lockedLoadRoutes()
+
+					expect(StructKeyExists(application.wheels.urlForCache, "stale##entry")).toBeFalse()
+				})
+			})
+		})
+	}
+
+	public struct function $mapper() {
+		local.args = Duplicate(config)
+		StructAppend(local.args, arguments, true)
+		return g.$createObjectFromRoot(argumentCollection = local.args)
+	}
+
+	public void function $clearRoutes() {
+		application.wheels.routes = []
+		application.wheels.staticRoutes = {}
+	}
+}

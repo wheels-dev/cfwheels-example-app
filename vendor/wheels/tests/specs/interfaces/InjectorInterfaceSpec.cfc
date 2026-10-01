@@ -1,0 +1,139 @@
+/**
+ * InjectorInterface contract specs. S6 skip-missing is proven here and
+ * again under tests/specs/injector so --filter=injector also covers it.
+ */
+component extends="wheels.WheelsTest" {
+
+	function run() {
+
+		describe("Injector Interface Contracts", () => {
+
+			describe("InjectorInterface", () => {
+
+				beforeEach(() => {
+					di = new wheels.Injector(binderPath="wheels.tests._assets.di.TestBindings");
+				});
+
+				it("exposes all required DI methods", () => {
+					var methods = [
+						"init", "map", "mapInstance", "to", "bind",
+						"getInstance", "containsInstance", "asSingleton",
+						"asRequestScoped", "getMappings", "isSingleton",
+						"isRequestScoped"
+					];
+					for (var m in methods) {
+						expect(structKeyExists(di, m)).toBeTrue("Injector missing: #m#()");
+					}
+				});
+
+				it("getInstance has correct parameter names", () => {
+					var meta = getMetaData(di.getInstance);
+					var paramNames = [];
+					for (var p in meta.parameters) {
+						arrayAppend(paramNames, p.name);
+					}
+					expect(arrayFindNoCase(paramNames, "name") > 0).toBeTrue("Missing: name");
+					expect(arrayFindNoCase(paramNames, "initArguments") > 0).toBeTrue("Missing: initArguments");
+				});
+
+			});
+
+			describe("DI Binding Resolution", () => {
+
+				it("interface bindings are registered in wheels.Bindings", () => {
+					// Create a fresh Injector with the default Bindings to verify
+					// all interface bindings are present (avoids relying on
+					// application.wheelsdi which may be reset during test lifecycle).
+					var di = new wheels.Injector(binderPath="wheels.Bindings");
+					var bindings = [
+						"ModelFinderInterface",
+						"ModelPersistenceInterface",
+						"ModelValidationInterface",
+						"ModelErrorInterface",
+						"ModelCallbackInterface",
+						"ModelAssociationInterface",
+						"ModelPropertyInterface",
+						"ControllerFilterInterface",
+						"ControllerRenderingInterface",
+						"ControllerFlashInterface",
+						"ViewFormInterface",
+						"ViewLinkInterface",
+						"ViewContentInterface",
+						"RouteMapperInterface",
+						"RouteResolverInterface",
+						"EventHandlerInterface"
+					];
+					for (var name in bindings) {
+						expect(di.containsInstance(name)).toBeTrue(
+							"Missing DI binding: #name#"
+						);
+					}
+				});
+
+				it("does not register a dead InjectorInterface binding", () => {
+					// The live container self-registers at application.wheelsdi.
+					// A path binding for InjectorInterface could never resolve
+					// (init() requires a binderPath no auto-wire mapping supplies)
+					// and, if it ever did, would clobber the live container.
+					var di = new wheels.Injector(binderPath="wheels.Bindings");
+					expect(di.containsInstance("InjectorInterface")).toBeFalse();
+				});
+
+				it("S6: resolve-all skips names that are not mapped", () => {
+					var di = new wheels.Injector(binderPath="wheels.Bindings");
+					var names = [
+						"ModelFinderInterface",
+						"InjectorInterfaceHardenerMissingKey"
+					];
+					var result = {resolved = 0, skipped = 0};
+					for (var name in names) {
+						if (di.containsInstance(name)) {
+							di.getInstance(name);
+							result.resolved = result.resolved + 1;
+						} else {
+							result.skipped = result.skipped + 1;
+						}
+					}
+					expect(result.resolved).toBe(1);
+					expect(result.skipped).toBe(1);
+					expect(di.containsInstance("InjectorInterfaceHardenerMissingKey")).toBeFalse();
+				});
+
+				it("all interface bindings resolve to real components", () => {
+					// This test catches broken bindings (e.g., pointing to non-existent CFCs)
+					// by actually instantiating each bound component, not just checking the mapping.
+					var di = new wheels.Injector(binderPath="wheels.Bindings");
+					var bindings = [
+						"ModelFinderInterface",
+						"ModelPersistenceInterface",
+						"ModelValidationInterface",
+						"ModelErrorInterface",
+						"ModelCallbackInterface",
+						"ModelAssociationInterface",
+						"ModelPropertyInterface",
+						"ControllerFilterInterface",
+						"ControllerRenderingInterface",
+						"ControllerFlashInterface",
+						"ViewFormInterface",
+						"ViewLinkInterface",
+						"ViewContentInterface",
+						"RouteMapperInterface",
+						"RouteResolverInterface",
+						"EventHandlerInterface"
+					];
+					for (var name in bindings) {
+						if (di.containsInstance(name)) {
+							expect(function() {
+								di.getInstance(name);
+							}).notToThrow("getInstance('#name#') should resolve without error");
+						}
+					}
+				});
+
+			});
+
+		});
+
+	}
+
+}

@@ -1,0 +1,673 @@
+/**
+ * A chainable query builder for Wheels models.
+ * Provides a fluent API alternative to the traditional `findAll(where="...")` string approach.
+ *
+ * Usage:
+ *   model("User")
+ *       .where("status", "active")
+ *       .where("age", ">", 18)
+ *       .orderBy("name", "ASC")
+ *       .limit(25)
+ *       .get();
+ *
+ * The 2- and 3-argument `where()` / `orWhere()` forms quote values through the
+ * model's database adapter. The single-argument form is a raw-SQL passthrough
+ * for trusted clauses only — it is not parameterized. Prefer the 2-/3-arg forms
+ * for user input. The builder ultimately delegates to the model's standard
+ * finder methods (findAll, findOne, etc.).
+ */
+component output="false" {
+
+	/**
+	 * Initialize the query builder with a reference to the model.
+	 *
+	 * @modelReference The model class instance to build queries for.
+	 * @scopeSpecs Optional array of scope specification structs to merge in.
+	 */
+	public any function init(required any modelReference, array scopeSpecs = []) {
+		variables.modelReference = arguments.modelReference;
+		variables.scopeSpecs = arguments.scopeSpecs;
+		variables.whereClauses = [];
+		variables.orderClauses = [];
+		variables.selectClause = "";
+		variables.includeClause = "";
+		variables.limitValue = -1;
+		variables.offsetValue = 0;
+		variables.distinctValue = false;
+		variables.groupClause = "";
+		variables.forUpdateValue = false;
+		// Set on whereIn(empty); terminals short-circuit before the WHERE parser sees a column-less clause.
+		variables.$alwaysEmpty = false;
+		return this;
+	}
+
+	/**
+	 * Add a WHERE condition. Supports multiple calling conventions:
+	 *   .where("status", "active")           -> status = 'active'
+	 *   .where("age", ">", 18)               -> age > 18
+	 *   .where("status = 'active'")           -> status = 'active' (raw string passthrough)
+	 *
+	 * @property The property name, or a raw WHERE string if only one argument is provided.
+	 * @operatorOrValue The operator (if 3 args) or the value (if 2 args).
+	 * @value The value to compare against (when using 3-argument form).
+	 */
+	public any function where() {
+		if (StructCount(arguments) == 1) {
+			// Raw WHERE string: .where("status = 'active'")
+			ArrayAppend(variables.whereClauses, {type = "AND", clause = arguments[1]});
+		} else if (StructCount(arguments) == 2) {
+			// Property + value: .where("status", "active") -> status = 'active'
+			local.clause = $buildCondition(arguments[1], "=", arguments[2]);
+			ArrayAppend(variables.whereClauses, {type = "AND", clause = local.clause});
+		} else if (StructCount(arguments) == 3) {
+			// Property + operator + value: .where("age", ">", 18) -> age > 18
+			local.clause = $buildCondition(arguments[1], arguments[2], arguments[3]);
+			ArrayAppend(variables.whereClauses, {type = "AND", clause = local.clause});
+		}
+		return this;
+	}
+
+	/**
+	 * Add an OR WHERE condition. Same calling conventions as where().
+	 */
+	public any function orWhere() {
+		if (StructCount(arguments) == 1) {
+			ArrayAppend(variables.whereClauses, {type = "OR", clause = arguments[1]});
+		} else if (StructCount(arguments) == 2) {
+			local.clause = $buildCondition(arguments[1], "=", arguments[2]);
+			ArrayAppend(variables.whereClauses, {type = "OR", clause = local.clause});
+		} else if (StructCount(arguments) == 3) {
+			local.clause = $buildCondition(arguments[1], arguments[2], arguments[3]);
+			ArrayAppend(variables.whereClauses, {type = "OR", clause = local.clause});
+		}
+		return this;
+	}
+
+	/**
+	 * Add a WHERE IS NULL condition.
+	 *
+	 * @property The property name to check for NULL.
+	 */
+	public any function whereNull(required string property) {
+		$validatePropertyName(arguments.property);
+		ArrayAppend(variables.whereClauses, {type = "AND", clause = "#arguments.property# IS NULL"});
+		return this;
+	}
+
+	/**
+	 * Add a WHERE IS NOT NULL condition.
+	 *
+	 * @property The property name to check for NOT NULL.
+	 */
+	public any function whereNotNull(required string property) {
+		$validatePropertyName(arguments.property);
+		ArrayAppend(variables.whereClauses, {type = "AND", clause = "#arguments.property# IS NOT NULL"});
+		return this;
+	}
+
+	/**
+	 * Add a WHERE BETWEEN condition.
+	 *
+	 * @property The property name to check.
+	 * @low The lower bound value.
+	 * @high The upper bound value.
+	 */
+	public any function whereBetween(required string property, required any low, required any high) {
+		$validatePropertyName(arguments.property);
+		// A grouped >= / <= pair, so each bound gets the same handling as a
+		// where() comparison, typed by the column.
+		local.lowCondition = $buildCondition(arguments.property, ">=", arguments.low);
+		local.highCondition = $buildCondition(arguments.property, "<=", arguments.high);
+		ArrayAppend(variables.whereClauses, {type = "AND", clause = "(#local.lowCondition# AND #local.highCondition#)"});
+		return this;
+	}
+
+	/**
+	 * Add a WHERE IN condition.
+	 *
+	 * @property The property name to check.
+	 * @values A list or array of values to match against.
+	 */
+	public any function whereIn(required string property, required any values) {
+		$validatePropertyName(arguments.property);
+		// Empty IN -> no rows (Rails/Sequel/Django/Eloquent). Flag, not raw SQL: a "1 = 0" literal trips Wheels' WHERE parser as property "1".
+		local.valueArray = IsArray(arguments.values) ? arguments.values : ListToArray(arguments.values);
+		if (!ArrayLen(local.valueArray)) {
+			variables.$alwaysEmpty = true;
+			return this;
+		}
+		local.valueList = $quoteValueList(arguments.property, arguments.values);
+		ArrayAppend(variables.whereClauses, {type = "AND", clause = "#arguments.property# IN (#local.valueList#)"});
+		return this;
+	}
+
+	/**
+	 * Add a WHERE NOT IN condition.
+	 *
+	 * @property The property name to check.
+	 * @values A list or array of values to exclude.
+	 */
+	public any function whereNotIn(required string property, required any values) {
+		$validatePropertyName(arguments.property);
+		// Empty NOT IN -> "exclude none" = every row, so this call becomes a no-op (no clause appended).
+		local.valueArray = IsArray(arguments.values) ? arguments.values : ListToArray(arguments.values);
+		if (!ArrayLen(local.valueArray)) {
+			return this;
+		}
+		local.valueList = $quoteValueList(arguments.property, arguments.values);
+		ArrayAppend(variables.whereClauses, {type = "AND", clause = "#arguments.property# NOT IN (#local.valueList#)"});
+		return this;
+	}
+
+	/**
+	 * Add an ORDER BY clause.
+	 *
+	 * @property The property name to order by.
+	 * @direction The sort direction: "ASC" or "DESC". Defaults to "ASC".
+	 */
+	public any function orderBy(required string property, string direction = "ASC") {
+		$validatePropertyName(arguments.property);
+		$validateDirection(arguments.direction);
+		ArrayAppend(variables.orderClauses, "#arguments.property# #arguments.direction#");
+		return this;
+	}
+
+	/**
+	 * Set the maximum number of records to return.
+	 *
+	 * @value The maximum number of records.
+	 */
+	public any function limit(required numeric value) {
+		variables.limitValue = arguments.value;
+		return this;
+	}
+
+	/**
+	 * Set the number of records to skip.
+	 *
+	 * @value The number of records to skip.
+	 */
+	public any function offset(required numeric value) {
+		variables.offsetValue = arguments.value;
+		return this;
+	}
+
+	/**
+	 * Set the SELECT clause.
+	 *
+	 * @properties A list of properties to select.
+	 */
+	public any function select(required string properties) {
+		variables.selectClause = arguments.properties;
+		return this;
+	}
+
+	/**
+	 * Set the include (JOIN) clause.
+	 *
+	 * @associations Associations to include.
+	 */
+	public any function include(required string associations) {
+		variables.includeClause = arguments.associations;
+		return this;
+	}
+
+	/**
+	 * Set the GROUP BY clause.
+	 *
+	 * @properties Properties to group by.
+	 */
+	public any function group(required string properties) {
+		variables.groupClause = arguments.properties;
+		return this;
+	}
+
+	/**
+	 * Enable DISTINCT.
+	 */
+	public any function distinct() {
+		variables.distinctValue = true;
+		return this;
+	}
+
+	/**
+	 * Add a FOR UPDATE clause to the query for pessimistic row locking.
+	 * The locked rows will be held until the current transaction commits or rolls back.
+	 * Must be used within a transaction to be effective.
+	 *
+	 * Support varies by database:
+	 * - PostgreSQL, MySQL, CockroachDB, H2, Oracle: Appends FOR UPDATE
+	 * - SQL Server, SQLite: No-op (MSSQL uses table hints, SQLite has file-level locking)
+	 */
+	public any function forUpdate() {
+		variables.forUpdateValue = true;
+		return this;
+	}
+
+	/**
+	 * Build the accumulated arguments into a struct suitable for finder methods.
+	 */
+	public struct function $buildFinderArgs(struct extraArgs = {}) {
+		local.args = {};
+
+		// Start with scope specs if present
+		if (ArrayLen(variables.scopeSpecs)) {
+			local.scopeChain = new wheels.model.query.ScopeChain(modelReference = variables.modelReference, specs = variables.scopeSpecs);
+			local.args = local.scopeChain.$mergeSpecs();
+		}
+
+		// Build WHERE clause from accumulated conditions
+		if (ArrayLen(variables.whereClauses)) {
+			local.whereStr = "";
+			for (local.i = 1; local.i <= ArrayLen(variables.whereClauses); local.i++) {
+				local.item = variables.whereClauses[local.i];
+				if (local.i == 1) {
+					local.whereStr = local.item.clause;
+				} else {
+					local.whereStr = local.whereStr & " " & local.item.type & " " & local.item.clause;
+				}
+			}
+			// Merge with any existing where from scopes
+			if (StructKeyExists(local.args, "where") && Len(local.args.where)) {
+				local.args.where = "(#local.args.where#) AND (#local.whereStr#)";
+			} else {
+				local.args.where = local.whereStr;
+			}
+		}
+
+		// Build ORDER BY
+		if (ArrayLen(variables.orderClauses)) {
+			local.orderStr = ArrayToList(variables.orderClauses);
+			if (StructKeyExists(local.args, "order") && Len(local.args.order)) {
+				local.args.order = ListAppend(local.args.order, local.orderStr);
+			} else {
+				local.args.order = local.orderStr;
+			}
+		}
+
+		// Apply SELECT
+		if (Len(variables.selectClause)) {
+			local.args.select = variables.selectClause;
+		}
+
+		// Apply INCLUDE
+		if (Len(variables.includeClause)) {
+			if (StructKeyExists(local.args, "include") && Len(local.args.include)) {
+				local.args.include = ListAppend(local.args.include, variables.includeClause);
+			} else {
+				local.args.include = variables.includeClause;
+			}
+		}
+
+		// Apply GROUP
+		if (Len(variables.groupClause)) {
+			local.args.group = variables.groupClause;
+		}
+
+		// Apply DISTINCT
+		if (variables.distinctValue) {
+			local.args.distinct = true;
+		}
+
+		// Apply LIMIT
+		if (variables.limitValue > 0) {
+			local.args.maxRows = variables.limitValue;
+		}
+
+		// Add FOR UPDATE flag if set
+		if (variables.forUpdateValue) {
+			local.args.$forUpdate = true;
+		}
+
+		// Merge in any extra arguments passed to the terminal method
+		StructAppend(local.args, arguments.extraArgs, false);
+
+		return local.args;
+	}
+
+	/**
+	 * Terminal method: execute the query and return all matching records.
+	 * Alias: `get()` is the same as `findAll()`.
+	 */
+	public any function get() {
+		return findAll(argumentCollection = arguments);
+	}
+
+	/**
+	 * Terminal method: execute the query and return all matching records.
+	 */
+	public any function findAll() {
+		if (variables.$alwaysEmpty) {
+			// Empty query shaped like a normal zero-row findAll() — full columnList from $classData().
+			// NOTE: chained select()/include() are ignored; zero rows makes projection moot.
+			return QueryNew(variables.modelReference.$classData().columnList);
+		}
+		local.args = $buildFinderArgs(arguments);
+		// A caller-supplied `page` owns the row window, so offset() only applies without it.
+		if (variables.offsetValue > 0 && !StructKeyExists(local.args, "page")) {
+			if (!$applyOffset(args = local.args, limit = variables.limitValue)) {
+				return $emptyResult(
+					StructKeyExists(local.args, "returnAs") ? local.args.returnAs : variables.modelReference.$get(name = "returnAs", functionName = "findAll")
+				);
+			}
+		}
+		return variables.modelReference.findAll(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: return the first matching record.
+	 * Alias: `first()` is the same as `findOne()`.
+	 */
+	public any function first() {
+		return findOne(argumentCollection = arguments);
+	}
+
+	/**
+	 * Terminal method: return the first matching record.
+	 */
+	public any function findOne() {
+		if (variables.$alwaysEmpty) {
+			return false;
+		}
+		local.args = $buildFinderArgs(arguments);
+		if (variables.offsetValue > 0) {
+			// Model findOne() windows rows with maxRows (or pagination for hasMany includes), neither
+			// of which can skip rows, so run the offset query through findAll() and unwrap the first
+			// row the same way findOne() does.
+			if (!StructKeyExists(local.args, "returnAs")) {
+				local.args.returnAs = variables.modelReference.$get(name = "returnAs", functionName = "findOne");
+			}
+			if ($applyOffset(args = local.args, limit = 1)) {
+				local.rv = variables.modelReference.findAll(argumentCollection = local.args);
+			} else {
+				local.rv = $emptyResult(local.args.returnAs);
+			}
+			if (IsArray(local.rv) && local.args.returnAs != "array") {
+				local.rv = ArrayLen(local.rv) ? local.rv[1] : false;
+			}
+			return local.rv;
+		}
+		return variables.modelReference.findOne(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: return the count of matching records.
+	 */
+	public any function count() {
+		if (variables.$alwaysEmpty) {
+			return 0;
+		}
+		local.args = $buildFinderArgs(arguments);
+		return variables.modelReference.count(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: check if any matching records exist.
+	 */
+	public any function exists() {
+		if (variables.$alwaysEmpty) {
+			return false;
+		}
+		local.args = $buildFinderArgs(arguments);
+		return variables.modelReference.exists(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: update all matching records.
+	 */
+	public any function updateAll() {
+		if (variables.$alwaysEmpty) {
+			return 0;
+		}
+		local.args = $buildFinderArgs(arguments);
+		return variables.modelReference.updateAll(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: delete all matching records.
+	 */
+	public any function deleteAll() {
+		if (variables.$alwaysEmpty) {
+			return 0;
+		}
+		local.args = $buildFinderArgs(arguments);
+		return variables.modelReference.deleteAll(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: process records one at a time in batches.
+	 */
+	public void function findEach() {
+		if (variables.$alwaysEmpty) {
+			return;
+		}
+		local.args = $buildFinderArgs(arguments);
+		variables.modelReference.findEach(argumentCollection = local.args);
+	}
+
+	/**
+	 * Terminal method: process records in batch groups.
+	 */
+	public void function findInBatches() {
+		if (variables.$alwaysEmpty) {
+			return;
+		}
+		local.args = $buildFinderArgs(arguments);
+		variables.modelReference.findInBatches(argumentCollection = local.args);
+	}
+
+	/**
+	 * Handle scope chaining from the query builder.
+	 */
+	public any function onMissingMethod(required string missingMethodName, required struct missingMethodArguments) {
+		// Check if this is a named scope
+		if (StructKeyExists(variables.modelReference.$classData(), "scopes") && StructKeyExists(variables.modelReference.$classData().scopes, arguments.missingMethodName)) {
+			local.scopeDef = variables.modelReference.$classData().scopes[arguments.missingMethodName];
+
+			if (StructKeyExists(local.scopeDef, "handler") && Len(local.scopeDef.handler)) {
+				local.sanitizedArgs = variables.modelReference.$sanitizeScopeHandlerArgs(arguments.missingMethodArguments);
+				local.spec = variables.modelReference.$invoke(
+					method = local.scopeDef.handler,
+					invokeArgs = local.sanitizedArgs
+				);
+			} else {
+				local.spec = Duplicate(local.scopeDef);
+			}
+			ArrayAppend(variables.scopeSpecs, local.spec);
+			return this;
+		}
+
+		Throw(
+			type = "Wheels.MethodNotFound",
+			message = "The method `#arguments.missingMethodName#` was not found on the query builder for `#variables.modelReference.$classData().modelName#`.",
+			extendedInfo = "Available methods: where, orWhere, whereNull, whereNotNull, whereBetween, whereIn, whereNotIn, orderBy, limit, offset, select, include, group, distinct, forUpdate, get, first, findAll, findOne, count, exists, updateAll, deleteAll, findEach, findInBatches."
+		);
+	}
+
+	/**
+	 * Translate the builder's offset() into findAll()'s SQL-level `$limit` / `$offset` arguments.
+	 * Returns false when the adapter reports the offset lies past the last matching row.
+	 *
+	 * @args The finder arguments built by $buildFinderArgs(); modified in place.
+	 * @limit Rows to return after the offset; 0 or less means "all remaining rows".
+	 */
+	public boolean function $applyOffset(required struct args, required numeric limit) {
+		StructDelete(arguments.args, "maxRows");
+		arguments.args.$offset = variables.offsetValue;
+		// OFFSET needs a row limit on every dialect, so "no limit" becomes the largest 32-bit value.
+		arguments.args.$limit = arguments.limit > 0 ? arguments.limit : 2147483647;
+		// Skipping rows is only deterministic with an ORDER BY (and SQL Server's windowing requires one),
+		// so default to the primary key like findAll() pagination does.
+		if (
+			(!StructKeyExists(arguments.args, "order") || !Len(arguments.args.order))
+			&& (!StructKeyExists(arguments.args, "group") || !Len(arguments.args.group))
+		) {
+			arguments.args.order = variables.modelReference.primaryKey();
+		}
+		// SQL Server emulates OFFSET with nested TOP queries, which return the trailing rows instead of
+		// the requested window when limit + offset runs past the end, so clamp the limit to what is left.
+		if (variables.modelReference.$classData().adapter.$offsetNeedsRowCount()) {
+			local.countArgs = {};
+			for (local.key in ["where", "include", "parameterize", "includeSoftDeletes", "group", "reload", "dataSource"]) {
+				if (StructKeyExists(arguments.args, local.key)) {
+					local.countArgs[local.key] = arguments.args[local.key];
+				}
+			}
+			local.total = variables.modelReference.count(argumentCollection = local.countArgs);
+			if (IsQuery(local.total)) {
+				local.total = local.total.recordCount;
+			}
+			local.remaining = local.total - variables.offsetValue;
+			if (local.remaining < 1) {
+				return false;
+			}
+			arguments.args.$limit = Min(arguments.args.$limit, local.remaining);
+		}
+		return true;
+	}
+
+	/**
+	 * An empty result shaped for the requested `returnAs` (query columns mirror the $alwaysEmpty path).
+	 */
+	public any function $emptyResult(required string returnAs) {
+		if (arguments.returnAs == "query") {
+			return QueryNew(variables.modelReference.$classData().columnList);
+		}
+		return [];
+	}
+
+	// ----- Private Helpers -----
+
+	/**
+	 * Validate that a property name is safe to interpolate into SQL.
+	 * Allows alphanumeric identifiers with underscores and `$` (never first), and optional table.column dot notation.
+	 * Throws Wheels.InvalidPropertyName if the name contains unsafe characters.
+	 *
+	 * @property The property name to validate.
+	 */
+	private void function $validatePropertyName(required string property) {
+		if (!Len(arguments.property) || !ReFind("^[a-zA-Z_][a-zA-Z0-9_$]*(\.[a-zA-Z_][a-zA-Z0-9_$]*)?$", arguments.property)) {
+			Throw(
+				type = "Wheels.InvalidPropertyName",
+				message = "The property name `#EncodeForHTML(arguments.property)#` contains invalid characters.",
+				extendedInfo = "Property names may only contain letters, numbers, underscores, and `$` (not as the first character), with an optional table prefix using dot notation (e.g., `users.id`)."
+			);
+		}
+	}
+
+	/**
+	 * Validate that an ORDER BY direction is safe.
+	 *
+	 * @direction The sort direction to validate.
+	 */
+	private void function $validateDirection(required string direction) {
+		if (!ReFind("^(?i)(ASC|DESC)$", arguments.direction)) {
+			Throw(
+				type = "Wheels.InvalidSortDirection",
+				message = "The sort direction `#EncodeForHTML(arguments.direction)#` is invalid.",
+				extendedInfo = "Sort direction must be either ASC or DESC."
+			);
+		}
+	}
+
+	/**
+	 * Validate that a comparison operator is safe to interpolate into SQL.
+	 *
+	 * @operator The operator to validate.
+	 */
+	private void function $validateOperator(required string operator) {
+		if (!ReFind("^(=|!=|<>|<|>|<=|>=|LIKE|NOT LIKE|IS|IS NOT)$", UCase(Trim(arguments.operator)))) {
+			Throw(
+				type = "Wheels.InvalidOperator",
+				message = "The operator `#EncodeForHTML(arguments.operator)#` is not allowed.",
+				extendedInfo = "Allowed operators: =, !=, <>, <, >, <=, >=, LIKE, NOT LIKE, IS, IS NOT."
+			);
+		}
+	}
+
+	/**
+	 * Build a single condition clause with proper value quoting.
+	 */
+	private string function $buildCondition(required string property, required string operator, required any value) {
+		$validatePropertyName(arguments.property);
+		$validateOperator(arguments.operator);
+		local.quotedValue = $quoteValue(arguments.property, arguments.value);
+		return "#arguments.property# #arguments.operator# #local.quotedValue#";
+	}
+
+	/**
+	 * Quote a value using the model's adapter for SQL injection safety.
+	 *
+	 * For integer/float/boolean columns the adapter's $quoteValue passes the value
+	 * through unquoted (the downstream WHERE-clause regex re-extracts bare numerics
+	 * into cfqueryparam). That contract assumes the caller has already constrained
+	 * the value to a numeric/boolean shape — so we enforce that here at the only
+	 * untrusted entry point. String columns are wrapped and escaped by the adapter,
+	 * so they don't need this check.
+	 */
+	private string function $quoteValue(required string property, required any value) {
+		local.type = "string";
+		local.classData = variables.modelReference.$classData();
+		if (StructKeyExists(local.classData.properties, arguments.property)) {
+			local.type = local.classData.properties[arguments.property].validationtype;
+		}
+		local.strValue = ToString(arguments.value);
+		$validateValueShape(arguments.property, local.strValue, local.type);
+		return local.classData.adapter.$quoteValue(str = local.strValue, type = local.type);
+	}
+
+	/**
+	 * Validate that a value matches the shape the adapter expects for its declared
+	 * column type. Throws Wheels.InvalidValue when the shape doesn't match — closing
+	 * the SQL-injection vector through which strings like "0 OR 1=1" would otherwise
+	 * land in the unquoted numeric/boolean path of the adapter.
+	 */
+	private void function $validateValueShape(required string property, required string value, required string type) {
+		// Empty values fall through to the adapter's empty-string quoting branch.
+		if (!Len(arguments.value)) {
+			return;
+		}
+		switch (arguments.type) {
+			case "integer":
+				if (!ReFind("^-?[0-9]+$", arguments.value) || ReFind("[^0-9-]", arguments.value)) {
+					$throwInvalidValue(arguments.property, arguments.value, "integer");
+				}
+				break;
+			case "float":
+				if (!ReFind("^-?[0-9]+(\.[0-9]+)?$", arguments.value) || ReFind("[^0-9.-]", arguments.value)) {
+					$throwInvalidValue(arguments.property, arguments.value, "float");
+				}
+				break;
+			case "boolean":
+				if (!ListFindNoCase("0,1,true,false,yes,no", arguments.value)) {
+					$throwInvalidValue(arguments.property, arguments.value, "boolean");
+				}
+				break;
+		}
+	}
+
+	private void function $throwInvalidValue(required string property, required string value, required string expectedType) {
+		Throw(
+			type = "Wheels.InvalidValue",
+			message = "The value `#EncodeForHTML(arguments.value)#` for property `#EncodeForHTML(arguments.property)#` is not a valid #arguments.expectedType#.",
+			extendedInfo = "Values bound to #arguments.expectedType# columns must be valid #arguments.expectedType# literals so they can be safely interpolated into the WHERE clause. This check protects the chainable query builder against SQL injection through typed-numeric/boolean payloads."
+		);
+	}
+
+	/**
+	 * Quote a list of values for IN clauses.
+	 */
+	private string function $quoteValueList(required string property, required any values) {
+		if (IsArray(arguments.values)) {
+			local.valueArray = arguments.values;
+		} else {
+			local.valueArray = ListToArray(arguments.values);
+		}
+		local.result = [];
+		for (local.val in local.valueArray) {
+			ArrayAppend(local.result, $quoteValue(arguments.property, local.val));
+		}
+		return ArrayToList(local.result);
+	}
+
+}

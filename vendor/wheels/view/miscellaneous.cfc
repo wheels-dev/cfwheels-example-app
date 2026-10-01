@@ -29,6 +29,11 @@ component {
 		}
 
 		local.phraseArray = ListToArray(arguments.phrase, arguments.delimiter);
+
+		// Initialize here so the unchanged text is returned when the phrase list collapses
+		// to an empty array (e.g. phrase=",") and the loop below never runs.
+		local.newText = local.text;
+
 		local.iEnd = ArrayLen(local.phraseArray);
 		for (local.i = 1; local.i <= local.iEnd; local.i++) {
 			local.newText = "";
@@ -130,7 +135,12 @@ component {
 			local.item = local.flashKeysArray[local.i];
 			local.class = LCase(local.item) & "-message";
 			local.attributes = {class = local.class};
-			if (!StructKeyExists(arguments, "key") || arguments.key == local.item) {
+			// Guard against requested keys that were never flashed ($readFlash() returns {} when
+			// the Flash is empty, so an unguarded read would throw for e.g. flashMessages(key="error")).
+			if (
+				StructKeyExists(local.flash, local.item)
+				&& (!StructKeyExists(arguments, "key") || arguments.key == local.item)
+			) {
 				local.content = local.flash[local.item];
 				// Do we have an array of values or a simple value?
 				if (IsArray(local.content)) {
@@ -311,8 +321,9 @@ component {
 	 *
 	 * @name Name of layout section to return content for.
 	 * @defaultValue What to display as a default if the section is not defined.
+	 * @encode Opt-in HTML encode of the stored section. Default is omitted (no encode) so layouts that store HTML keep working.
 	 */
-	public string function includeContent(string name = "body", string defaultValue = "") {
+	public string function includeContent(string name = "body", string defaultValue = "", any encode) {
 		if (StructKeyExists(arguments, "default")) {
 			arguments.defaultValue = arguments.default;
 			StructDelete(arguments, "default");
@@ -321,6 +332,10 @@ component {
 			local.rv = ArrayToList(variables.$instance.contentFor[arguments.name], Chr(10));
 		} else {
 			local.rv = arguments.defaultValue;
+		}
+		// Opt-in only. Default remains "no encode" so layouts that store HTML keep working (S10).
+		if (StructKeyExists(arguments, "encode") && IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
+			local.rv = EncodeForHTML($canonicalize(local.rv));
 		}
 		return local.rv;
 	}
@@ -365,6 +380,69 @@ component {
 	}
 
 	/**
+	 * Internal function. True when `name` is a single HTML/XML attribute token.
+	 * `$tag` lowercases names but used to emit anything, including breakout
+	 * keys such as `"><img src=x onerror=alert(1)`.
+	 */
+	public boolean function $isSafeAttributeName(required string name) {
+		return ReFindNoCase("^[a-z_:][-a-z0-9_:.]*$", arguments.name) == 1;
+	}
+
+	/**
+	 * Internal function. `false` stays false. Any other encode value (true,
+	 * "attributes") becomes `whenTruthy` so helpers share one coercion.
+	 */
+	public any function $coerceEncode(required any encode, whenTruthy = true) {
+		if (IsBoolean(arguments.encode) && !arguments.encode) {
+			return false;
+		}
+		return arguments.whenTruthy;
+	}
+
+	/**
+	 * Internal function. Restricts wrapper tag names (errorElement, etc.) to
+	 * a short alphanumeric token that is not a dangerous HTML element.
+	 */
+	public string function $sanitizeHtmlTagName(required string name, string fallback = "span") {
+		if (!ReFindNoCase("^[a-z][a-z0-9]*$", arguments.name) || Len(arguments.name) > 32) {
+			return arguments.fallback;
+		}
+		if (
+			ListFindNoCase(
+				"script,iframe,object,embed,link,meta,style,svg,math,form,input,button,img,video,audio,source,frame,frameset,base,applet",
+				arguments.name
+			)
+		) {
+			return arguments.fallback;
+		}
+		return LCase(arguments.name);
+	}
+
+	/**
+	 * Internal function. HTML-encodes the listed prepend / append style keys on a helper's
+	 * argument struct (in place, the struct is passed by reference) when the helper's `encode`
+	 * argument and the global `encodeHtmlTags` setting are both enabled. Centralizes the block
+	 * previously duplicated (with drift) across the form, error, and pagination helpers.
+	 */
+	public void function $encodeArgsForHtml(required struct args, required string keys) {
+		if (
+			StructKeyExists(arguments.args, "encode")
+			&& IsBoolean(arguments.args.encode)
+			&& arguments.args.encode
+			&& $get("encodeHtmlTags")
+		) {
+			local.keysArray = ListToArray(arguments.keys);
+			local.iEnd = ArrayLen(local.keysArray);
+			for (local.i = 1; local.i <= local.iEnd; local.i++) {
+				local.key = local.keysArray[local.i];
+				if (StructKeyExists(arguments.args, local.key) && Len(arguments.args[local.key])) {
+					arguments.args[local.key] = EncodeForHTML($canonicalize(arguments.args[local.key]));
+				}
+			}
+		}
+	}
+
+	/**
 	 * Internal function.
 	 */
 	public string function $tag(
@@ -395,8 +473,12 @@ component {
 		if(structKeyExists(arguments.attributes, 'addClass')) {
 			if(structKeyExists(arguments.attributes, 'class')) {
 				arguments.attributes.class = arguments.attributes.class & ' ' & arguments.attributes.addClass;
-				structDelete(arguments.attributes, 'addClass');
+			} else {
+				// No default class present: use the addClass value as the class attribute instead
+				// of letting the key fall through and render as a literal addclass="..." attribute.
+				arguments.attributes.class = arguments.attributes.addClass;
 			}
+			structDelete(arguments.attributes, 'addClass');
 		}
 
 		// add the names of the attributes and their values to the output string with a space in between (class="something" name="somethingelse" etc)
@@ -414,6 +496,7 @@ component {
 					|| Left(local.key, Len(arguments.skipStartingWith)) != arguments.skipStartingWith
 				)
 				&& Left(local.key, 1) != "$"
+				&& !ListFindNoCase("includeErrorMessage,includeFormErrorMessages", local.key)
 			) {
 				if (IsSimpleValue(arguments.attributes[local.key])) {
 					local.rv &= $tagAttribute(
@@ -450,6 +533,9 @@ component {
 		}
 
 		arguments.name = LCase(arguments.name);
+		if (!$isSafeAttributeName(arguments.name)) {
+			return "";
+		}
 
 		// set standard attribute name / value to use as the default to return (e.g. name / value part of <input name="value">)
 		local.rv = " " & arguments.name & "=""";
@@ -580,6 +666,39 @@ component {
 	}
 
 	/**
+	 * Internal function. Sets `args.id` (auto-derived, dash-style) and optionally `args.dataAutoId`
+	 * (underscore-style companion) on a form helper's argument struct when the caller did not
+	 * supply their own `id`. The `dataAutoId` emission is controlled by the `formHelperDataAutoId`
+	 * setting (default true); the `$tag` renderer turns `dataAutoId` into the `data-auto-id`
+	 * attribute during tag assembly. Keeping both labels on the tag lets browser/E2E tests target
+	 * either `##post-title` (historical) or `[data-auto-id='post_title']` (Rails-style).
+	 */
+	public void function $applyAutoId(
+		required struct args,
+		required any objectName,
+		required string property,
+		string valueToAppend = ""
+	) {
+		if (!StructKeyExists(arguments.args, "id")) {
+			arguments.args.id = $tagId(arguments.objectName, arguments.property, arguments.valueToAppend);
+			// Only emit `data-auto-id` for truly object-bound helpers (objectName is a simple,
+			// non-empty string). Tag-style helpers (textFieldTag, selectTag, etc.) use an empty
+			// struct for objectName — those ids are already a plain name with no dash/underscore
+			// ambiguity, so the companion attribute would just be redundant noise.
+			if (
+				$get("formHelperDataAutoId")
+				&& IsSimpleValue(arguments.objectName)
+				&& Len(arguments.objectName)
+			) {
+				// Use bracket notation so Lucee preserves the camelCase key — $tagAttribute
+				// keys off `Left(name, 4) == "data"` and hyphenizes camelCase `dataAutoId`
+				// to `data-auto-id`. A lowercased key (via dot-set on Lucee) skips hyphenize.
+				arguments.args["dataAutoId"] = Replace(arguments.args.id, "-", "_", "all");
+			}
+		}
+	}
+
+	/**
 	 * Internal function.
 	 */
 	public string function $tagName(required any objectName, required string property) {
@@ -686,22 +805,37 @@ component {
 	 * @variableScope The scope from which to resolve the path from.
 	 */
 	public any function $getValueByDynamicPath(required string path, required struct variableScope) {
-		// Extract keys and indexes using a regular expression
-		local.pattern = "[a-zA-Z0-9_]+|\\['[^\\]]+'\\]";
+		// Extract keys and indexes using a regular expression.
+		// Bracket-quoted segments (e.g. obj['my-key']) are matched as a whole so keys containing
+		// non-word characters tokenize correctly; the brackets and quotes are stripped below.
+		local.pattern = "\['[^']+'\]|[a-zA-Z0-9_]+";
 		local.matches = REMatchNoCase(local.pattern, arguments.path);
 
 		// Prepare the starting object
 		local.currentObject = arguments.variableScope;
 
-		for (key in local.matches) {
-			// Dynamically navigate the object structures
-			if (IsArray(local.currentObject) && IsNumeric(key)) {
-				local.currentObject = local.currentObject[val(key)];
-			}else if (StructKeyExists(local.currentObject, key)) {
-				local.currentObject = local.currentObject[key];
+		for (local.key in local.matches) {
+			// Strip the brackets and quotes off bracket-quoted segments.
+			if (Left(local.key, 2) == "['") {
+				local.key = Mid(local.key, 3, Len(local.key) - 4);
 			}
-			else {
-				return invoke(local.currentObject, key);
+
+			// Dynamically navigate the object structures
+			if (IsArray(local.currentObject) && IsNumeric(local.key)) {
+				local.currentObject = local.currentObject[Val(local.key)];
+			} else if (StructKeyExists(local.currentObject, local.key)) {
+				local.currentObject = local.currentObject[local.key];
+			} else if (IsObject(local.currentObject)) {
+				// Fall back to invoking a method with the segment's name (e.g. a model's dynamic
+				// association method) and keep navigating any remaining path segments.
+				local.currentObject = invoke(local.currentObject, local.key);
+			} else {
+				// Unresolvable segment on a struct or array: throw instead of falling through
+				// to arbitrary method execution.
+				Throw(
+					type = "Wheels.ObjectNotFound",
+					message = "The path `#arguments.path#` could not be resolved because the segment `#local.key#` does not exist."
+				);
 			}
 		}
 

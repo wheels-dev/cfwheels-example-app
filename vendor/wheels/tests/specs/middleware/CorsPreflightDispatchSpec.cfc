@@ -1,0 +1,125 @@
+/**
+ * Regression test for #2703: wheels.middleware.Cors cannot short-circuit
+ * OPTIONS preflight because middleware runs AFTER route dispatch.
+ *
+ * The legacy `set(allowCorsRequests=true)` path aborted OPTIONS in
+ * EventMethods.cfc BEFORE route matching. The new middleware pipeline must
+ * preserve that behavior for cross-origin POST/PUT/PATCH/DELETE preflight
+ * to function — browsers block the actual request when preflight 404s.
+ */
+component extends="wheels.WheelsTest" {
+
+	function run() {
+
+		describe("CORS preflight short-circuit in dispatch", () => {
+
+			beforeEach(() => {
+				_savedMiddleware = StructKeyExists(application.wheels, "middleware")
+					? Duplicate(application.wheels.middleware) : [];
+				_savedRoutes = Duplicate(application.wheels.routes);
+				_savedStaticRoutes = StructKeyExists(application.wheels, "staticRoutes")
+					? Duplicate(application.wheels.staticRoutes) : {};
+				_savedCgiMethod = request.cgi.request_method;
+				_hadCgiOrigin = StructKeyExists(request.cgi, "http_origin");
+				_savedCgiOrigin = _hadCgiOrigin ? request.cgi.http_origin : "";
+				application.wheels.routes = [];
+				application.wheels.staticRoutes = {};
+			});
+
+			afterEach(() => {
+				application.wheels.middleware = _savedMiddleware;
+				application.wheels.routes = _savedRoutes;
+				application.wheels.staticRoutes = _savedStaticRoutes;
+				request.cgi["request_method"] = _savedCgiMethod;
+				if (_hadCgiOrigin) {
+					request.cgi["http_origin"] = _savedCgiOrigin;
+				} else {
+					StructDelete(request.cgi, "http_origin");
+				}
+			});
+
+			it("does not 404 on OPTIONS preflight when CORS middleware is registered", () => {
+				// This test validates the dispatch-layer fix: OPTIONS preflight
+				// reaches the middleware pipeline instead of 404ing in
+				// $findMatchingRoute. Since #3074 the preflight context carries
+				// a `cgi` member built from request.cgi (where this spec injects
+				// the OPTIONS verb), so Cors.handle() reads the verb from the
+				// context and its own OPTIONS short-circuit branch returns "".
+				// The Cors middleware's own OPTIONS branch is also unit-tested
+				// in CorsSpec.cfc.
+				application.wheels.middleware = [
+					new wheels.middleware.Cors(allowOrigins = "https://portal.pai.com")
+				];
+				request.cgi["request_method"] = "OPTIONS";
+				// Preflight short-circuit requires ACAO. Inject the matching Origin
+				// so Cors emits the allow header instead of passing through to 404.
+				request.cgi["http_origin"] = "https://portal.pai.com";
+
+				var d = application.wo.$createObjectFromRoot(
+					path = "wheels", fileName = "Dispatch", method = "$init"
+				);
+
+				var threw = false;
+				var result = "preflight-not-reached";
+				try {
+					result = d.$request(
+						pathInfo = "/api/v1/jvm",
+						scriptName = "",
+						formScope = {},
+						urlScope = {}
+					);
+				} catch (any e) {
+					threw = true;
+				}
+
+				expect(threw).toBeFalse();
+				expect(result).toBe("");
+			});
+
+			it("still 404s on OPTIONS request when no CORS middleware is registered", () => {
+				// Preserves existing dispatch behavior — we only short-circuit when
+				// a CORS instance is actually configured.
+				application.wheels.middleware = [];
+				request.cgi["request_method"] = "OPTIONS";
+
+				var d = application.wo.$createObjectFromRoot(
+					path = "wheels", fileName = "Dispatch", method = "$init"
+				);
+
+				expect(function() {
+					d.$request(
+						pathInfo = "/api/v1/jvm",
+						scriptName = "",
+						formScope = {},
+						urlScope = {}
+					);
+				}).toThrow("Wheels.RouteNotFound");
+			});
+
+			it("still routes non-OPTIONS requests through normal dispatch when CORS is registered", () => {
+				// Sanity check: GET requests should still go through $paramParser
+				// → $findMatchingRoute and 404 normally when unmatched.
+				application.wheels.middleware = [
+					new wheels.middleware.Cors(allowOrigins = "*")
+				];
+				request.cgi["request_method"] = "GET";
+
+				var d = application.wo.$createObjectFromRoot(
+					path = "wheels", fileName = "Dispatch", method = "$init"
+				);
+
+				expect(function() {
+					d.$request(
+						pathInfo = "/api/v1/jvm",
+						scriptName = "",
+						formScope = {},
+						urlScope = {}
+					);
+				}).toThrow("Wheels.RouteNotFound");
+			});
+
+		});
+
+	}
+
+}

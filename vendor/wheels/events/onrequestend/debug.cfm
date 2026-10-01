@@ -1,369 +1,743 @@
-<cfset local.baseReloadURL = cgi.script_name>
-<cfif IsDefined("request.cgi.path_info")>
-	<cfif request.cgi.path_info IS NOT cgi.script_name>
-		<cfset local.baseReloadURL &= request.cgi.path_info>
-	</cfif>
-<cfelse>
-	<cfif cgi.path_info IS NOT cgi.script_name>
-		<cfset local.baseReloadURL &= cgi.path_info>
-	</cfif>
-</cfif>
-<cfif Len(cgi.query_string)>
-	<cfset local.baseReloadURL &= "?" & cgi.query_string>
-</cfif>
-<cfset local.baseReloadURL = ReplaceNoCase(local.baseReloadURL, "/" & application.wheels.rewriteFile, "")>
-<cfloop list="development,testing,maintenance,production,true" index="local.i">
-	<cfset local.baseReloadURL = ReplaceNoCase(
-		ReplaceNoCase(local.baseReloadURL, "?reload=" & local.i, ""),
-		"&reload=" & local.i,
-		""
-	)>
-</cfloop>
-<cfif local.baseReloadURL Contains "?">
-	<cfset local.baseReloadURL &= "&">
-<cfelse>
-	<cfset local.baseReloadURL &= "?">
-</cfif>
-<cfset local.baseReloadURL &= "reload=">
-<cfset local.frameworkTestDir = GetDirectoryFromPath(GetBaseTemplatePath()) & "wheels/tests">
-<cfset local.hasFrameworkTests = DirectoryExists(local.frameworkTestDir)>
-<cfset local.hasFrameworkBuildFile = FileExists(GetDirectoryFromPath(GetBaseTemplatePath()) & "wheels/public/build.cfm")>
-<cfset local.appTestDir = GetDirectoryFromPath(GetBaseTemplatePath()) & "tests">
-<cfset local.hasAppTests = DirectoryExists(local.appTestDir)>
-<cfset local.gitbranch = DirectoryExists(GetDirectoryFromPath(GetBaseTemplatePath()) & ".git") ? FileRead(GetDirectoryFromPath(GetBaseTemplatePath()) & ".git/HEAD") : "">
+<cfscript>
+	// Template-scope helpers are guarded closure assignments, not function
+	// declarations: this file can be included more than once per request
+	// (onrequestend plus an in-process render), and Adobe CF declares script
+	// or tag functions unconditionally — a second include throws "routine
+	// declared twice". The guard makes every include idempotent.
+	if (!StructKeyExists(variables, "$debugBarSkipRequest")) {
+		variables.$debugBarSkipRequest = function(required struct reqHeaders) {
+			return (StructKeyExists(arguments.reqHeaders, "X-Requested-With") AND arguments.reqHeaders["X-Requested-With"] IS "XMLHttpRequest")
+				OR (StructKeyExists(arguments.reqHeaders, "HX-Request"))
+				OR (StructKeyExists(arguments.reqHeaders, "Turbo-Frame"))
+				OR (StructKeyExists(arguments.reqHeaders, "X-Fetch") AND arguments.reqHeaders["X-Fetch"] IS "true")
+				OR (StructKeyExists(url, "format") AND ListFindNoCase("json,xml,csv,pdf", url.format));
+		};
+	}
 
-<cfif local.hasAppTests>
-	<cfdirectory action="list" directory="#local.appTestDir#" name="local.tests">
-	<cfif NOT local.tests.recordCount>
-		<cfset local.hasAppTests = false>
-	</cfif>
+	if (!StructKeyExists(variables, "$debugEnvColor")) {
+		variables.$debugEnvColor = function(required string envClass) {
+			if (arguments.envClass IS "production") {
+				return "##dc3545";
+			} else if (arguments.envClass IS "testing") {
+				return "##fd7e14";
+			} else if (arguments.envClass IS "maintenance") {
+				return "##ffc107";
+			}
+			return "##28a745";
+		};
+	}
+
+	if (!StructKeyExists(variables, "$debugTimingBreakdown")) {
+		variables.$debugTimingBreakdown = function(required struct execution) {
+			local.timingBreakdown = [];
+			if (arguments.execution.total GT 0) {
+				local.keys = StructSort(arguments.execution, "numeric", "desc");
+				for (local.ti = 1; local.ti LTE ArrayLen(local.keys); local.ti++) {
+					local.tkey = local.keys[local.ti];
+					if (local.tkey IS NOT "total" AND arguments.execution[local.tkey] GT 0) {
+						ArrayAppend(
+							local.timingBreakdown,
+							{
+								name = LCase(local.tkey),
+								ms = arguments.execution[local.tkey],
+								pct = Round((arguments.execution[local.tkey] / arguments.execution.total) * 100)
+							}
+						);
+					}
+				}
+			}
+			return local.timingBreakdown;
+		};
+	}
+
+	if (!StructKeyExists(variables, "$debugParamsList")) {
+		variables.$debugParamsList = function(required struct params) {
+			local.paramsList = [];
+			for (local.pi in arguments.params) {
+				if (local.pi IS NOT "fieldnames" AND local.pi IS NOT "route" AND local.pi IS NOT "controller" AND local.pi IS NOT "action" AND local.pi IS NOT "key") {
+					if (IsSimpleValue(arguments.params[local.pi])) {
+						ArrayAppend(
+							local.paramsList,
+							{name = LCase(local.pi), value = arguments.params[local.pi], type = "string"}
+						);
+					} else if (IsStruct(arguments.params[local.pi]) OR IsArray(arguments.params[local.pi])) {
+						ArrayAppend(
+							local.paramsList,
+							{name = LCase(local.pi), value = SerializeJSON(arguments.params[local.pi]), type = "json"}
+						);
+					}
+				}
+			}
+			return local.paramsList;
+		};
+	}
+</cfscript>
+<!--- GHSA-8r22: render the debug bar only for a request that is actually granted
+      debug information. An app still carrying the pre-4.1.2 IP-debug block
+      includes this template from its own onRequestEnd based on the shared
+      application-scope debug flag, which does not reflect the per-request grant
+      (and rendering.cfc always sets the request copy true on a layout render).
+      Gate on $get() so a concurrent request never renders another client's
+      debug bar. --->
+<cfif NOT $get("showDebugInformation")>
+	<cfexit>
 </cfif>
+<!--- Skip debug bar for AJAX, HTMX, Turbo, and fetch requests to avoid breaking partial responses --->
+<cfset local.reqHeaders = GetHTTPRequestData().headers>
+<cfif $debugBarSkipRequest(local.reqHeaders)>
+	<cfexit>
+</cfif>
+<!---
+	Base reload URL composed from webPath (subpath-aware, issue #3344) via
+	$buildDebugReloadUrl() in Global.cfc. Engines report path_info differently,
+	so prefer the normalized request.cgi copy when available.
+--->
+<cfif IsDefined("request.cgi.path_info")>
+	<cfset local.debugPathInfo = request.cgi.path_info>
+	<cfelse>
+	<cfset local.debugPathInfo = cgi.path_info>
+</cfif>
+<cfset local.baseReloadURL = $buildDebugReloadUrl(
+	scriptName = cgi.script_name,
+	pathInfo = local.debugPathInfo,
+	queryString = cgi.query_string
+)>
+<cfset local.gitbranch = DirectoryExists(GetDirectoryFromPath(GetBaseTemplatePath()) & ".git") ? FileRead(
+	GetDirectoryFromPath(GetBaseTemplatePath()) & ".git/HEAD"
+) : "">
+<cfset local.envClass = LCase($get("environment"))>
+<cfset local.envColor = $debugEnvColor(local.envClass)>
+<!--- Collect execution timing breakdown --->
+<cfset local.timingBreakdown = $debugTimingBreakdown(request.wheels.execution)>
+<!--- Collect parameters --->
+<cfset local.paramsList = $debugParamsList(request.wheels.params)>
+<!--- Code complexity (static, cached in CodeComplexity.load; a failure degrades
+	to an empty summary so the debug bar never breaks the request). --->
+<cfset local.codeComplexityAnalyzer = CreateObject("component", "wheels.wheelstest.system.CodeComplexity")>
+<cfset local.codeComplexity = local.codeComplexityAnalyzer.load(ExpandPath("/app"))>
 <!--- cfformat-ignore-start --->
-<cfsavecontent variable="local.css">
-	<style>#wheels-debug-area {
-		background: #ececec;
-		border-bottom: 3px solid #999;
-		border-top: 3px solid #999;
-		clear: both;
-		margin: 50px 0;
-		padding: 10px;
-		text-align: left;
-		}
-		#wheels-debug-area table {
-		border-collapse: collapse;
-		border-spacing: 0;
-		}
-		#wheels-debug-area td {
-		color: #333;
-		font-family: Arial, Helvetica, sans-serif;
-		font-size: 12px;
-		line-height: 1.5em;
-		padding: 0 10px 0 0;
-		vertical-align: top;
-		border-bottom: none;
-		}
-		#wheels-debug-area th {
-		border-bottom: none;
-		}
-		#wheels-debug-area a {
-		color: #333;
-		padding: 0 1px;
-		text-decoration: underline;
-		}
-		#wheels-debug-area a.btn {
-		background-color: #f5f5f5;
-		padding:5px 10px;
-		margin-right:5px;
-		}
-		#wheels-debug-area a:hover {
-		background: #333;
-		color: #fff;
-		text-decoration: none;
-		}
-		#wheels-debug-area a.btn:hover {
-		background-color: #999;
-		padding:5px 10px;
-		margin-right:5px;
-		}</style>
-</cfsavecontent>
-<cfoutput>
-	#local.css#
-	<div id="wheels-debug-area">
-		<cfif $get("enablePublicComponent")>
-			<table>
-				<tr>
-					<td>
-						<a href="#urlFor(route = "wheelsInfo")#" class="btn" target="_blank">Info</a>
-					</td>
-					<td>
-						<a href="#urlFor(route = "wheelsRoutes")#" class="btn" target="_blank">Routes</a>
-					</td>
-					<td>
-						<a href="#urlFor(route = "wheelsApiDocs")#" class="btn" target="_blank">API</a>
-					</td>
-					<td>
-						<a href="#urlFor(route = "wheelsGuides")#" class="btn" target="_blank">Guides</a>
-					</td>
-					<td>
-						<a href="#urlFor(route = "testbox")#" class="btn" target="_blank">Tests</a>
-					</td>
-					<td>
-						<a href="#urlFor(route = "wheelsWheelsPackages")#" class="btn" target="_blank">App Tests(Legacy)</a>
-					</td>
-					<td>
-						<a href="#urlFor(route = "WheelsPackages", type="core")#" class="btn" target="_blank">Core Tests(Legacy)</a>
-					</td>
-					<cfif $get("enableMigratorComponent")>
-						<td>
-							<a href="#urlFor(route = "wheelsMigrator")#" class="btn" target="_blank">Migrator</a>
-						</td>
-					</cfif>
-					<cfif $get("enablePluginsComponent")>
-						<td>
-							<a href="#urlFor(route = "wheelsPlugins")#" class="btn" target="_blank">Plugins</a>
-						</td>
-					</cfif>
-				</tr>
-			</table>
-			<hr>
-		</cfif>
-		<table>
-			<cfif $get("enablePluginsComponent")>
-				<cfif ($get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins))
-				OR Len(application.wheels.dependantPlugins)>
-					<tr>
-						<td>
-							<strong>
-								<span style="color:red;">Warnings:</span>
-							</strong>
-						</td>
-						<td>
-							<span style="color:red;">
-								<cfif $get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins)>
-									<cfloop list="#application.wheels.incompatiblePlugins#" index="local.i">
-										The #local.i# plugin may be incompatible with this version of Wheels, please look for a compatible version of the plugin<br>
-									</cfloop>
-								</cfif>
-								<cfif Len(application.wheels.dependantPlugins)>
-									<cfloop list="#application.wheels.dependantPlugins#" index="local.i">
-										<cfset needs = ListLast(local.i, "|")>The #ListFirst(local.i, "|")# plugin needs the following plugin<cfif ListLen(
-											needs
-										) GT 1>s</cfif>
-										to work properly: #needs#<br>
-									</cfloop>
-								</cfif>
-							</span>
-						</td>
-					</tr>
-				</cfif>
+<cfsavecontent variable="local.wdbHtml"><cfoutput>
+<div id="wheels-debugbar" style="all:initial;display:block;position:fixed;bottom:0;left:0;overflow:hidden;z-index:99999;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;">
+<style><cfinclude template="/wheels/public/assets/css/debugbar.css"></style>
+
+<!--- ============ RELOAD-REFUSED NOTICE (issue 3311) ============
+	The app template's reload gate (public/Application.cfc) records
+	request.wheels.reloadRefusedReason when ?reload= was requested but did not
+	fire. Development-only surface: other environments stay silent (log-only),
+	and the generic "refused" reason must never distinguish wrong-password from
+	rate-limited (no oracle on top of $secureCompare). --->
+<cfif StructKeyExists(request.wheels, "reloadRefusedReason") AND $get("environment") IS "development">
+	<div class="wdb-notice-warn" data-wdb-reload-refused="#EncodeForHTMLAttribute(request.wheels.reloadRefusedReason)#">
+		<!--- The copy button lifts innerText from this block, so what lands on
+			the clipboard is the message the developer is reading, not markup. --->
+		<div class="wdb-notice-body" id="wdb-reload-refused-body">
+			<strong>Reload not performed.</strong>
+			<cfif request.wheels.reloadRefusedReason IS "emptyPassword">
+				URL-based reload is disabled because <code>reloadPassword</code> is empty (fail-closed since 4.0.4).
+				Set <code>set(reloadPassword=env('WHEELS_RELOAD_PASSWORD', ''))</code> in <code>config/settings.cfm</code>,
+				put the value in <code>.env</code>, then reload with <code>?reload=true&amp;password=...</code>
+			<cfelseif request.wheels.reloadRefusedReason IS "missingPasswordParam">
+				A <code>reloadPassword</code> is configured but the request carried no password parameter.
+				Append <code>&amp;password=&lt;your reloadPassword&gt;</code> to the URL.
+			<cfelse>
+				The reload request was refused. Check <code>wheels_security.log</code> for details.
 			</cfif>
-			<cfif Len(local.gitbranch)>
-			<tr>
-				<td>
-					<strong>Git Branch:</strong>
-				</td>
-				<td>#local.gitbranch#</td>
-			</tr>
-			</cfif>
-			<tr>
-				<td>
-					<strong>Application:</strong>
-				</td>
-				<td>
-					#application.applicationName#
-					<cfif NOT Len($get("reloadPassword"))>
-						[<a href="#local.baseReloadURL#true">Reload</a>
-						]
-					</cfif>
-				</td>
-			</tr>
-			<tr>
-				<td>
-					<strong>Framework:</strong>
-				</td>
-				<td>
-					<a href="https://wheels.dev/" target="_blank">Wheels</a>
-					#$get("version")#
-				</td>
-			</tr>
-			<tr>
-				<td>
-					<strong>Environment:</strong>
-				</td>
-				<td>
-					#capitalize($get("environment"))#<cfif NOT Len($get("reloadPassword"))>
-						<cfset local.environments = "development,testing,maintenance,production">
-						[
-						<cfset local.pos = 0>
-						<cfloop list="#local.environments#" index="local.i">
-							<cfset local.pos = local.pos + 1>
-							<cfif $get("environment") IS NOT local.i>
-								<a href="#local.baseReloadURL##local.i#">#capitalize(local.i)#</a>
-								<cfif ListLen(local.environments) GT local.pos>,</cfif>
-							</cfif>
-						</cfloop>
-						]
-					</cfif>
-				</td>
-			</tr>
-			<cfif StructKeyExists(application.wheels, "hostName")>
-				<tr>
-					<td>
-						<strong>Host Name:</strong>
-					</td>
-					<td>#$get("hostName")#</td>
-				</tr>
-			</cfif>
-			<tr>
-				<td>
-					<strong>CFML Engine:</strong>
-				</td>
-				<td>#$get("serverName")##$get("serverVersion")#</td>
-			</tr>
-			<tr>
-				<td>
-					<strong>Data Source:</strong>
-				</td>
-				<td>#capitalize($get("dataSourceName"))#</td>
-			</tr>
-			<cfif StructKeyExists(application.wheels, "adapterName")>
-				<tr>
-					<td>
-						<strong>Database Adapter:</strong>
-					</td>
-					<td>#$get("adapterName")#</td>
-				</tr>
-			</cfif>
-			<tr>
-				<td>
-					<strong>URL Rewriting:</strong>
-				</td>
-				<td>#capitalize($get("URLRewriting"))#</td>
-			</tr>
-			<tr>
-				<td>
-					<strong>URL Obfuscation:</strong>
-				</td>
-				<td>
-					<cfif $get("obfuscateUrls")>
-						On<cfelse>Off
-					</cfif>
-				</td>
-			</tr>
-			<cfif $get("enablePluginsComponent")>
-				<tr>
-					<td>
-						<strong>Plugins:</strong>
-					</td>
-					<td>
-						<cfif StructCount($get("plugins")) IS NOT 0>
-							<cfset local.count = 0>
-							<cfloop collection="#$get('plugins')#" item="local.i">
-								<cfset local.count = local.count + 1>
-								<a
-									href="#URLFor(route="wheelspluginEntry", name=local.i)#"
-								>
-									#local.i#
-									<cfif StructCount($get("pluginMeta")) IS NOT 0 && StructKeyExists($get("pluginMeta"), local.i)>
-										#$get("pluginMeta")[local.i]['version']#
-									</cfif>
-								</a>
-								<cfif DirectoryExists("#GetDirectoryFromPath(GetBaseTemplatePath())#plugins/#LCase(local.i)#/tests")>
-									[
-									<a
-										href="#$get('webPath')##ListLast(request.cgi.script_name, '/')#?controller=wheels&action=wheels&view=tests&type=#LCase(local.i)#"
-									>Run Tests</a>
-									,
-									<a
-										href="#$get('webPath')##ListLast(request.cgi.script_name, '/')#?controller=wheels&action=wheels&view=packages&type=#LCase(local.i)#"
-									>View Tests</a>
-									]
-								</cfif>
-								<cfif StructCount($get("plugins")) GT local.count>
-									<br/>
-								</cfif>
-							</cfloop>
-						<cfelse>
-							None
-						</cfif>
-					</td>
-				</tr>
-			</cfif>
-			<cfif StructKeyExists(request.wheels.params, "route")>
-				<tr>
-					<td>
-						<strong>Route:</strong>
-					</td>
-					<td>#capitalize(request.wheels.params.route)#</td>
-				</tr>
-			</cfif>
-			<tr>
-				<td>
-					<strong>Controller:</strong>
-				</td>
-				<td>#capitalize(request.wheels.params.controller)#</td>
-			</tr>
-			<tr>
-				<td>
-					<strong>Action:</strong>
-				</td>
-				<td>#capitalize(request.wheels.params.action)#</td>
-			</tr>
-			<cfif StructKeyExists(request.wheels.params, "key")>
-				<tr>
-					<td>
-						<strong>Key(s):</strong>
-					</td>
-					<td>#request.wheels.params.key#</td>
-				</tr>
-			</cfif>
-			<tr>
-				<td>
-					<strong>Parameters:</strong>
-				</td>
-				<td>
-					<cfset local.additionalParamsExists = false>
-					<cfloop collection="#request.wheels.params#" item="local.i">
-						<cfif local.i IS NOT "fieldnames"
-						AND local.i IS NOT "route"
-						AND local.i IS NOT "controller"
-						AND local.i IS NOT "action"
-						AND local.i IS NOT "key">
-							<cfset local.additionalParamsExists = true>
-							<cfif IsStruct(request.wheels.params[local.i])>
-								#LCase(local.i)# = #SerializeJSON(request.wheels.params[local.i])#<br>
-							<cfelseif IsArray(request.wheels.params[local.i])>
-								#LCase(local.i)# = #SerializeJSON(request.wheels.params[local.i])#<br>
-							<cfelseif IsSimpleValue(request.wheels.params[local.i])>
-								#LCase(local.i)# = #request.wheels.params[local.i]#<br>
-							</cfif>
-						</cfif>
-					</cfloop>
-					<cfif NOT local.additionalParamsExists>None</cfif>
-				</td>
-			</tr>
-			<tr>
-				<td>
-					<strong>Execution Time:</strong>
-				</td>
-				<td>
-					#request.wheels.execution.total#ms<cfif request.wheels.execution.total GT 0>
-						(
-						<cfset local.keys = StructSort(request.wheels.execution, "numeric", "desc")>
-						<cfset local.firstDone = false>
-						<cfloop from="1" to="#ArrayLen(local.keys)#" index="local.i">
-							<cfset local.key = local.keys[local.i]>
-							<cfif local.key IS NOT "total" AND request.wheels.execution[local.key] GT 0>
-								<cfif local.firstDone>,</cfif>
-								#LCase(local.key)# ~#request.wheels.execution[local.key]#ms
-								<cfset local.firstDone = true>
-							</cfif>
-						</cfloop>
-						)
-					</cfif>
-				</td>
-			</tr>
-		</table>
+		</div>
+		<button type="button" class="wdb-mig-btn wdb-copy-btn"
+			onclick="wdbCopyEl(this, 'wdb-reload-refused-body', 'Wheels reload refused (#EncodeForHTMLAttribute(request.wheels.reloadRefusedReason)#)')">Copy</button>
 	</div>
-</cfoutput>
+</cfif>
+
+<!--- Application routes for the Routes tab. The developer's own routes only —
+	the 34 internal wheels.* ones are noise here and stay behind the full page.
+	Mirrors the split in public/views/routes.cfm so the two never drift. --->
+<cfscript>
+local.appRoutes = [];
+if (StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "routes")) {
+	for (local.r in application.wheels.routes) {
+		local.isInternal = (StructKeyExists(local.r, "controller") && local.r.controller EQ "wheels.public")
+			|| (StructKeyExists(local.r, "pattern") && local.r.pattern EQ "/wheels/app/tests")
+			|| (StructKeyExists(local.r, "pattern") && Left(local.r.pattern, 9) EQ "/_browser");
+		if (!local.isInternal) {
+			ArrayAppend(local.appRoutes, local.r);
+		}
+	}
+}
+</cfscript>
+
+<!--- ============ CHROME BAR ============ --->
+<div class="wdb-bar" id="wdb-bar">
+	<!--- Wheels logo: first chrome element. Opens Request when expanded;
+		restores the bar when collapsed (issue 3547). --->
+	<button class="wdb-tab wdb-logo" onclick="wdbLogoClick()" title="Request Details">
+		<svg viewBox="0 0 31 18" xmlns="http://www.w3.org/2000/svg" style="width:28px;height:16px;"><path d="M15.71 12c1.65 0 2.99 1.34 2.99 3s-1.34 3-2.99 3-2.99-1.34-2.99-3v-1.27c0-.42-.15-.79-.45-1.09L6.1 6.45c-.3-.3-.66-.45-1.09-.45H3.75c-1.65 0-2.99-1.34-2.99-3S2.09 0 3.74 0s2.99 1.34 2.99 3v1.27c0 .42.15.79.45 1.09l6.17 6.19c.3.3.66.45 1.09.45h1.27zM27.68 0c1.65 0 2.99 1.34 2.99 3s-1.34 3-2.99 3-2.99-1.34-2.99-3 1.34-3 2.99-3zm0 12h-1.27c-.42 0-.79-.15-1.09-.45l-6.17-6.19c-.3-.3-.45-.66-.45-1.09V3c0-1.65-1.34-3-2.99-3S12.73 1.35 12.73 3s1.34 3 2.99 3h1.27c.42 0 .79.16 1.09.45l6.17 6.19c.3.3.45.66.45 1.09V15c0 1.65 1.34 3 2.99 3s2.99-1.34 2.99-3-1.34-3-2.99-3z" fill="##f38ba8"/></svg>
+	</button>
+	<span class="wdb-sep"></span>
+
+	<!--- Request tab --->
+	<button class="wdb-tab" onclick="wdbToggle('request')" id="wdb-tab-request" title="Request">
+		<svg viewBox="0 0 512 512"><path d="M256 512A256 256 0 10256 0a256 256 0 000 512zm-24-176h24V272h-24c-13.3 0-24-10.7-24-24s10.7-24 24-24h48c13.3 0 24 10.7 24 24v88h8c13.3 0 24 10.7 24 24s-10.7 24-24 24h-80c-13.3 0-24-10.7-24-24s10.7-24 24-24zm40-208a32 32 0 110 64 32 32 0 010-64z"/></svg>
+		#EncodeForHTML(request.wheels.params.controller)#.#EncodeForHTML(request.wheels.params.action)#
+	</button>
+
+	<!--- Timing tab --->
+	<button class="wdb-tab" onclick="wdbToggle('timing')" id="wdb-tab-timing" title="Execution Time">
+		<svg viewBox="0 0 512 512"><path d="M256 0a256 256 0 110 512A256 256 0 01256 0zm24 120a24 24 0 10-48 0v136c0 8.4 4.4 16.2 11.6 20.5l80 48a24 24 0 1024.8-41l-68.4-41V120z"/></svg>
+		<span class="wdb-badge <cfif request.wheels.execution.total LT 100>wdb-badge-green<cfelseif request.wheels.execution.total LT 500>wdb-badge-yellow<cfelse>wdb-badge-red</cfif>">#request.wheels.execution.total#ms</span>
+	</button>
+
+	<!--- Params tab --->
+	<button class="wdb-tab" onclick="wdbToggle('params')" id="wdb-tab-params" title="Parameters">
+		<svg viewBox="0 0 576 512"><path d="M0 64C0 28.7 28.7 0 64 0h160v128c0 17.7 14.3 32 32 32h128v128H216c-13.3 0-24 10.7-24 24s10.7 24 24 24h168v128H64c-35.3 0-64-28.7-64-64V64z"/></svg>
+		Params
+		<cfif ArrayLen(local.paramsList)>
+			<span class="wdb-badge wdb-badge-blue">#ArrayLen(local.paramsList)#</span>
+		</cfif>
+	</button>
+
+	<!--- Environment tab --->
+	<button class="wdb-tab" onclick="wdbToggle('environment')" id="wdb-tab-environment" title="Environment">
+		<span class="wdb-env-dot" style="background:#local.envColor#;"></span>
+		#capitalize($get("environment"))#
+	</button>
+
+	<!--- Routes tab: promoted out of the Tools grid because it is the single
+		most-consulted dev view, and it answers "why did this 404?" in one
+		glance without leaving the page. --->
+	<cfif $get("enablePublicComponent")>
+	<button class="wdb-tab" onclick="wdbToggle('routes')" id="wdb-tab-routes" title="Application Routes">
+		<svg viewBox="0 0 512 512"><path d="M403.8 34.4c12-5 25.7-2.2 34.9 6.9l64 64c6 6 9.4 14.1 9.4 22.6s-3.4 16.6-9.4 22.6l-64 64c-9.2 9.2-22.9 11.9-34.9 6.9s-19.8-16.6-19.8-29.6V160H352c-10.1 0-19.6 4.7-25.6 12.8L284 229.3 244 176l31.2-41.6C293.3 110.2 321.8 96 352 96h32V64c0-12.9 7.8-24.6 19.8-29.6zM164 282.7L204 336l-31.2 41.6C154.7 401.8 126.2 416 96 416H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H96c10.1 0 19.6-4.7 25.6-12.8L164 282.7zm274.6 188c-9.2 9.2-22.9 11.9-34.9 6.9s-19.8-16.6-19.8-29.6V416H352c-30.2 0-58.7-14.2-76.8-38.4L121.6 172.8c-6-8.1-15.5-12.8-25.6-12.8H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H96c30.2 0 58.7 14.2 76.8 38.4L326.4 339.2c6 8.1 15.5 12.8 25.6 12.8h32V320c0-12.9 7.8-24.6 19.8-29.6s25.7-2.2 34.9 6.9l64 64c6 6 9.4 14.1 9.4 22.6s-3.4 16.6-9.4 22.6l-64 64z"/></svg>
+		Routes <span class="wdb-badge wdb-badge-blue">#ArrayLen(local.appRoutes)#</span>
+	</button>
+	</cfif>
+
+	<!--- Migrator tab: state is lazy-loaded on open (see debugbar.js) because
+		reading migration status costs a DB round-trip and this file runs on
+		every single request. --->
+	<cfif $get("enablePublicComponent") AND $get("enableMigratorComponent")>
+	<button class="wdb-tab" onclick="wdbToggle('migrator')" id="wdb-tab-migrator" title="Database Migrations">
+		<svg viewBox="0 0 448 512"><path d="M448 80v48c0 44.2-100.3 80-224 80S0 172.2 0 128V80C0 35.8 100.3 0 224 0s224 35.8 224 80zM393.2 214.7c20.8-7.4 39.9-16.9 54.8-28.6V288c0 44.2-100.3 80-224 80S0 332.2 0 288V186.1c14.9 11.8 34 21.2 54.8 28.6C99.7 230.7 159.5 240 224 240s124.3-9.3 169.2-25.3zM0 346.1c14.9 11.8 34 21.2 54.8 28.6C99.7 390.7 159.5 400 224 400s124.3-9.3 169.2-25.3c20.8-7.4 39.9-16.9 54.8-28.6V432c0 44.2-100.3 80-224 80S0 476.2 0 432V346.1z"/></svg>
+		Migrate
+	</button>
+	</cfif>
+
+	<!--- Tests tab: runs the app's suite on demand. Far too expensive to run on
+		every request, so it is lazy-loaded when opened (see debugbar.js). The
+		badge is filled in from the run result. --->
+	<cfif $get("enablePublicComponent")>
+	<button class="wdb-tab" onclick="wdbToggle('tests')" id="wdb-tab-tests" title="Run the test suite">
+		<!--- A flask, not a tick: the tick glyph (Font Awesome `check`) only
+			fills ~30% of its viewBox, so it rendered as a barely-visible speck
+			next to the other tab icons, which fill 87-100%. --->
+		<svg viewBox="0 0 448 512"><path d="M288 0H160 128C110.3 0 96 14.3 96 32s14.3 32 32 32V196.8c0 11.8-3.3 23.5-9.5 33.5L10.3 406.2C3.6 417.2 0 429.7 0 442.6C0 480.9 31.1 512 69.4 512H378.6c38.3 0 69.4-31.1 69.4-69.4c0-12.8-3.6-25.4-10.3-36.4L329.5 230.4c-6.2-10.1-9.5-21.7-9.5-33.5V64c17.7 0 32-14.3 32-32s-14.3-32-32-32H288zM192 196.8V64h64V196.8c0 23.7 6.6 46.9 19 67.1L309.5 320h-171L173 263.9c12.4-20.2 19-43.4 19-67.1z"/></svg>
+		Tests <span class="wdb-badge wdb-badge-green" id="wdb-tests-badge" style="display:none;"></span>
+	</button>
+	</cfif>
+
+	<!--- Docs tabs: open the local offline bundle (mounted at the app webroot as
+		wheels-docs/). These are links to full pages rather than lazy-loaded
+		panels like the others, because the docs bring their own navigation —
+		wrapping Starlight in a debug panel would fight it. --->
+	<cfif $get("enablePublicComponent")>
+	<button class="wdb-tab" onclick="window.open('/wheels-docs/guides/', '_blank')" id="wdb-tab-guides" title="Read the guides offline">
+		<svg viewBox="0 0 448 512"><path d="M96 0C43 0 0 43 0 96v320c0 53 43 96 96 96h320c17.7 0 32-14.3 32-32s-14.3-32-32-32H96c-17.7 0-32-14.3-32-32h352c17.7 0 32-14.3 32-32V32c0-17.7-14.3-32-32-32H96z"/></svg>
+		Guides
+	</button>
+	<button class="wdb-tab" onclick="window.open('/wheels-docs/api/', '_blank')" id="wdb-tab-apidocs" title="Read the API reference offline">
+		<svg viewBox="0 0 384 512"><path d="M64 0C28.7 0 0 28.7 0 64v384c0 35.3 28.7 64 64 64h256c35.3 0 64-28.7 64-64V160H256c-17.7 0-32-14.3-32-32V0H64zm192 0v128h128L256 0zM112 256h160c8.8 0 16 7.2 16 16s-7.2 16-16 16H112c-8.8 0-16-7.2-16-16s7.2-16 16-16z"/></svg>
+		API
+	</button>
+	</cfif>
+
+	<!--- Packages tab: installed packages and, more usefully, the ones that
+		failed to load. Lazy-loaded like Migrator/Tests. --->
+	<cfif StructKeyExists(application.wheels, "enablePackagesComponent") AND application.wheels.enablePackagesComponent>
+	<button class="wdb-tab" onclick="wdbToggle('packages')" id="wdb-tab-packages" title="Installed packages">
+		<svg viewBox="0 0 512 512"><path d="M234.5 5.7c13.9-5.3 29.7-5.3 43.6 0l192 73.7C493.6 89.5 512 112.3 512 138.4V373.6c0 26.1-18.4 48.9-42 59l-192 73.7c-13.9 5.3-29.7 5.3-43.6 0l-192-73.7C18.4 422.5 0 399.7 0 373.6V138.4c0-26.1 18.4-48.9 42-59l192-73.7zM256 66L82 133l174 67 174-67L256 66zM32 373.6c0 8.7 6.1 16.3 14 19.7l192 73.7V274L46 200v173.6zM274 467l192-73.7c7.9-3 14-11 14-19.7V200L274 274V467z"/></svg>
+		Packages <span class="wdb-badge wdb-badge-blue" id="wdb-packages-badge" style="display:none;"></span>
+	</button>
+	</cfif>
+
+	<!--- Tools tab --->
+	<cfif $get("enablePublicComponent")>
+	<button class="wdb-tab" onclick="wdbToggle('tools')" id="wdb-tab-tools" title="Developer Tools">
+		<svg viewBox="0 0 512 512"><path d="M78.6 5C69.1-2.4 55.6-1.5 47 7L7 47c-8.5 8.5-9.4 22-2.1 31.6l80 104c4.5 5.9 11.6 9.4 19 9.4h54.1l109 109c-14.7 29-10 65.4 14.3 89.6l112 112c12.5 12.5 32.8 12.5 45.3 0l64-64c12.5-12.5 12.5-32.8 0-45.3l-112-112c-24.2-24.2-60.6-29-89.6-14.3l-109-109V124c0-7.5-3.5-14.5-9.4-19L78.6 5z"/></svg>
+		Tools
+	</button>
+	</cfif>
+
+	<!--- Complexity tab --->
+	<button class="wdb-tab" onclick="wdbToggle('complexity')" id="wdb-tab-complexity" title="Code Complexity">
+		<svg viewBox="0 0 448 512"><path d="M439.55 236.05L244 40.45a28.87 28.87 0 0 0-40.81 0l-40.66 40.63 51.52 51.52c27.06-9.14 52.68 16.77 43.39 43.68l49.66 49.66c34.23-11.8 61.18 31 35.47 56.69-26.49 26.49-70.21-2.87-56-37.34L240.22 199v121.85c25.3 12.54 22.26 41.85 9.08 55a34.34 34.34 0 0 1-48.55 0c-17.57-17.6-11.07-46.91 11.25-56v-123c-20.8-8.51-24.6-30.74-18.64-45L142.57 101 8.45 235.14a28.86 28.86 0 0 0 0 40.81l195.61 195.6a28.86 28.86 0 0 0 40.8 0l194.69-194.69a28.86 28.86 0 0 0 0-40.81z"/></svg>
+		Complexity
+	</button>
+
+	<span class="wdb-spacer"></span>
+
+	<!--- Version --->
+	<span class="wdb-version" style="font-size:11px;color:##6c7086;padding:0 8px;">
+		<cfif Len(local.gitbranch)>
+			<svg viewBox="0 0 448 512" style="width:11px;height:11px;fill:##6c7086;vertical-align:middle;"><path d="M80 104a24 24 0 100-48 24 24 0 000 48zm80-24c0 32.8-19.7 61-48 73.3v87.8c18.8-10.9 40.7-17.1 64-17.1h96c35.3 0 64-28.7 64-64v-6.7C307.7 141 288 112.8 288 80c0-44.2 35.8-80 80-80s80 35.8 80 80c0 32.8-19.7 61-48 73.3V224c0 70.7-57.3 128-128 128h-96c-35.3 0-64 28.7-64 64v6.7c28.3 12.3 48 40.5 48 73.3 0 44.2-35.8 80-80 80S0 540.2 0 496c0-32.8 19.7-61 48-73.3V153.3C19.7 141 0 112.8 0 80 0 35.8 35.8 0 80 0s80 35.8 80 80z"/></svg>
+			#Trim(Replace(local.gitbranch, "ref: refs/heads/", ""))#
+			&middot;
+		</cfif>
+		Wheels #$get("version")#
+	</span>
+
+	<!--- Reload button --->
+	<cfif NOT Len($get("reloadPassword"))>
+		<a href="#EncodeForHTMLAttribute(local.baseReloadURL)#true" class="wdb-tab" title="Reload Application" style="color:##f9e2af;">
+			<svg viewBox="0 0 512 512" style="width:13px;height:13px;fill:##f9e2af;"><path d="M105.1 202.6c7.7-21.8 20.2-42.3 37.8-59.8c62.5-62.5 163.8-62.5 226.3 0L386.3 160H352c-17.7 0-32 14.3-32 32s14.3 32 32 32h127.9c17.7 0 32-14.3 32-32V64c0-17.7-14.3-32-32-32s-32 14.3-32 32v35.2L430.6 81.9c-87.5-87.5-229.3-87.5-316.8 0C85.7 109.9 61 143.5 44.5 180.2l60.6 22.4z"/></svg>
+		</a>
+	</cfif>
+
+	<!--- Close: last chrome element. Slides the bar left to the logo (issue 3547). --->
+	<button class="wdb-tab wdb-close" onclick="wdbMinimize()" title="Hide Debug Bar" style="color:##a6adc8;">
+		<svg viewBox="0 0 320 512" style="width:10px;height:10px;fill:currentColor;"><path d="M310.6 150.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0L160 210.7 54.6 105.4c-12.5-12.5-32.8-12.5-45.3 0s-12.5 32.8 0 45.3L114.7 256 9.4 361.4c-12.5 12.5-12.5 32.8 0 45.3s32.8 12.5 45.3 0L160 301.3 265.4 406.6c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L205.3 256 310.6 150.6z"/></svg>
+	</button>
+</div>
+
+<!--- ============ REQUEST PANEL ============ --->
+<div class="wdb-panel" id="wdb-panel-request">
+	<div class="wdb-panel-header">
+		<h3>Request Details</h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<dl class="wdb-kv">
+			<cfif StructKeyExists(request.wheels.params, "route")>
+				<dt>Route</dt>
+				<dd><code>#EncodeForHTML(request.wheels.params.route)#</code></dd>
+			</cfif>
+			<dt>Controller</dt>
+			<dd><code>#EncodeForHTML(request.wheels.params.controller)#</code></dd>
+			<dt>Action</dt>
+			<dd><code>#EncodeForHTML(request.wheels.params.action)#</code></dd>
+			<cfif StructKeyExists(request.wheels.params, "key")>
+				<dt>Key</dt>
+				<dd><code>#EncodeForHTML(request.wheels.params.key)#</code></dd>
+			</cfif>
+			<dt>HTTP Method</dt>
+			<dd><code>#UCase(cgi.request_method)#</code></dd>
+			<dt>URL</dt>
+			<dd><code>#EncodeForHTML(cgi.server_name)##EncodeForHTML(cgi.path_info)#<cfif Len(cgi.query_string)>?#EncodeForHTML(cgi.query_string)#</cfif></code></dd>
+			<dt>Application</dt>
+			<dd>#application.applicationName#</dd>
+			<dt>Data Source</dt>
+			<dd><code>#$get("dataSourceName")#</code></dd>
+			<cfif StructKeyExists(application.wheels, "adapterName")>
+				<dt>DB Adapter</dt>
+				<dd>#$get("adapterName")#</dd>
+			</cfif>
+			<dt>URL Rewriting</dt>
+			<dd>#$get("URLRewriting")#</dd>
+		</dl>
+	</div>
+</div>
+
+<!--- ============ TIMING PANEL ============ --->
+<div class="wdb-panel" id="wdb-panel-timing">
+	<div class="wdb-panel-header">
+		<h3>Execution Timing &mdash; #request.wheels.execution.total#ms total</h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<cfif ArrayLen(local.timingBreakdown)>
+			<cfset local.barColors = ["##89b4fa","##a6e3a1","##f9e2af","##fab387","##f38ba8","##cba6f7","##94e2d5","##74c7ec"]>
+			<cfloop from="1" to="#ArrayLen(local.timingBreakdown)#" index="local.bi">
+				<cfset local.bcolor = local.barColors[((local.bi - 1) MOD ArrayLen(local.barColors)) + 1]>
+				<div class="wdb-timing-row">
+					<span class="wdb-timing-label">#local.timingBreakdown[local.bi].name#</span>
+					<div class="wdb-timing-bar-bg">
+						<div class="wdb-timing-bar" style="width:#Max(local.timingBreakdown[local.bi].pct, 5)#%;background:#local.bcolor#;">
+							#local.timingBreakdown[local.bi].ms#ms
+						</div>
+					</div>
+				</div>
+			</cfloop>
+		<cfelse>
+			<p style="color:##6c7086;">No timing breakdown available.</p>
+		</cfif>
+	</div>
+</div>
+
+<!--- ============ PARAMS PANEL ============ --->
+<div class="wdb-panel" id="wdb-panel-params">
+	<div class="wdb-panel-header">
+		<h3>Request Parameters</h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<cfif ArrayLen(local.paramsList)>
+			<table class="wdb-table">
+				<thead><tr><th>Name</th><th>Value</th><th>Type</th></tr></thead>
+				<tbody>
+				<cfloop from="1" to="#ArrayLen(local.paramsList)#" index="local.pIdx">
+					<tr>
+						<td><code>#EncodeForHTML(local.paramsList[local.pIdx].name)#</code></td>
+						<td style="font-family:monospace;max-width:500px;overflow:hidden;text-overflow:ellipsis;">#EncodeForHTML(local.paramsList[local.pIdx].value)#</td>
+						<td><span class="wdb-badge wdb-badge-blue">#local.paramsList[local.pIdx].type#</span></td>
+					</tr>
+				</cfloop>
+				</tbody>
+			</table>
+		<cfelse>
+			<p style="color:##6c7086;">No additional parameters.</p>
+		</cfif>
+	</div>
+</div>
+
+<!--- ============ ENVIRONMENT PANEL ============ --->
+<div class="wdb-panel" id="wdb-panel-environment">
+	<div class="wdb-panel-header">
+		<h3>Environment &amp; Configuration</h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<div class="wdb-section">
+			<div class="wdb-section-title">Application</div>
+			<dl class="wdb-kv">
+				<dt>Environment</dt>
+				<dd>
+					<span class="wdb-env-dot" style="background:#local.envColor#;"></span>
+					#capitalize($get("environment"))#
+					<!---
+						Quick-switch links render only when switching can actually work:
+						since ##2082 the ?reload=<env> switch requires a non-empty
+						reloadPassword (plus a matching password parameter) and is gated
+						by allowEnvironmentSwitchViaUrl. The password is never embedded
+						in the page — wdbEnvSwitch() prompts for it at click time and
+						builds the documented ?reload=<env>&password=... request.
+					--->
+					<cfif Len($get("reloadPassword")) AND $get("allowEnvironmentSwitchViaUrl")>
+						<cfset local.environments = "development,testing,maintenance,production">
+						&mdash;
+						<cfloop list="#local.environments#" index="local.ei">
+							<cfif $get("environment") IS NOT local.ei>
+								<a href="##" data-wdb-reload="#EncodeForHTMLAttribute(local.baseReloadURL & local.ei)#" onclick="return wdbEnvSwitch(this);" title="Switch to #capitalize(local.ei)# (prompts for the reload password)" style="color:##89b4fa;font-size:11px;margin-left:4px;">#capitalize(local.ei)#</a>
+							</cfif>
+						</cfloop>
+					</cfif>
+				</dd>
+				<cfif Len(local.gitbranch)>
+					<dt>Git Branch</dt>
+					<dd><code>#Trim(Replace(local.gitbranch, "ref: refs/heads/", ""))#</code></dd>
+				</cfif>
+				<dt>Wheels Version</dt>
+				<dd>#$get("version")#</dd>
+				<dt>CFML Engine</dt>
+				<dd>#$get("serverName")# #$get("serverVersion")#</dd>
+				<cfif StructKeyExists(application.wheels, "hostName")>
+					<dt>Host Name</dt>
+					<dd>#$get("hostName")#</dd>
+				</cfif>
+			</dl>
+		</div>
+		<cfif StructKeyExists(application.wheels, "enablePackagesComponent") AND application.wheels.enablePackagesComponent>
+			<div class="wdb-section">
+				<div class="wdb-section-title">Packages</div>
+				<cfif StructKeyExists(application.wheels, "packageMeta") AND StructCount(application.wheels.packageMeta) GT 0>
+					<table class="wdb-table">
+						<thead><tr><th>Package</th><th>Version</th><th>Description</th></tr></thead>
+						<tbody>
+						<cfloop collection="#application.wheels.packageMeta#" item="local.pkgName">
+							<cfset local.pkgInfo = application.wheels.packageMeta[local.pkgName]>
+							<tr>
+								<td><code>#local.pkgInfo.name#</code></td>
+								<td>#local.pkgInfo.version#</td>
+								<td style="color:##a6adc8;">#local.pkgInfo.description#</td>
+							</tr>
+						</cfloop>
+						</tbody>
+					</table>
+				<cfelse>
+					<p style="color:##6c7086;">No packages installed.</p>
+				</cfif>
+				<cfif StructKeyExists(application.wheels, "failedPackages") AND ArrayLen(application.wheels.failedPackages) GT 0>
+					<div style="color:##f38ba8;font-size:12px;margin-top:8px;">
+						<cfloop array="#application.wheels.failedPackages#" index="local.fp">
+							<p>Failed to load <strong>#local.fp.name#</strong>: #local.fp.error#</p>
+						</cfloop>
+					</div>
+				</cfif>
+			</div>
+		</cfif>
+		<cfif $get("enablePluginsComponent")>
+			<div class="wdb-section">
+				<div class="wdb-section-title">Plugins (Legacy)</div>
+				<cfif StructCount($get("plugins")) IS NOT 0>
+					<table class="wdb-table">
+						<thead><tr><th>Plugin</th><th>Version</th></tr></thead>
+						<tbody>
+						<cfloop collection="#$get('plugins')#" item="local.pn">
+							<tr>
+								<td><code>#local.pn#</code></td>
+								<td>
+									<cfif StructCount($get("pluginMeta")) IS NOT 0 AND StructKeyExists($get("pluginMeta"), local.pn)>
+										#$get("pluginMeta")[local.pn]['version']#
+									<cfelse>
+										-
+									</cfif>
+								</td>
+							</tr>
+						</cfloop>
+						</tbody>
+					</table>
+				<cfelse>
+					<p style="color:##6c7086;">No plugins installed.</p>
+				</cfif>
+			</div>
+			<!--- Warnings --->
+			<cfif ($get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins)) OR Len(application.wheels.dependantPlugins) OR (isDefined("application.wheels.versionMismatchPlugins") AND Len(application.wheels.versionMismatchPlugins)) OR (isDefined("application.wheels.mixinCollisions") AND arrayLen(application.wheels.mixinCollisions))>
+				<div class="wdb-section">
+					<div class="wdb-section-head">
+						<div class="wdb-section-title" style="color:##f38ba8;">Warnings</div>
+						<button type="button" class="wdb-mig-btn wdb-copy-btn" onclick="wdbCopyEl(this, 'wdb-warnings-body', 'Wheels warnings')">Copy</button>
+					</div>
+					<div id="wdb-warnings-body" style="color:##f38ba8;font-size:12px;">
+						<cfif $get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins)>
+							<cfloop list="#application.wheels.incompatiblePlugins#" index="local.wi">
+								<p>The <strong>#local.wi#</strong> plugin may be incompatible with this version of Wheels.</p>
+							</cfloop>
+						</cfif>
+						<cfif Len(application.wheels.dependantPlugins)>
+							<cfloop list="#application.wheels.dependantPlugins#" index="local.di">
+								<cfset local.needs = ListLast(local.di, "|")>
+								<p><strong>#ListFirst(local.di, "|")#</strong> needs: #local.needs#</p>
+							</cfloop>
+						</cfif>
+						<cfif isDefined("application.wheels.versionMismatchPlugins") AND Len(application.wheels.versionMismatchPlugins)>
+							<cfloop list="#application.wheels.versionMismatchPlugins#" index="local.vm">
+								<p><strong>#ListGetAt(local.vm, 1, "|")#</strong> requires <strong>#ListGetAt(local.vm, 2, "|")#</strong> #ListGetAt(local.vm, 3, "|")# but version <strong>#ListGetAt(local.vm, 4, "|")#</strong> is loaded</p>
+							</cfloop>
+						</cfif>
+						<cfif isDefined("application.wheels.mixinCollisions") AND arrayLen(application.wheels.mixinCollisions)>
+							<cfloop array="#application.wheels.mixinCollisions#" index="local.ci">
+								<p>Method <strong>#local.ci.method#</strong> on <strong>#local.ci.target#</strong>: <strong>#local.ci.firstProvider#</strong> overridden by <strong>#local.ci.secondProvider#</strong></p>
+							</cfloop>
+						</cfif>
+					</div>
+				</div>
+			</cfif>
+		</cfif>
+		<!---
+			Deprecation warnings collected via the shared $deprecated() helper.
+			application.wheels (not $appKey()) is correct here: application.$wheels only
+			exists during onapplicationstart, and its final line reassigns the same struct
+			reference to application.wheels — so init-time registrations are already
+			visible under application.wheels by the time any onrequestend runs.
+		--->
+
+		<cfif StructKeyExists(application.wheels, "deprecationWarnings") AND ArrayLen(application.wheels.deprecationWarnings)>
+			<div class="wdb-section">
+				<div class="wdb-section-head">
+					<div class="wdb-section-title" style="color:##f9e2af;">Deprecations</div>
+					<button type="button" class="wdb-mig-btn wdb-copy-btn" onclick="wdbCopyEl(this, 'wdb-deprecations-body', 'Wheels deprecations')">Copy</button>
+				</div>
+				<div id="wdb-deprecations-body" style="color:##f9e2af;font-size:12px;">
+					<cfloop array="#application.wheels.deprecationWarnings#" index="local.dw">
+						<p>
+							#EncodeForHTML(local.dw.message)#
+							<cfif StructKeyExists(local.dw, "url") AND Len(local.dw.url)>
+								<a href="#EncodeForHTMLAttribute(local.dw.url)#" style="color:##89b4fa;" target="_blank" rel="noopener">Migration guide</a>
+							</cfif>
+						</p>
+					</cfloop>
+				</div>
+			</div>
+		</cfif>
+		<!---
+			Controller configuration warnings collected via $warnIfConfigSkipsSuper()
+			(controllers overriding config() without calling super.config()).
+		--->
+		<cfif StructKeyExists(application.wheels, "controllerConfigWarnings") AND ArrayLen(application.wheels.controllerConfigWarnings)>
+			<div class="wdb-section">
+				<div class="wdb-section-head">
+					<div class="wdb-section-title" style="color:##f9e2af;">Configuration Warnings</div>
+					<button type="button" class="wdb-mig-btn wdb-copy-btn" onclick="wdbCopyEl(this, 'wdb-configwarn-body', 'Wheels configuration warnings')">Copy</button>
+				</div>
+				<div id="wdb-configwarn-body" style="color:##f9e2af;font-size:12px;">
+					<cfloop array="#application.wheels.controllerConfigWarnings#" index="local.cw">
+						<p>#EncodeForHTML(local.cw.message)#</p>
+					</cfloop>
+				</div>
+			</div>
+		</cfif>
+
+		<!--- Full system information, collapsed by default. Lazy-loaded from
+			the existing JSON endpoint on first expand, because this file runs
+			on every request and none of this should be paid for up front. --->
+		<details class="wdb-details" id="wdb-sysinfo" data-wdb-url="#urlFor(route = 'wheelsInfo', params = 'format=json')#">
+			<summary>System information</summary>
+			<div id="wdb-sysinfo-body">
+				<p class="wdb-muted">Expand to load.</p>
+			</div>
+		</details>
+	</div>
+</div>
+
+<!--- ============ ROUTES PANEL ============ --->
+<cfif $get("enablePublicComponent")>
+<div class="wdb-panel" id="wdb-panel-routes">
+	<div class="wdb-panel-header">
+		<h3>Application Routes &mdash; #ArrayLen(local.appRoutes)#</h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<cfif ArrayLen(local.appRoutes)>
+			<table class="wdb-table">
+				<tr>
+					<th>Method</th><th>Pattern</th><th>Controller</th><th>Action</th><th>Name</th>
+				</tr>
+				<cfloop array="#local.appRoutes#" index="local.rt">
+					<tr>
+						<td><code>#EncodeForHTML(IsSimpleValue(local.rt.methods) ? local.rt.methods : "")#</code></td>
+						<td><code>#EncodeForHTML(local.rt.pattern)#</code></td>
+						<td><cfif StructKeyExists(local.rt, "controller") AND Len(local.rt.controller)>#EncodeForHTML(local.rt.controller)#<cfelse><span style="color:##6c7086;">&mdash;</span></cfif></td>
+						<td><cfif StructKeyExists(local.rt, "action") AND Len(local.rt.action)>#EncodeForHTML(local.rt.action)#<cfelse><span style="color:##6c7086;">&mdash;</span></cfif></td>
+						<td><code>#EncodeForHTML(local.rt.name)#</code></td>
+					</tr>
+				</cfloop>
+			</table>
+			<p style="margin-top:10px;">
+				<a href="#urlFor(route = 'wheelsRoutes')#" target="_blank" style="color:##89b4fa;">
+					Full route table, including internal Wheels routes &rarr;
+				</a>
+			</p>
+		<cfelse>
+			<p style="color:##6c7086;">No application routes registered.</p>
+		</cfif>
+	</div>
+</div>
+</cfif>
+
+<!--- ============ MIGRATOR PANEL ============ --->
+<cfif $get("enablePublicComponent") AND $get("enableMigratorComponent")>
+<div class="wdb-panel" id="wdb-panel-migrator">
+	<div class="wdb-panel-header">
+		<h3>Migrator <span class="wdb-panel-note" id="wdb-mig-headline"></span></h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<div id="wdb-mig-body"><p class="wdb-muted">Loading&hellip;</p></div>
+		<div id="wdb-mig-confirm" class="wdb-mig-confirm" style="display:none;"></div>
+		<div id="wdb-mig-result" class="wdb-mig-result" style="display:none;"></div>
+	</div>
+</div>
+<!--- Endpoints are built with urlFor() so URL rewriting and non-root context
+	paths are respected, exactly as the standalone page does. The [command]
+	segment is case-sensitive, and the route requires POST when URL rewriting
+	is on. The CSRF token is not embedded here — debugbar.js takes it from the
+	state response, which is what generates it. --->
+<script>
+window.wdbMigrator = {
+	stateUrl: '#urlFor(route = "wheelsMigrator", params = "format=json")#',
+	migrateTo: '#urlFor(route = "wheelsMigratorCommand", command = "migrateto", version = "_V_")#',
+	redo: '#urlFor(route = "wheelsMigratorCommand", command = "redomigration", version = "_V_")#',
+	method: '<cfif get("URLRewriting") eq "Off">get<cfelse>post</cfif>'
+};
+</script>
+</cfif>
+
+<!--- ============ TESTS PANEL ============ --->
+<cfif $get("enablePublicComponent")>
+<div class="wdb-panel" id="wdb-panel-tests">
+	<div class="wdb-panel-header">
+		<h3>Test Suite <span class="wdb-panel-note" id="wdb-tests-headline"></span></h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<div id="wdb-tests-body"><p class="wdb-muted">Open this tab to run the suite.</p></div>
+		<div id="wdb-tests-result" class="wdb-mig-result" style="display:none;"></div>
+		<div class="wdb-mig-toolbar">
+			<button class="wdb-mig-btn" onclick="wdbTestsRerun()">Run again</button>
+			<a class="wdb-mig-btn" style="text-decoration:none;" href="#urlFor(route = 'testbox')#" target="_blank">Open full runner</a>
+		</div>
+	</div>
+</div>
+<!--- The JSON format is built in: ../tests/json.cfm serialises the whole
+	TestBox result struct and suppresses the debug bar to avoid recursion. --->
+<script>
+window.wdbTests = {
+	runUrl: '#urlFor(route = "testbox", params = "format=json")#'
+};
+</script>
+</cfif>
+
+<!--- ============ PACKAGES PANEL ============ --->
+<cfif StructKeyExists(application.wheels, "enablePackagesComponent") AND application.wheels.enablePackagesComponent>
+<div class="wdb-panel" id="wdb-panel-packages">
+	<div class="wdb-panel-header">
+		<h3>Packages <span class="wdb-panel-note" id="wdb-packages-headline"></span></h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+		<div id="wdb-packages-body"><p class="wdb-muted">Loading&hellip;</p></div>
+		<div id="wdb-packages-result" class="wdb-mig-result" style="display:none;"></div>
+		<div class="wdb-mig-toolbar">
+			<a class="wdb-mig-btn" style="text-decoration:none;" href="#urlFor(route = 'wheelsPackageList')#" target="_blank">Open full list &amp; registry</a>
+		</div>
+	</div>
+</div>
+<script>
+window.wdbPackages = {
+	stateUrl: '#urlFor(route = "wheelsPackageList", params = "format=json")#'
+};
+</script>
+</cfif>
+
+<!--- ============ TOOLS PANEL ============ --->
+<cfif $get("enablePublicComponent")>
+<div class="wdb-panel" id="wdb-panel-tools">
+	<div class="wdb-panel-header">
+		<h3>Developer Tools</h3>
+		<button class="wdb-close-btn" onclick="wdbClosePanel()">&times;</button>
+	</div>
+	<div class="wdb-panel-body">
+
+		<!--- Grouped by what the developer is trying to do, so a first-class
+			tool (Routes has its own tab now) never sits at the same weight as
+			a link that just leaves the app. --->
+		<div class="wdb-section">
+			<div class="wdb-section-title">Inspect this application</div>
+			<div class="wdb-link-grid">
+				<a href="/wheels-docs/api/" class="wdb-link-card" target="_blank">
+					<svg viewBox="0 0 384 512"><path d="M64 0C28.7 0 0 28.7 0 64v384c0 35.3 28.7 64 64 64h256c35.3 0 64-28.7 64-64V160H256c-17.7 0-32-14.3-32-32V0H64zm192 0v128h128L256 0zM112 256h160c8.8 0 16 7.2 16 16s-7.2 16-16 16H112c-8.8 0-16-7.2-16-16s7.2-16 16-16z"/></svg>
+					API Reference
+				</a>
+			</div>
+		</div>
+
+		<div class="wdb-section">
+			<div class="wdb-section-title">Change this application</div>
+			<div class="wdb-link-grid">
+				<cfif $get("enablePluginsComponent")>
+				<a href="#urlFor(route = 'wheelsPlugins')#" class="wdb-link-card" target="_blank">
+					<svg viewBox="0 0 384 512"><path d="M96 0C78.3 0 64 14.3 64 32v96h64V32c0-17.7-14.3-32-32-32zm192 0c-17.7 0-32 14.3-32 32v96h64V32c0-17.7-14.3-32-32-32zM32 160c-17.7 0-32 14.3-32 32s14.3 32 32 32v32c0 77.4 55 142 128 156.8V480c0 17.7 14.3 32 32 32s32-14.3 32-32v-67.2C297 398 352 333.4 352 256v-32c17.7 0 32-14.3 32-32s-14.3-32-32-32H32z"/></svg>
+					Plugins <span class="wdb-card-note">legacy</span>
+				</a>
+				</cfif>
+			</div>
+		</div>
+
+		<div class="wdb-section">
+			<div class="wdb-section-title">Elsewhere</div>
+			<div class="wdb-link-grid">
+				<a href="/wheels-docs/guides/" class="wdb-link-card" target="_blank">
+					<svg viewBox="0 0 448 512"><path d="M96 0C43 0 0 43 0 96v320c0 53 43 96 96 96h320c17.7 0 32-14.3 32-32s-14.3-32-32-32H96c-17.7 0-32-14.3-32-32h352c17.7 0 32-14.3 32-32V32c0-17.7-14.3-32-32-32H96z"/></svg>
+					Guides <span class="wdb-card-note" title="Opens guides.wheels.dev in a new tab">&##8599;</span>
+				</a>
+			</div>
+		</div>
+
+	</div>
+</div>
+</cfif>
+
+<!--- ============ COMPLEXITY PANEL ============ --->
+<cfinclude template="/wheels/events/onrequestend/complexity-panel.cfm">
+
+<script><cfinclude template="/wheels/public/assets/js/debugbar.js"></script>
+</div>
+</cfoutput></cfsavecontent><cfoutput>#ReReplace(local.wdbHtml, "(?m)>\s+<", "><", "all")#</cfoutput>
 <!--- cfformat-ignore-end --->

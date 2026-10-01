@@ -1,66 +1,978 @@
 /**
- * Base Job class for Wheels framework
- * Provides common functionality for background jobs
+ * Base Job class for Wheels framework.
+ * Provides background job processing with database-backed persistence,
+ * retry logic with exponential backoff, and priority queue support.
+ *
+ * The wheels_jobs table is auto-created on first use — no migration needed.
+ *
+ * Usage:
+ *   // In app/jobs/SendWelcomeEmailJob.cfc
+ *   component extends="wheels.Job" {
+ *     function config() {
+ *       super.config();
+ *       this.queue = "mailers";
+ *       this.maxRetries = 5;
+ *     }
+ *     public void function perform(struct data = {}) {
+ *       // model() works here; sendEmail() is a controller function, so send through a mailer
+ *       user = model("User").findByKey(arguments.data.userId);
+ *       new app.mailers.UserMailer().sendWelcome(user);
+ *     }
+ *   }
+ *
+ *   // Enqueue from a controller:
+ *   job = new app.jobs.SendWelcomeEmailJob();
+ *   job.enqueue(data={userId: user.id});
  */
 component {
+
+	// Default job configuration (override in subclass config())
+	this.queue = "default";
+	this.priority = 0;
+	this.maxRetries = 3;
+	this.retryBackoff = "exponential";
+	this.timeout = 300;
+	this.baseDelay = 2;
+	this.maxDelay = 3600;
 
 	/**
 	 * Constructor
 	 */
 	public function init() {
+		config();
+		variables.$datasource = "";
+		if (StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "dataSourceName")) {
+			variables.$datasource = application.wheels.dataSourceName;
+		}
 		return this;
 	}
 
 	/**
-	 * Main job execution method to be overridden by subclasses
+	 * Override in subclasses to configure job options.
+	 */
+	public void function config() {
+	}
+
+	/**
+	 * Main job execution method. Must be overridden by subclasses.
 	 * @data Job data/parameters
 	 */
 	public void function perform(struct data = {}) {
-		throw(type="Wheels.NotImplemented", message="The perform() method must be implemented in the job subclass");
+		throw(type = "Wheels.NotImplemented", message = "The perform() method must be implemented in the job subclass.");
 	}
 
 	/**
-	 * Enqueue job for processing
-	 * @jobName Name of the job
-	 * @data Job data
-	 * @queue Queue name
-	 * @priority Job priority
+	 * Returns a model class object, so perform() can call model("User") as a controller does.
+	 * Delegates to application.wo.model(); a job extends no controller or model base class.
+	 * @name Name of the model, e.g. "User".
 	 */
-	public void function enqueue(
-		required string jobName,
-		struct data = {},
-		string queue = "default",
-		string priority = "normal"
-	) {
-		// Placeholder for queue implementation
-		// In a real implementation, this would add the job to a queue system
-		writeLog(
-			text="Job '#arguments.jobName#' enqueued to queue '#arguments.queue#' with priority '#arguments.priority#'",
-			type="information",
-			file="jobs"
+	public any function model(required string name) {
+		return application.wo.model(name = arguments.name);
+	}
+
+	/**
+	 * Enqueue this job for immediate processing.
+	 * @data Job data to pass to perform().
+	 * @queue Override the default queue name.
+	 * @priority Override the default priority (higher = processed first).
+	 */
+	public struct function enqueue(struct data = {}, string queue = this.queue, numeric priority = this.priority) {
+		return $enqueueJob(
+			jobClass = $persistableJobClass(),
+			data = arguments.data,
+			queue = arguments.queue,
+			priority = arguments.priority,
+			runAt = $now()
 		);
 	}
 
 	/**
-	 * Enqueue job for specific time
-	 * @jobName Name of the job
-	 * @data Job data
-	 * @queue Queue name
-	 * @priority Job priority
-	 * @runAt When to run the job
+	 * Enqueue this job for processing after a delay.
+	 * @seconds Number of seconds to wait before processing.
+	 * @data Job data to pass to perform().
+	 * @queue Override the default queue name.
+	 * @priority Override the default priority.
 	 */
-	public void function enqueueAt(
-		required string jobName,
+	public struct function enqueueIn(
+		required numeric seconds,
 		struct data = {},
-		string queue = "default",
-		string priority = "normal",
+		string queue = this.queue,
+		numeric priority = this.priority
+	) {
+		return $enqueueJob(
+			jobClass = $persistableJobClass(),
+			data = arguments.data,
+			queue = arguments.queue,
+			priority = arguments.priority,
+			runAt = DateAdd("s", arguments.seconds, $now())
+		);
+	}
+
+	/**
+	 * Enqueue this job for processing at a specific time.
+	 * @runAt Date/time when the job should be processed.
+	 * @data Job data to pass to perform().
+	 * @queue Override the default queue name.
+	 * @priority Override the default priority.
+	 */
+	public struct function enqueueAt(
+		required date runAt,
+		struct data = {},
+		string queue = this.queue,
+		numeric priority = this.priority
+	) {
+		return $enqueueJob(
+			jobClass = $persistableJobClass(),
+			data = arguments.data,
+			queue = arguments.queue,
+			priority = arguments.priority,
+			runAt = arguments.runAt
+		);
+	}
+
+	/**
+	 * Internal: The component path `enqueue()` persists to `wheels_jobs.jobClass`.
+	 *
+	 * `GetMetadata(this).name` is not safe to persist verbatim. On a case-insensitive
+	 * filesystem (macOS, Windows, or a macOS checkout bind-mounted into Docker) a miscased
+	 * `new app.jobs.sendwelcomeemailjob()` resolves, and Adobe CF reports the metadata name
+	 * with the caller's casing rather than the file's. A row enqueued that way names a class a
+	 * case-sensitive Linux worker cannot resolve (issue #3731). Canonicalize against the
+	 * directory listing so the persisted string always carries the on-disk casing.
+	 */
+	public string function $persistableJobClass() {
+		local.meta = GetMetadata(this);
+		return $canonicalJobClass(name = local.meta.name, path = StructKeyExists(local.meta, "path") ? local.meta.path : "");
+	}
+
+	/**
+	 * Internal: Rewrite a dotted component name so every segment that maps to a component of
+	 * `path` carries that entry's casing as it exists on disk.
+	 *
+	 * Walks the name from its last segment (the .cfc file) up through its package directories,
+	 * pairing each with the matching trailing component of `path`. For each pair, the parent
+	 * directory is listed and the entry that matches case-insensitively supplies the casing (an
+	 * exact match wins, so a case-sensitive filesystem holding both `Foo.cfc` and `foo.cfc` is
+	 * left alone). The walk stops at the first segment that does not name its path component —
+	 * a mapping whose name differs from its directory — so mapping roots are never rewritten.
+	 * Any failure keeps the segment as given: this must never break an enqueue.
+	 *
+	 * @name The dotted component name, e.g. from `GetMetadata(obj).name`.
+	 * @path The component's absolute file path, e.g. from `GetMetadata(obj).path`.
+	 */
+	public string function $canonicalJobClass(required string name, string path = "") {
+		local.segments = ListToArray(arguments.name, ".");
+		local.current = Replace(arguments.path, "\", "/", "all");
+		local.segmentCount = ArrayLen(local.segments);
+		if (!local.segmentCount || Right(local.current, 4) != ".cfc") {
+			return arguments.name;
+		}
+		for (local.i = local.segmentCount; local.i >= 1; local.i--) {
+			local.entryName = ListLast(local.current, "/");
+			local.isLeaf = local.i == local.segmentCount;
+			local.expected = local.isLeaf ? local.segments[local.i] & ".cfc" : local.segments[local.i];
+			if (!Len(local.entryName) || CompareNoCase(local.entryName, local.expected) != 0) {
+				break;
+			}
+			local.parentLength = Len(local.current) - Len(local.entryName) - 1;
+			if (local.parentLength <= 0) {
+				break;
+			}
+			local.parentDir = Left(local.current, local.parentLength);
+			local.onDisk = $onDiskEntryName(directory = local.parentDir, entryName = local.entryName);
+			if (Len(local.onDisk)) {
+				local.segments[local.i] = local.isLeaf ? Left(local.onDisk, Len(local.onDisk) - 4) : local.onDisk;
+			}
+			local.current = local.parentDir;
+		}
+		return ArrayToList(local.segments, ".");
+	}
+
+	/**
+	 * Internal: The name `entryName` has in `directory`'s listing — itself when an exact match
+	 * exists, the single case-insensitive match otherwise, and "" when neither is unambiguous
+	 * or the directory cannot be listed.
+	 */
+	public string function $onDiskEntryName(required string directory, required string entryName) {
+		local.rv = "";
+		local.matches = 0;
+		try {
+			// Iterate only: BoxLang returns a fixed-size array (cross-engine invariant 20).
+			for (local.candidate in DirectoryList(arguments.directory, false, "name")) {
+				if (Compare(local.candidate, arguments.entryName) == 0) {
+					return local.candidate;
+				}
+				if (CompareNoCase(local.candidate, arguments.entryName) == 0) {
+					local.matches++;
+					local.rv = local.candidate;
+				}
+			}
+		} catch (any e) {
+			return "";
+		}
+		return local.matches == 1 ? local.rv : "";
+	}
+
+	/**
+	 * Internal: Persist a job to the queue table.
+	 */
+	private struct function $enqueueJob(
+		required string jobClass,
+		required struct data,
+		required string queue,
+		required numeric priority,
 		required date runAt
 	) {
-		// Placeholder for scheduled queue implementation
+		local.id = CreateUUID();
+
+		arguments.data["$wheelsJobTimeout"] = this.timeout;
+
+		// Capture tenant context so jobs run against the correct tenant datasource.
+		// Persist id + dataSource only — never dump tenant.config into the queue row.
+		if (
+			IsDefined("request.wheels.tenant.dataSource")
+			&& Len(request.wheels.tenant.dataSource)
+		) {
+			arguments.data["$wheelsTenantContext"] = {
+				id = StructKeyExists(request.wheels.tenant, "id") ? request.wheels.tenant.id : "",
+				dataSource = request.wheels.tenant.dataSource
+			};
+		}
+
+		local.serializedData = SerializeJSON(arguments.data);
+		local.now = $now();
+
+		try {
+			$insertJobRow(
+				id = local.id,
+				jobClass = arguments.jobClass,
+				queue = arguments.queue,
+				serializedData = local.serializedData,
+				priority = arguments.priority,
+				runAt = arguments.runAt,
+				enqueuedAt = local.now
+			);
+		} catch (any e) {
+			// Auto-create table on first use and retry
+			if ($ensureJobTable()) {
+				try {
+					$insertJobRow(
+						id = local.id,
+						jobClass = arguments.jobClass,
+						queue = arguments.queue,
+						serializedData = local.serializedData,
+						priority = arguments.priority,
+						runAt = arguments.runAt,
+						enqueuedAt = local.now
+					);
+				} catch (any e2) {
+					writeLog(text = "Job enqueue failed after table creation: #e2.message#", type = "error", file = "wheels_jobs");
+					return {id = local.id, jobClass = arguments.jobClass, persisted = false, error = e2.message};
+				}
+			} else {
+				writeLog(text = "Job '#arguments.jobClass#' could not be persisted: #e.message#", type = "warning", file = "wheels_jobs");
+				return {id = local.id, jobClass = arguments.jobClass, persisted = false, error = e.message};
+			}
+		}
+
 		writeLog(
-			text="Job '#arguments.jobName#' scheduled for #dateTimeFormat(arguments.runAt, 'yyyy-mm-dd HH:nn:ss')#",
-			type="information",
-			file="jobs"
+			text = "Job '#arguments.jobClass#' [#local.id#] enqueued to queue '#arguments.queue#' with priority #arguments.priority#",
+			type = "information",
+			file = "wheels_jobs"
 		);
+
+		return {id = local.id, jobClass = arguments.jobClass, status = "pending", persisted = true};
+	}
+
+	/**
+	 * Internal: Execute the wheels_jobs INSERT for a new pending job.
+	 * Shared by the first-attempt and table-create-retry paths in $enqueueJob.
+	 */
+	private void function $insertJobRow(
+		required string id,
+		required string jobClass,
+		required string queue,
+		required string serializedData,
+		required numeric priority,
+		required date runAt,
+		required date enqueuedAt
+	) {
+		queryExecute(
+			"INSERT INTO wheels_jobs (id, jobClass, queue, data, priority, status, attempts, maxRetries, runAt, createdAt, updatedAt)
+			VALUES (:id, :jobClass, :queue, :data, :priority, 'pending', 0, :maxRetries, :runAt, :createdAt, :updatedAt)",
+			{
+				id = {value = arguments.id, cfsqltype = "cf_sql_varchar"},
+				jobClass = {value = arguments.jobClass, cfsqltype = "cf_sql_varchar"},
+				queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"},
+				data = {value = arguments.serializedData, cfsqltype = "cf_sql_longvarchar"},
+				priority = {value = arguments.priority, cfsqltype = "cf_sql_integer"},
+				maxRetries = {value = this.maxRetries, cfsqltype = "cf_sql_integer"},
+				runAt = {value = arguments.runAt, cfsqltype = "cf_sql_timestamp"},
+				createdAt = {value = arguments.enqueuedAt, cfsqltype = "cf_sql_timestamp"},
+				updatedAt = {value = arguments.enqueuedAt, cfsqltype = "cf_sql_timestamp"}
+			},
+			{datasource = variables.$datasource}
+		);
+	}
+
+	/**
+	 * Process pending jobs from the queue. Call this from a scheduled task or controller action.
+	 * @queue Queue name to process. Default processes all queues.
+	 * @limit Maximum number of jobs to process in this batch.
+	 */
+	public struct function processQueue(string queue = "", numeric limit = 10) {
+		local.result = {processed = 0, failed = 0, skipped = 0, errors = []};
+		local.params = {
+			runAt = {value = $now(), cfsqltype = "cf_sql_timestamp"}
+		};
+
+		local.sql = "SELECT id, jobClass, queue, data, attempts, maxRetries
+			FROM wheels_jobs
+			WHERE status = 'pending' AND runAt <= :runAt";
+
+		if (Len(arguments.queue)) {
+			local.sql &= " AND queue = :queue";
+			local.params.queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"};
+		}
+
+		local.sql &= " ORDER BY priority DESC, runAt ASC";
+
+		try {
+			local.jobs = queryExecute(local.sql, local.params, {datasource = variables.$datasource, maxrows = arguments.limit});
+		} catch (any e) {
+			$ensureJobTable();
+			try {
+				local.jobs = queryExecute(local.sql, local.params, {datasource = variables.$datasource, maxrows = arguments.limit});
+			} catch (any e2) {
+				ArrayAppend(local.result.errors, e2.message);
+				return local.result;
+			}
+		}
+
+		for (local.row in local.jobs) {
+			local.jobResult = $processJob(local.row);
+			if (local.jobResult.skipped) {
+				// Another worker claimed the job between our SELECT and the claim UPDATE
+				local.result.skipped++;
+				continue;
+			}
+			if (local.jobResult.success) {
+				local.result.processed++;
+			} else {
+				local.result.failed++;
+				ArrayAppend(local.result.errors, local.jobResult.error);
+			}
+		}
+
+		return local.result;
+	}
+
+	/**
+	 * Internal: Turn a persisted `jobClass` string back into a job instance.
+	 *
+	 * `jobClass` is written on enqueue by `$persistableJobClass()` and read back here as a
+	 * component path, so the round trip depends on that string still resolving — including its
+	 * casing, on a case-sensitive filesystem. Lucee derives the metadata name from the file, but
+	 * Adobe echoes a miscased caller's path when the filesystem lets it resolve (#3731), so the
+	 * enqueue side canonicalizes against the directory listing; JobClassRoundTripSpec pins it.
+	 *
+	 * When it does not resolve, the raw engine error is `component not found` for a class that
+	 * plainly exists on disk, which sends people to look at mappings and deployment. Name the
+	 * real shape of the problem instead: a string read out of a queue row (issue #3351).
+	 *
+	 * @jobClass The component path as persisted in wheels_jobs.
+	 * @jobId The queue row's id, for the error message. Optional.
+	 */
+	public any function $instantiateJobClass(required string jobClass, string jobId = "") {
+		local.rowLabel = Len(arguments.jobId) ? " named by queue row [#arguments.jobId#]" : "";
+		if (!$isAllowedJobClass(arguments.jobClass)) {
+			Throw(
+				type = "Wheels.JobClassNotAllowed",
+				message = "The job class `#arguments.jobClass#`#local.rowLabel# is not on an allowed jobs path.",
+				extendedInfo = "CreateObject is restricted to `app.jobs` (and any `jobClassPrefixes` you configure). A `perform()` method is not enough."
+			);
+		}
+		try {
+			local.rv = CreateObject("component", arguments.jobClass);
+		} catch (any e) {
+			Throw(
+				type = "Wheels.JobClassNotFound",
+				message = "The job class `#arguments.jobClass#`#local.rowLabel# could not be instantiated: #e.message#",
+				extendedInfo = "This path was persisted to `wheels_jobs.jobClass` when the job was enqueued and is resolved as a component path now. If the file exists, compare its name and directories to the string above CHARACTER BY CHARACTER — component paths are case-sensitive on Linux but not on macOS or Windows, so a casing mismatch resolves in development and fails in production. It also fails if the job class was renamed, moved, or deleted while rows referencing it were still queued."
+			);
+		}
+		// A job row names something to instantiate and then call perform() on. Anything without
+		// perform() is not a job, and failing here says so rather than failing later inside the
+		// job's own execution where it reads as a job bug. Note this narrows but does not close
+		// the database-string-to-CreateObject shape the issue flags: the actual guarantee is that
+		// only $enqueueJob writes this column.
+		if (!StructKeyExists(local.rv, "perform")) {
+			Throw(
+				type = "Wheels.InvalidJobClass",
+				message = "The component `#arguments.jobClass#`#local.rowLabel# is not a job — it has no `perform()` method.",
+				extendedInfo = "`wheels_jobs.jobClass` must name a component extending `wheels.Job`. Only the framework writes this column; a value that names something else means the row was written by something other than `enqueue()`."
+			);
+		}
+		if (StructKeyExists(local.rv, "init")) {
+			local.rv.init();
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Internal: Process a single job row.
+	 */
+	private struct function $processJob(required struct jobRow) {
+		local.result = {success = false, skipped = false, error = ""};
+
+		// Mark as processing using optimistic locking: the status guard ensures only
+		// one concurrent worker can claim the job. Use the result option to get the
+		// affected-row count from the same connection that executed the UPDATE. A
+		// separate verification SELECT can fail on BoxLang + PostgreSQL when the
+		// connection pool hands out a different connection that cannot see the
+		// uncommitted UPDATE.
+		try {
+			queryExecute(
+				"UPDATE wheels_jobs
+				SET status = 'processing', attempts = attempts + 1, updatedAt = :updatedAt
+				WHERE id = :id AND status = 'pending'",
+				{
+					updatedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+					id = {value = arguments.jobRow.id, cfsqltype = "cf_sql_varchar"}
+				},
+				{datasource = variables.$datasource, result = "local.updateResult"}
+			);
+			if ((local.updateResult.recordCount ?: 0) == 0) {
+				// Another worker already claimed this job — skip without executing
+				local.result.skipped = true;
+				return local.result;
+			}
+		} catch (any e) {
+			local.result.error = "Failed to lock job #arguments.jobRow.id#: #e.message#";
+			return local.result;
+		}
+
+		// Initialized before the try: the catch below also handles instantiation and
+		// deserialization failures, and the tenant cleanup after it must not read an
+		// undefined variable (which would escape $processJob and abort the whole batch,
+		// masking the real job failure).
+		local.hasTenantContext = false;
+
+		// Backoff settings for retry scheduling. Defaults come from this processing
+		// instance; overridden from the failing job's own class once it instantiates,
+		// mirroring JobWorker.$scheduleRetry so both paths share one retry schedule.
+		local.backoffBaseDelay = this.baseDelay;
+		local.backoffMaxDelay = this.maxDelay;
+		local.backoffRetryBackoff = this.retryBackoff;
+
+		try {
+			// Instantiate and execute the job
+			local.jobInstance = $instantiateJobClass(jobClass = arguments.jobRow.jobClass, jobId = arguments.jobRow.id);
+			if (StructKeyExists(local.jobInstance, "baseDelay")) {
+				local.backoffBaseDelay = local.jobInstance.baseDelay;
+			}
+			if (StructKeyExists(local.jobInstance, "maxDelay")) {
+				local.backoffMaxDelay = local.jobInstance.maxDelay;
+			}
+			if (StructKeyExists(local.jobInstance, "retryBackoff")) {
+				local.backoffRetryBackoff = local.jobInstance.retryBackoff;
+			}
+			local.jobData = DeserializeJSON(arguments.jobRow.data);
+
+			// Restore tenant context if the job was enqueued within a tenant scope and
+			// strip the internal $wheelsTenantContext key before passing data to perform()
+			local.hasTenantContext = $restoreTenantContext(local.jobData);
+			local.timeoutSeconds = $takeJobTimeout(local.jobData, local.jobInstance.timeout ?: 300);
+			local.performOutcome = $runPerformWithTimeout(
+				jobInstance = local.jobInstance,
+				jobData = local.jobData,
+				timeoutSeconds = local.timeoutSeconds
+			);
+			if (local.performOutcome.timedOut) {
+				throw(type = "Wheels.JobTimeout", message = local.performOutcome.error);
+			}
+			if (!local.performOutcome.success) {
+				throw(type = "Wheels.JobFailed", message = local.performOutcome.error);
+			}
+
+			// Mark as completed
+			queryExecute(
+				"UPDATE wheels_jobs
+				SET status = 'completed', completedAt = :completedAt, updatedAt = :updatedAt
+				WHERE id = :id AND status = 'processing'",
+				{
+					completedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+					updatedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+					id = {value = arguments.jobRow.id, cfsqltype = "cf_sql_varchar"}
+				},
+				{datasource = variables.$datasource}
+			);
+
+			writeLog(
+				text = "Job '#arguments.jobRow.jobClass#' [#arguments.jobRow.id#] completed successfully",
+				type = "information",
+				file = "wheels_jobs"
+			);
+
+			local.result.success = true;
+
+		} catch (any e) {
+			// Determine retry eligibility
+			local.currentAttempts = Val(arguments.jobRow.attempts) + 1;
+			local.maxRetries = Val(arguments.jobRow.maxRetries);
+
+			if (local.currentAttempts <= local.maxRetries) {
+				// Schedule retry with configurable exponential backoff, capped at maxDelay.
+				// Settings were captured from the failing job's class above so subclass
+				// overrides apply (the base instance defaults are only the fallback).
+				local.backoffSeconds = $backoffDelay(
+					attempts = local.currentAttempts,
+					baseDelay = local.backoffBaseDelay,
+					maxDelay = local.backoffMaxDelay,
+					retryBackoff = local.backoffRetryBackoff
+				);
+				local.nextRunAt = DateAdd("s", local.backoffSeconds, $now());
+
+				queryExecute(
+					"UPDATE wheels_jobs
+					SET status = 'pending',
+						lastError = :lastError,
+						runAt = :runAt,
+						updatedAt = :updatedAt
+					WHERE id = :id AND status = 'processing'",
+					{
+						lastError = {value = Left(e.message, 1000), cfsqltype = "cf_sql_longvarchar"},
+						runAt = {value = local.nextRunAt, cfsqltype = "cf_sql_timestamp"},
+						updatedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+						id = {value = arguments.jobRow.id, cfsqltype = "cf_sql_varchar"}
+					},
+					{datasource = variables.$datasource}
+				);
+
+				writeLog(
+					text = "Job '#arguments.jobRow.jobClass#' [#arguments.jobRow.id#] failed (attempt #local.currentAttempts#/#local.maxRetries#), retrying in #local.backoffSeconds#s: #e.message#",
+					type = "warning",
+					file = "wheels_jobs"
+				);
+			} else {
+				// Max retries exceeded — mark as failed (dead letter)
+				queryExecute(
+					"UPDATE wheels_jobs
+					SET status = 'failed',
+						failedAt = :failedAt,
+						lastError = :lastError,
+						updatedAt = :updatedAt
+					WHERE id = :id AND status = 'processing'",
+					{
+						failedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+						lastError = {value = Left(e.message, 1000), cfsqltype = "cf_sql_longvarchar"},
+						updatedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+						id = {value = arguments.jobRow.id, cfsqltype = "cf_sql_varchar"}
+					},
+					{datasource = variables.$datasource}
+				);
+
+				writeLog(
+					text = "Job '#arguments.jobRow.jobClass#' [#arguments.jobRow.id#] permanently failed after #local.maxRetries# attempts: #e.message#",
+					type = "error",
+					file = "wheels_jobs"
+				);
+			}
+
+			local.result.error = "Job #arguments.jobRow.id# (#arguments.jobRow.jobClass#): #e.message#";
+		}
+
+		// Clean up tenant context after job execution
+		if (local.hasTenantContext) {
+			$clearTenantContext();
+		}
+
+		return local.result;
+	}
+
+	/**
+	 * Restore tenant context from job data when the job was enqueued within a tenant
+	 * scope, and strip the internal $wheelsTenantContext key from the passed data
+	 * struct (by reference) before it reaches perform(). Returns true when a tenant
+	 * context was restored — the caller must $clearTenantContext() after execution.
+	 * Public with $ prefix so JobWorker's worker path shares the exact same logic.
+	 */
+	public boolean function $restoreTenantContext(required struct jobData) {
+		local.restored = false;
+		if (StructKeyExists(arguments.jobData, "$wheelsTenantContext") && IsStruct(arguments.jobData["$wheelsTenantContext"])) {
+			local.tenantCtx = arguments.jobData["$wheelsTenantContext"];
+			local.ds = StructKeyExists(local.tenantCtx, "dataSource") ? ToString(local.tenantCtx.dataSource) : "";
+			if (Len(local.ds) && $isAllowedJobDataSource(local.ds)) {
+				if (!StructKeyExists(request, "wheels")) {
+					request.wheels = {};
+				}
+				request.wheels.tenant = {
+					id = StructKeyExists(local.tenantCtx, "id") ? local.tenantCtx.id : "",
+					dataSource = local.ds
+				};
+				local.restored = true;
+			}
+			StructDelete(arguments.jobData, "$wheelsTenantContext");
+		}
+		return local.restored;
+	}
+
+	/**
+	 * Remove a previously restored tenant context from the request scope.
+	 */
+	public void function $clearTenantContext() {
+		if (StructKeyExists(request, "wheels")) {
+			StructDelete(request.wheels, "tenant");
+		}
+	}
+
+	/**
+	 * Get the count of jobs by status.
+	 * @queue Optional queue name to filter by.
+	 */
+	public struct function queueStats(string queue = "") {
+		local.stats = {pending = 0, processing = 0, completed = 0, failed = 0, total = 0};
+
+		try {
+			local.sql = "SELECT status, COUNT(*) as cnt FROM wheels_jobs";
+			local.params = {};
+
+			if (Len(arguments.queue)) {
+				local.sql &= " WHERE queue = :queue";
+				local.params.queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"};
+			}
+
+			local.sql &= " GROUP BY status";
+			local.result = queryExecute(local.sql, local.params, {datasource = variables.$datasource});
+
+			for (local.row in local.result) {
+				if (StructKeyExists(local.stats, local.row.status)) {
+					local.stats[local.row.status] = local.row.cnt;
+				}
+				local.stats.total += local.row.cnt;
+			}
+		} catch (any e) {
+			// Table doesn't exist yet — auto-create for next time
+			$ensureJobTable();
+		}
+
+		return local.stats;
+	}
+
+	/**
+	 * Retry all failed jobs.
+	 * @queue Optional queue name to filter by.
+	 */
+	public numeric function retryFailed(string queue = "") {
+		local.sql = "UPDATE wheels_jobs
+			SET status = 'pending', attempts = 0, lastError = NULL, failedAt = NULL,
+				runAt = :runAt, updatedAt = :updatedAt
+			WHERE status = 'failed'";
+		local.params = {
+			runAt = {value = $now(), cfsqltype = "cf_sql_timestamp"},
+			updatedAt = {value = $now(), cfsqltype = "cf_sql_timestamp"}
+		};
+
+		if (Len(arguments.queue)) {
+			local.sql &= " AND queue = :queue";
+			local.params.queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"};
+		}
+
+		try {
+			local.countSql = "SELECT COUNT(*) AS cnt FROM wheels_jobs WHERE status = 'failed'";
+			local.countParams = {};
+			if (Len(arguments.queue)) {
+				local.countSql &= " AND queue = :queue";
+				local.countParams.queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"};
+			}
+			local.countResult = queryExecute(local.countSql, local.countParams, {datasource = variables.$datasource});
+			queryExecute(local.sql, local.params, {datasource = variables.$datasource});
+			return local.countResult.cnt ?: 0;
+		} catch (any e) {
+			$ensureJobTable();
+			return 0;
+		}
+	}
+
+	/**
+	 * Purge completed jobs older than the specified number of days.
+	 * @days Number of days to keep completed jobs.
+	 * @queue Optional queue name to filter by.
+	 */
+	public numeric function purgeCompleted(numeric days = 7, string queue = "") {
+		local.cutoff = DateAdd("d", -arguments.days, $now());
+		local.sql = "DELETE FROM wheels_jobs WHERE status = 'completed' AND completedAt < :cutoff";
+		local.params = {
+			cutoff = {value = local.cutoff, cfsqltype = "cf_sql_timestamp"}
+		};
+
+		if (Len(arguments.queue)) {
+			local.sql &= " AND queue = :queue";
+			local.params.queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"};
+		}
+
+		try {
+			local.countSql = "SELECT COUNT(*) AS cnt FROM wheels_jobs WHERE status = 'completed' AND completedAt < :cutoff";
+			local.countParams = {cutoff = {value = local.cutoff, cfsqltype = "cf_sql_timestamp"}};
+			if (Len(arguments.queue)) {
+				local.countSql &= " AND queue = :queue";
+				local.countParams.queue = {value = arguments.queue, cfsqltype = "cf_sql_varchar"};
+			}
+			local.countResult = queryExecute(local.countSql, local.countParams, {datasource = variables.$datasource});
+			queryExecute(local.sql, local.params, {datasource = variables.$datasource});
+			return local.countResult.cnt ?: 0;
+		} catch (any e) {
+			$ensureJobTable();
+			return 0;
+		}
+	}
+
+	/**
+	 * Auto-create the wheels_jobs table if it doesn't exist.
+	 * Uses database-agnostic SQL compatible with MySQL, PostgreSQL, SQL Server, H2, and SQLite.
+	 * Returns true if the table was created or already exists, false if creation failed.
+	 * Public with $ prefix so JobWorker can bootstrap the table on a fresh database.
+	 */
+	public boolean function $ensureJobTable() {
+		try {
+			// Check if table already exists by querying it
+			queryExecute("SELECT COUNT(*) AS cnt FROM wheels_jobs WHERE 1=0", {}, {datasource = variables.$datasource});
+			return true;
+		} catch (any e) {
+			// Table doesn't exist — create it
+		}
+
+		try {
+			// Detect actual database type from the datasource via JDBC metadata.
+			// We query the datasource directly rather than using application.wheels.adapterName
+			// because the adapter may have been detected from a different datasource.
+			local.dbType = $detectDatabaseType();
+
+			// Use database-appropriate types
+			if (local.dbType == "oracle") {
+				local.varcharType = "VARCHAR2";
+				local.textType = "CLOB";
+				local.datetimeType = "TIMESTAMP";
+			} else if (local.dbType == "postgresql") {
+				local.varcharType = "VARCHAR";
+				local.textType = "TEXT";
+				local.datetimeType = "TIMESTAMP";
+			} else if (local.dbType == "h2") {
+				local.varcharType = "VARCHAR";
+				local.textType = "CLOB";
+				local.datetimeType = "TIMESTAMP";
+			} else {
+				local.varcharType = "VARCHAR";
+				local.textType = "TEXT";
+				local.datetimeType = "DATETIME";
+			}
+
+			queryExecute("
+				CREATE TABLE wheels_jobs (
+					id #local.varcharType#(36) NOT NULL PRIMARY KEY,
+					jobClass #local.varcharType#(255) NOT NULL,
+					queue #local.varcharType#(100) DEFAULT 'default' NOT NULL,
+					data #local.textType#,
+					priority INT DEFAULT 0 NOT NULL,
+					status #local.varcharType#(20) DEFAULT 'pending' NOT NULL,
+					attempts INT DEFAULT 0 NOT NULL,
+					maxRetries INT DEFAULT 3 NOT NULL,
+					lastError #local.textType#,
+					runAt #local.datetimeType#,
+					completedAt #local.datetimeType#,
+					failedAt #local.datetimeType#,
+					createdAt #local.datetimeType#,
+					updatedAt #local.datetimeType#
+				)
+			", {}, {datasource = variables.$datasource});
+
+			// Add indexes for efficient queue processing
+			try {
+				queryExecute("CREATE INDEX idx_wjobs_processing ON wheels_jobs (status, runAt, priority)", {}, {datasource = variables.$datasource});
+				queryExecute("CREATE INDEX idx_wjobs_queue ON wheels_jobs (queue, status)", {}, {datasource = variables.$datasource});
+				queryExecute("CREATE INDEX idx_wjobs_cleanup ON wheels_jobs (status, completedAt)", {}, {datasource = variables.$datasource});
+			} catch (any indexError) {
+				// Indexes are optional — don't fail if they can't be created
+			}
+
+			writeLog(text = "Auto-created wheels_jobs table", type = "information", file = "wheels_jobs");
+			return true;
+		} catch (any createError) {
+			writeLog(text = "Failed to auto-create wheels_jobs table: #createError.message#", type = "error", file = "wheels_jobs");
+			return false;
+		}
+	}
+
+	public boolean function $isAllowedJobClass(required string jobClass) {
+		local.name = Replace(Replace(Trim(arguments.jobClass), "/", ".", "all"), "\", ".", "all");
+		local.prefixes = ListToArray($jobClassPrefixes());
+		for (local.prefix in local.prefixes) {
+			local.prefix = Trim(local.prefix);
+			if (!Len(local.prefix)) {
+				continue;
+			}
+			if (CompareNoCase(local.name, local.prefix) == 0) {
+				return true;
+			}
+			if (Len(local.name) > Len(local.prefix) && CompareNoCase(Left(local.name, Len(local.prefix) + 1), local.prefix & ".") == 0) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public string function $jobClassPrefixes() {
+		local.prefixes = "app.jobs";
+		if (StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "jobClassPrefixes") && Len(application.wheels.jobClassPrefixes)) {
+			local.prefixes = ListAppend(local.prefixes, application.wheels.jobClassPrefixes);
+		}
+		if (
+			!StructKeyExists(application, "wheels")
+			|| !StructKeyExists(application.wheels, "environment")
+			|| CompareNoCase(application.wheels.environment, "production") != 0
+		) {
+			local.prefixes = ListAppend(local.prefixes, "wheels.tests._assets.jobs");
+		}
+		return local.prefixes;
+	}
+
+	public boolean function $isAllowedJobDataSource(required string dataSource) {
+		return ListFindNoCase($allowedJobDataSources(), arguments.dataSource) > 0;
+	}
+
+	public string function $allowedJobDataSources() {
+		local.names = "";
+		if (StructKeyExists(application, "wheels")) {
+			if (StructKeyExists(application.wheels, "dataSourceName") && Len(application.wheels.dataSourceName)) {
+				local.names = ListAppend(local.names, application.wheels.dataSourceName);
+			}
+			if (StructKeyExists(application.wheels, "coreTestDataSourceName") && Len(application.wheels.coreTestDataSourceName)) {
+				local.names = ListAppend(local.names, application.wheels.coreTestDataSourceName);
+			}
+			if (StructKeyExists(application.wheels, "tenantDataSources")) {
+				if (IsArray(application.wheels.tenantDataSources)) {
+					local.names = ListAppend(local.names, ArrayToList(application.wheels.tenantDataSources));
+				} else if (Len(application.wheels.tenantDataSources)) {
+					local.names = ListAppend(local.names, application.wheels.tenantDataSources);
+				}
+			}
+		}
+		try {
+			local.meta = GetApplicationMetaData();
+			if (IsStruct(local.meta) && StructKeyExists(local.meta, "datasources") && IsStruct(local.meta.datasources)) {
+				for (local.dsName in local.meta.datasources) {
+					local.names = ListAppend(local.names, local.dsName);
+				}
+			}
+		} catch (any e) {
+		}
+		return local.names;
+	}
+
+	public numeric function $takeJobTimeout(required struct jobData, numeric fallback = 300) {
+		local.timeout = arguments.fallback;
+		if (StructKeyExists(arguments.jobData, "$wheelsJobTimeout") && IsNumeric(arguments.jobData["$wheelsJobTimeout"])) {
+			local.timeout = Val(arguments.jobData["$wheelsJobTimeout"]);
+		}
+		StructDelete(arguments.jobData, "$wheelsJobTimeout");
+		if (!IsNumeric(local.timeout) || local.timeout <= 0) {
+			return 300;
+		}
+		return local.timeout;
+	}
+
+	public struct function $runPerformWithTimeout(
+		required any jobInstance,
+		required struct jobData,
+		required numeric timeoutSeconds
+	) {
+		local.rv = {success = false, error = "", timedOut = false};
+		local.timeoutMs = Max(1, Int(arguments.timeoutSeconds)) * 1000;
+		local.threadName = "wheelsJob" & Replace(CreateUUID(), "-", "", "all");
+		local.box = {instance = arguments.jobInstance, data = arguments.jobData, ok = false, err = ""};
+
+		try {
+			thread name="#local.threadName#" action="run" box="#local.box#" {
+				try {
+					attributes.box.instance.perform(data = attributes.box.data);
+					thread.ok = true;
+					thread.err = "";
+				} catch (any e) {
+					thread.ok = false;
+					thread.err = e.message;
+				}
+			}
+			thread action="join" name="#local.threadName#" timeout="#local.timeoutMs#";
+			local.meta = cfthread[local.threadName];
+			local.status = StructKeyExists(local.meta, "status") ? ToString(local.meta.status) : "";
+			if (CompareNoCase(local.status, "COMPLETED") != 0 && CompareNoCase(local.status, "TERMINATED") != 0) {
+				try {
+					thread action="terminate" name="#local.threadName#";
+				} catch (any termErr) {
+				}
+				local.rv.timedOut = true;
+				local.rv.error = "Job timed out after #arguments.timeoutSeconds# seconds";
+				return local.rv;
+			}
+			if (StructKeyExists(local.meta, "ok") && local.meta.ok) {
+				local.rv.success = true;
+				return local.rv;
+			}
+			local.rv.error = (StructKeyExists(local.meta, "err") && Len(local.meta.err)) ? local.meta.err : "Job failed";
+			return local.rv;
+		} catch (any threadErr) {
+			// Fail closed. Inline perform() would hang until the job finished.
+			local.rv.timedOut = true;
+			local.rv.error = "Job timed out after #arguments.timeoutSeconds# seconds";
+			return local.rv;
+		}
+	}
+
+	/**
+	 * Retry delay in seconds. `retryBackoff=exponential` is the live schedule
+	 * (`baseDelay * 2^attempts`, capped at `maxDelay`). `linear` is a reserved
+	 * no-op and keeps that same formula.
+	 */
+	public numeric function $backoffDelay(
+		required numeric attempts,
+		numeric baseDelay = this.baseDelay,
+		numeric maxDelay = this.maxDelay,
+		string retryBackoff = this.retryBackoff
+	) {
+		if (CompareNoCase(arguments.retryBackoff, "linear") == 0) {
+			// reserved no-op — exponential remains the schedule
+		}
+		return Min(arguments.baseDelay * (2 ^ arguments.attempts), arguments.maxDelay);
+	}
+
+	/**
+	 * Returns Now() truncated to whole seconds.
+	 * Prevents MySQL/H2 DATETIME rounding: when fractional seconds >= 0.5,
+	 * these databases round UP to the next second, making runAt appear in the future.
+	 */
+	private date function $now() {
+		local.n = Now();
+		return CreateDateTime(Year(local.n), Month(local.n), Day(local.n), Hour(local.n), Minute(local.n), Second(local.n));
+	}
+
+	/**
+	 * Detect the database type from the actual datasource via JDBC metadata.
+	 * Returns: "oracle", "postgresql", "h2", "mysql", "sqlserver", "sqlite", or "default".
+	 * Public with $ prefix so JobWorker can pick database-appropriate SQL syntax.
+	 */
+	public string function $detectDatabaseType() {
+		try {
+			cfdbinfo(type = "version", datasource = "#variables.$datasource#", name = "local.info");
+			local.product = local.info.database_productname;
+			if (FindNoCase("oracle", local.product)) return "oracle";
+			if (FindNoCase("postgre", local.product)) return "postgresql";
+			if (FindNoCase("h2", local.product)) return "h2";
+			if (FindNoCase("mysql", local.product) || FindNoCase("mariadb", local.product)) return "mysql";
+			if (FindNoCase("sql server", local.product)) return "sqlserver";
+			if (FindNoCase("sqlite", local.product)) return "sqlite";
+		} catch (any e) {
+			// cfdbinfo not available — fall through to default
+		}
+		return "default";
 	}
 }

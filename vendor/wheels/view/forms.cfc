@@ -13,15 +13,7 @@ component {
 		$args(name = "endFormTag", args = arguments);
 
 		// Encode all prepend / append type arguments if specified.
-		if (IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
-			if (Len(arguments.prepend)) {
-				arguments.prepend = EncodeForHTML($canonicalize(arguments.prepend));
-			}
-			if (Len(arguments.append)) {
-				arguments.append = EncodeForHTML($canonicalize(arguments.append));
-			}
-		}
-		arguments.encode = IsBoolean(arguments.encode) && !arguments.encode ? false : true;
+		$encodeArgsForHtml(args = arguments, keys = "prepend,append");
 
 		if (StructKeyExists(request.wheels, "currentFormMethod")) {
 			StructDelete(request.wheels, "currentFormMethod");
@@ -71,75 +63,41 @@ component {
 		any encode
 	) {
 		$args(name = "startFormTag", args = arguments);
-		local.routeAndMethodMatch = false;
 
 		// Encode all prepend / append type arguments if specified.
-		if (IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
-			if (Len(arguments.prepend)) {
-				arguments.prepend = EncodeForHTML($canonicalize(arguments.prepend));
-			}
-			if (Len(arguments.append)) {
-				arguments.append = EncodeForHTML($canonicalize(arguments.append));
-			}
-		}
-		arguments.encode = IsBoolean(arguments.encode) && !arguments.encode ? false : true;
+		$encodeArgsForHtml(args = arguments, keys = "prepend,append");
+		arguments.encode = $coerceEncode(arguments.encode, true);
 
 		// sets a flag to indicate whether we use get or post on this form, used when obfuscating params
 		request.wheels.currentFormMethod = arguments.method;
 
-		// Check to see if a route exists if not specified
-		if (!Len(arguments.route) && Len(arguments.controller) && Len(arguments.action) && Len(arguments.method)) {
-			for (local.route in application.wheels.routes) {
-				if (
-					StructKeyExists(local.route, "controller")
-					&& local.route.controller == arguments.controller
-					&& StructKeyExists(local.route, "action")
-					&& local.route.action == arguments.action
-					&& ListFindNoCase(local.route.methods, arguments.method)
-				) {
-					arguments.route = local.route.name;
-					local.routeAndMethodMatch = true;
-					break;
-				}
-			}
-		}
+		// Resolve the route and method (mutating arguments.route / arguments.method) and remember
+		// the original verb for the `_method` hidden field (empty string when none applies).
+		local.method = $startFormTagMethod(args = arguments);
 
-		// if we have a route and method, tap
-		if (Len(arguments.route) && StructKeyExists(arguments, "method")) {
-			// Throw error if no route was found.
-			if (!StructKeyExists(application.wheels.namedRoutePositions, arguments.route)) {
-				$throwErrorOrShow404Page(
-					type = "Wheels.RouteNotFound",
-					message = "Could not find the `#arguments.route#` route.",
-					extendedInfo = "Make sure there is a route configured in your `config/routes.cfm` file named `#arguments.route#`."
-				);
-			}
-
-			// check to see if the route specified has a method to match the one passed in
-			if (!local.routeAndMethodMatch) {
-				for (local.position in ListToArray(application.wheels.namedRoutePositions[arguments.route])) {
-					if (
-						StructKeyExists(application.wheels.routes[local.position], "methods")
-						&& ListFindNoCase(application.wheels.routes[local.position].methods, arguments.method)
-					) {
-						local.routeAndMethodMatch = true;
-					}
-				}
-			}
-
-			if (local.routeAndMethodMatch) {
-				// save the method passed in
-				local.method = arguments.method;
-
-				if (arguments.method != "get") {
-					arguments.method = "post";
-				}
-			}
+		// HTML forms only support get/post, but the named-route lookup must use
+		// the ORIGINAL verb (put/patch/delete) — resource member routes never
+		// declare `post` (#3517). Remember the HTML verb and restore it after
+		// the route is resolved.
+		local.formMethod = arguments.method;
+		if (Len(local.method)) {
+			arguments.method = local.method;
 		}
 
 		// set the form's action attribute to the URL that we want to send to
 		local.encodeExcept = "";
-		if (!ReFindNoCase("^https?:\/\/", arguments.action)) {
+		local.skipCsrf = false;
+		if (ReFindNoCase("^https?:\/\/", arguments.action)) {
+			// Absolute http(s) action: do not leak the authenticity token to
+			// another origin (S4). Same-host absolute URLs still get the field.
+			local.serverName = StructKeyExists(request, "cgi") && StructKeyExists(request.cgi, "server_name")
+				? request.cgi.server_name
+				: "";
+			local.skipCsrf = !Len(local.serverName) || !$isSafeRedirectUrl(
+				url = arguments.action,
+				serverName = local.serverName
+			);
+		} else {
 			arguments.$encodeForHtmlAttribute = true;
 			arguments.action = uRLFor(argumentCollection = arguments);
 			local.encodeExcept = "action";
@@ -162,6 +120,9 @@ component {
 			local.skip = ListDeleteAt(local.skip, ListFind(local.skip, "action"));
 		}
 
+		// Restore the HTML verb before rendering <form method="...">.
+		arguments.method = local.formMethod;
+
 		local.rv = arguments.prepend & $tag(
 			name = "form",
 			skip = local.skip,
@@ -169,10 +130,14 @@ component {
 			encode = arguments.encode,
 			encodeExcept = local.encodeExcept
 		) & arguments.append;
-		if ($isRequestProtectedFromForgery() && ListFindNoCase("post,put,patch,delete", arguments.method)) {
+		if (
+			$isRequestProtectedFromForgery()
+			&& ListFindNoCase("post,put,patch,delete", arguments.method)
+			&& !local.skipCsrf
+		) {
 			local.rv &= authenticityTokenField();
 		}
-		if (StructKeyExists(local, "method") && local.method != "get") {
+		if (Len(local.method) && local.method != "get") {
 			local.methodField = hiddenFieldTag(name = "_method", value = local.method);
 			// Delete the id="_method" part of the string.
 			// There could be multiple forms on a page and duplicate "id" attributes are not allowed in HTML.
@@ -180,6 +145,97 @@ component {
 			local.rv &= local.methodField;
 		}
 		return local.rv;
+	}
+
+	/**
+	 * Internal function. Resolves the route and method for startFormTag: finds a named route
+	 * matching controller/action/method, verifies the route's method, and rewrites non-get/post
+	 * verbs to `post` while remembering the original verb for the `_method` hidden field.
+	 * Mutates `args.route` and `args.method` in place and returns the original verb (empty string
+	 * when none applies).
+	 */
+	public string function $startFormTagMethod(required struct args) {
+		local.routeAndMethodMatch = false;
+
+		// Check to see if a route exists if not specified.
+		// The linear scan over all routes is memoized per request (mirroring URLFor's `urlForCache`).
+		// Only successful lookups are cached, and a cached route name is re-validated against the
+		// current route table so route changes within a request (e.g. the test suite) stay correct.
+		if (!Len(args.route) && Len(args.controller) && Len(args.action) && Len(args.method)) {
+			if (!StructKeyExists(request.wheels, "startFormTagRouteCache")) {
+				request.wheels.startFormTagRouteCache = {};
+			}
+			local.routeCache = request.wheels.startFormTagRouteCache;
+			local.routeCacheKey = args.controller & "##" & args.action & "##" & args.method;
+			if (
+				StructKeyExists(local.routeCache, local.routeCacheKey)
+				&& StructKeyExists(application.wheels.namedRoutePositions, local.routeCache[local.routeCacheKey])
+			) {
+				args.route = local.routeCache[local.routeCacheKey];
+				local.routeAndMethodMatch = true;
+			} else {
+				for (local.route in application.wheels.routes) {
+					if (
+						StructKeyExists(local.route, "controller")
+						&& local.route.controller == args.controller
+						&& StructKeyExists(local.route, "action")
+						&& local.route.action == args.action
+						&& ListFindNoCase(local.route.methods, args.method)
+					) {
+						args.route = local.route.name;
+						local.routeAndMethodMatch = true;
+						local.routeCache[local.routeCacheKey] = local.route.name;
+						break;
+					}
+				}
+			}
+		}
+
+		// if we have a route and method, tap
+		if (Len(args.route) && StructKeyExists(args, "method")) {
+			// Throw error if no route was found.
+			if (!StructKeyExists(application.wheels.namedRoutePositions, args.route)) {
+				$throwErrorOrShow404Page(
+					type = "Wheels.RouteNotFound",
+					message = "Could not find the `#args.route#` route.",
+					extendedInfo = "Make sure there is a route configured in your `config/routes.cfm` file named `#args.route#`."
+				);
+			}
+
+			// check to see if the route specified has a method to match the one passed in
+			if (!local.routeAndMethodMatch) {
+				for (local.position in ListToArray(application.wheels.namedRoutePositions[args.route])) {
+					if (
+						StructKeyExists(application.wheels.routes[local.position], "methods")
+						&& ListFindNoCase(application.wheels.routes[local.position].methods, args.method)
+					) {
+						local.routeAndMethodMatch = true;
+					}
+				}
+			}
+
+			if (local.routeAndMethodMatch) {
+				// save the method passed in
+				local.method = args.method;
+
+				if (args.method != "get") {
+					args.method = "post";
+				}
+				return local.method;
+			}
+		}
+
+		// HTML forms only support the `get` and `post` verbs. When the route / verb match above did
+		// not run (or did not match), other verbs (`put`, `patch`, `delete`) were previously rendered
+		// verbatim, causing browsers to silently fall back to a `get` submission - leaking the
+		// authenticity token into the URL and bypassing non-GET CSRF verification. Always rewrite
+		// them to `post` plus a `_method` hidden field instead.
+		if (Len(args.method) && !ListFindNoCase("get,post", args.method)) {
+			local.method = args.method;
+			args.method = "post";
+			return local.method;
+		}
+		return "";
 	}
 
 	/**
@@ -199,14 +255,7 @@ component {
 		$args(name = "submitTag", reserved = "type,src", args = arguments);
 
 		// Encode all prepend / append type arguments if specified.
-		if (IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
-			if (Len(arguments.prepend)) {
-				arguments.prepend = EncodeForHTML($canonicalize(arguments.prepend));
-			}
-			if (Len(arguments.append)) {
-				arguments.append = EncodeForHTML($canonicalize(arguments.append));
-			}
-		}
+		$encodeArgsForHtml(args = arguments, keys = "prepend,append");
 		arguments.encode = IsBoolean(arguments.encode) && !arguments.encode ? false : true;
 
 		local.rv = arguments.prepend;
@@ -260,14 +309,7 @@ component {
 		$args(name = "buttonTag", args = arguments);
 
 		// Encode all prepend / append type arguments if specified.
-		if (IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
-			if (Len(arguments.prepend)) {
-				arguments.prepend = EncodeForHTML($canonicalize(arguments.prepend));
-			}
-			if (Len(arguments.append)) {
-				arguments.append = EncodeForHTML($canonicalize(arguments.append));
-			}
-		}
+		$encodeArgsForHtml(args = arguments, keys = "prepend,append");
 
 		// if image is specified then use that as the content
 		if (Len(arguments.image)) {
@@ -300,13 +342,33 @@ component {
 	}
 
 	/**
+	 * Internal function. Resolves the object a form helper is bound to once and stashes it on the
+	 * helper's argument struct (passed by reference) so the shared internals ($formValue,
+	 * $maxLength, $formHasError, $getFieldLabel) reuse it instead of each re-resolving it via
+	 * $getObject. The `$`-prefixed key is automatically excluded from rendered HTML attributes
+	 * by $tag() / $element().
+	 */
+	public void function $primeBoundObject(required struct args) {
+		if (
+			IsSimpleValue(arguments.args.objectName)
+			&& Len(arguments.args.objectName)
+			&& !StructKeyExists(arguments.args, "$boundObject")
+		) {
+			local.object = $getObject(arguments.args.objectName);
+			if (IsObject(local.object)) {
+				arguments.args["$boundObject"] = local.object;
+			}
+		}
+	}
+
+	/**
 	 * Internal function.
 	 */
 	public string function $formValue(required any objectName, required string property) {
 		if (IsStruct(arguments.objectName)) {
 			local.rv = arguments.objectName[arguments.property];
 		} else {
-			local.object = $getObject(arguments.objectName);
+			local.object = StructKeyExists(arguments, "$boundObject") ? arguments.$boundObject : $getObject(arguments.objectName);
 			if ($get("showErrorInformation") && !IsObject(local.object)) {
 				Throw(type = "Wheels.IncorrectArguments", message = "The `#arguments.objectName#` variable is not an object.");
 			}
@@ -332,7 +394,7 @@ component {
 		if (StructKeyExists(arguments, "maxlength")) {
 			local.rv = arguments.maxlength;
 		} else if (!IsStruct(arguments.objectName)) {
-			local.object = $getObject(arguments.objectName);
+			local.object = StructKeyExists(arguments, "$boundObject") ? arguments.$boundObject : $getObject(arguments.objectName);
 			if (IsObject(local.object)) {
 				local.propertyInfo = local.object.$propertyInfo(arguments.property);
 				if (StructCount(local.propertyInfo) && ListFindNoCase("cf_sql_char,cf_sql_varchar", local.propertyInfo.type)) {
@@ -351,7 +413,7 @@ component {
 	public boolean function $formHasError(required any objectName, required string property) {
 		local.rv = false;
 		if (!IsStruct(arguments.objectName)) {
-			local.object = $getObject(arguments.objectName);
+			local.object = StructKeyExists(arguments, "$boundObject") ? arguments.$boundObject : $getObject(arguments.objectName);
 			if ($get("showErrorInformation") && !IsObject(local.object)) {
 				Throw(type = "Wheels.IncorrectArguments", message = "The `#arguments.objectName#` variable is not an object.");
 			}
@@ -408,22 +470,14 @@ component {
 		any encode = false
 	) {
 		// Encode all prepend type arguments if specified.
-		if (StructKeyExists(arguments, "encode") && IsBoolean(arguments.encode)) {
-			if (arguments.encode && $get("encodeHtmlTags")) {
-				if (Len(arguments.prepend)) {
-					arguments.prepend = EncodeForHTML($canonicalize(arguments.prepend));
-				}
-				if (Len(arguments.prependToLabel)) {
-					arguments.prependToLabel = EncodeForHTML($canonicalize(arguments.prependToLabel));
-				}
-			}
-		}
+		$encodeArgsForHtml(args = arguments, keys = "prepend,prependToLabel");
 
 		local.rv = "";
 		arguments.label = $getFieldLabel(argumentCollection = arguments);
 		if ($formHasError(argumentCollection = arguments) && Len(arguments.errorElement)) {
+			arguments.errorElement = $sanitizeHtmlTagName(arguments.errorElement);
 			// the input has an error and should be wrapped in a tag so we need to start that wrapper tag
-			local.encode = IsBoolean(arguments.encode) && !arguments.encode ? false : true;
+			local.encode = $coerceEncode(arguments.encode, true);
 			local.rv &= $tag(name = arguments.errorElement, class = arguments.errorClass, encode = local.encode);
 		}
 		if (Len(arguments.label) && arguments.labelPlacement != "after") {
@@ -461,16 +515,7 @@ component {
 		any encode = false
 	) {
 		// Encode all append type arguments if specified.
-		if (StructKeyExists(arguments, "encode") && IsBoolean(arguments.encode)) {
-			if (arguments.encode && $get("encodeHtmlTags")) {
-				if (Len(arguments.append)) {
-					arguments.append = EncodeForHTML($canonicalize(arguments.append));
-				}
-				if (Len(arguments.appendToLabel)) {
-					arguments.appendToLabel = EncodeForHTML($canonicalize(arguments.appendToLabel));
-				}
-			}
-		}
+		$encodeArgsForHtml(args = arguments, keys = "append,appendToLabel");
 
 		local.rv = arguments.append;
 		arguments.label = $getFieldLabel(argumentCollection = arguments);
@@ -479,19 +524,52 @@ component {
 				// if the label should be placed after the tag we return the entire label tag
 				local.rv &= $createLabel(argumentCollection = arguments);
 			} else if (arguments.labelPlacement == "aroundRight") {
-				// if the text should be placed to the right of the form input we return both the text and the closing tag
-				local.rv &= arguments.label & "</label>";
+				// Match $createLabel / $element: encode label text when encode=true.
+				// aroundRight used to concat arguments.label raw, so XSS labels
+				// skipped the encode=true path that around / aroundLeft / after use.
+				local.labelText = arguments.label;
+				if (IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
+					local.labelText = EncodeForHTML($canonicalize(arguments.label));
+				}
+				local.rv &= local.labelText & "</label>";
 			} else {
 				// the label argument is either "around" or "aroundLeft" so we only have to return the closing label tag
 				local.rv &= "</label>";
 			}
 			local.rv &= arguments.appendToLabel;
 		}
+		if ($includeFormErrorMessage(argumentCollection = arguments) && $formHasError(argumentCollection = arguments)) {
+			// Nest the per-field message inside the error wrapper, after the
+			// control (and after around-placement's closing label). Prefix is
+			// a non-color cue; CSS adds an icon + red (#3549, #3550).
+			local.errorArgs = {
+				objectName = arguments.objectName,
+				property = arguments.property,
+				prependText = "Error:"
+			};
+			if (StructKeyExists(arguments, "encode")) {
+				local.errorArgs.encode = arguments.encode;
+			}
+			local.rv &= errorMessageOn(argumentCollection = local.errorArgs);
+		}
 		if ($formHasError(argumentCollection = arguments) && Len(arguments.errorElement)) {
+			arguments.errorElement = $sanitizeHtmlTagName(arguments.errorElement);
 			// the input has an error and is wrapped in a tag so we need to close that wrapper tag
 			local.rv &= "</" & arguments.errorElement & ">";
 		}
 		return local.rv;
+	}
+
+	/**
+	 * Whether this field helper should emit errorMessageOn() inside its error wrapper.
+	 * Per-call `includeErrorMessage` wins; otherwise the app-level setting
+	 * `includeFormErrorMessages` (default false) is used.
+	 */
+	public boolean function $includeFormErrorMessage() {
+		if (StructKeyExists(arguments, "includeErrorMessage") && IsBoolean(arguments.includeErrorMessage)) {
+			return arguments.includeErrorMessage;
+		}
+		return $get("includeFormErrorMessages");
 	}
 
 	/**
@@ -502,7 +580,7 @@ component {
 		if (Compare("false", arguments.label) == 0) {
 			local.rv = "";
 		} else if (arguments.label == "useDefaultLabel" && !IsStruct(arguments.objectName)) {
-			local.object = $getObject(arguments.objectName);
+			local.object = StructKeyExists(arguments, "$boundObject") ? arguments.$boundObject : $getObject(arguments.objectName);
 			if (IsObject(local.object)) {
 				local.rv = local.object.$label(arguments.property);
 			}

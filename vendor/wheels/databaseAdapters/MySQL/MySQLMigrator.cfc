@@ -25,12 +25,12 @@ component extends="wheels.databaseAdapters.Abstract" {
 	}
 
 	public string function addForeignKeyOptions(required string sql, struct options = {}) {
-		arguments.sql = arguments.sql & " FOREIGN KEY (" & arguments.options.column & ")";
+		arguments.sql = arguments.sql & " FOREIGN KEY (" & quoteColumnName(arguments.options.column) & ")";
 		if (StructKeyExists(arguments.options, "referenceTable")) {
 			if (StructKeyExists(arguments.options, "referenceColumn")) {
 				arguments.sql = arguments.sql & " REFERENCES ";
-				arguments.sql = arguments.sql & arguments.options.referenceTable;
-				arguments.sql = arguments.sql & " (" & arguments.options.referenceColumn & ")";
+				arguments.sql = arguments.sql & quoteTableName(arguments.options.referenceTable);
+				arguments.sql = arguments.sql & " (" & quoteColumnName(arguments.options.referenceColumn) & ")";
 			}
 		}
 		return arguments.sql;
@@ -67,14 +67,13 @@ component extends="wheels.databaseAdapters.Abstract" {
 	}
 
 	/**
-	 * MySQL text fields can't have default
+	 * Whether `addColumnOptions` should emit a DEFAULT clause for the column.
+	 * Always true — TEXT/float keep their DEFAULT the same way Abstract does.
+	 * Pre-8.0.13 MySQL rejected DEFAULT on TEXT/BLOB; current Wheels targets
+	 * servers that accept it rather than silently dropping the clause.
 	 */
-	public boolean function optionsIncludeDefault(string type, string default = "", boolean allowNull = true) {
-		if (ListFindNoCase("text,mediumtext,longtext,float", arguments.type)) {
-			return false;
-		} else {
-			return true;
-		}
+	public boolean function optionsIncludeDefault(string type, default = "", boolean allowNull = true) {
+		return true;
 	}
 
 	/**

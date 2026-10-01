@@ -1,0 +1,416 @@
+/**
+ * Database-backed pub/sub adapter for multi-server SSE channels.
+ *
+ * Uses a wheels_events table for event persistence and cross-server
+ * communication. Auto-creates the table on first use (same pattern as Job.cfc).
+ *
+ * Usage:
+ *   var adapter = new wheels.channel.DatabaseAdapter();
+ *   adapter.publish(channel="user.42", event="notification", data='{"title":"Hello"}');
+ *   var events = adapter.poll(channel="user.42", since=dateAdd("n", -5, Now()));
+ */
+component {
+
+	/**
+	 * Initialize the database adapter.
+	 * Gets datasource from application.wheels.dataSourceName.
+	 */
+	public DatabaseAdapter function init() {
+		variables.$datasource = "";
+		if (StructKeyExists(application, "wheels") && StructKeyExists(application.wheels, "dataSourceName")) {
+			variables.$datasource = application.wheels.dataSourceName;
+		}
+		variables.tableVerified = false;
+		// Start the throttle clock at instance creation so a fresh instance does
+		// not run a retention sweep on its very first publish()
+		variables.lastCleanup = GetTickCount() / 1000;
+		variables.retentionMinutes = 60;
+		// Cap on rows deleted per throttled publish-path cleanup pass
+		variables.cleanupBatchSize = 1000;
+		// True while a previous bounded pass hit its cap (backlog still draining)
+		variables.cleanupBacklog = false;
+		return this;
+	}
+
+	public void function $assertChannelName(required string channel) {
+		if (!Len(Trim(arguments.channel))) {
+			throw(type = "Wheels.Channel.InvalidName", message = "Channel name cannot be empty.");
+		}
+	}
+
+	/**
+	 * Publish an event to the database.
+	 *
+	 * @channel The channel name.
+	 * @event The event type.
+	 * @data The event data (string, typically JSON).
+	 * @id Optional event ID. If not provided, a UUID is generated.
+	 * @return Struct with {id, channel, event, persisted}.
+	 */
+	public struct function publish(
+		required string channel,
+		required string event,
+		required string data,
+		string id = CreateUUID()
+	) {
+		$assertChannelName(arguments.channel);
+		$ensureEventsTable();
+		$maybeCleanup();
+
+		try {
+			queryExecute(
+				"INSERT INTO wheels_events (id, channel, event, data, createdAt)
+				VALUES (:id, :channel, :event, :data, :createdAt)",
+				{
+					id: {value: arguments.id, cfsqltype: "cf_sql_varchar"},
+					channel: {value: arguments.channel, cfsqltype: "cf_sql_varchar"},
+					event: {value: arguments.event, cfsqltype: "cf_sql_varchar"},
+					data: {value: arguments.data, cfsqltype: "cf_sql_longvarchar"},
+					createdAt: {value: Now(), cfsqltype: "cf_sql_timestamp"}
+				},
+				{datasource: variables.$datasource}
+			);
+
+			return {
+				id: arguments.id,
+				channel: arguments.channel,
+				event: arguments.event,
+				persisted: true
+			};
+		} catch (any e) {
+			writeLog(
+				text="DatabaseAdapter publish error on [#arguments.channel#]: #e.message#",
+				type="error",
+				file="wheels_channels"
+			);
+			throw(
+				type = "Wheels.Channel.PublishFailed",
+				message = "Failed to persist channel event on [#arguments.channel#]: #e.message#"
+			);
+		}
+	}
+
+	/**
+	 * Poll for events on a channel since a given event ID or timestamp.
+	 *
+	 * @channel The channel name to poll.
+	 * @lastEventId If provided, return events after this ID (by createdAt of the referenced event).
+	 * @since If provided (and no lastEventId), return events created after this timestamp.
+	 * @return Query of events with columns: id, channel, event, data, createdAt.
+	 */
+	public query function poll(
+		required string channel,
+		string lastEventId = "",
+		date since = DateAdd("n", -5, Now())
+	) {
+		$assertChannelName(arguments.channel);
+		$ensureEventsTable();
+
+		// If lastEventId is provided, find its timestamp and get events at or after it,
+		// excluding the event itself. Uses >= instead of > because MySQL and Oracle
+		// DATETIME/TIMESTAMP have only second-level precision — events within the same
+		// second would be missed with a strict > comparison.
+		if (Len(arguments.lastEventId)) {
+			return queryExecute(
+				"SELECT e.id, e.channel, e.event, e.data, e.createdAt
+				FROM wheels_events e
+				WHERE e.channel = :channel
+				AND e.id != :lastEventId
+				AND e.createdAt >= (
+					SELECT COALESCE(MAX(r.createdAt), :fallback)
+					FROM wheels_events r
+					WHERE r.id = :lastEventId
+				)
+				ORDER BY e.createdAt ASC",
+				{
+					channel: {value: arguments.channel, cfsqltype: "cf_sql_varchar"},
+					lastEventId: {value: arguments.lastEventId, cfsqltype: "cf_sql_varchar"},
+					fallback: {value: arguments.since, cfsqltype: "cf_sql_timestamp"}
+				},
+				{datasource: variables.$datasource}
+			);
+		}
+
+		return queryExecute(
+			"SELECT id, channel, event, data, createdAt
+			FROM wheels_events
+			WHERE channel = :channel
+			AND createdAt > :since
+			ORDER BY createdAt ASC",
+			{
+				channel: {value: arguments.channel, cfsqltype: "cf_sql_varchar"},
+				since: {value: arguments.since, cfsqltype: "cf_sql_timestamp"}
+			},
+			{datasource: variables.$datasource}
+		);
+	}
+
+	/**
+	 * Delete events older than the specified number of minutes.
+	 *
+	 * On busy multi-server deployments prefer calling this from a scheduled task
+	 * or worker (with a maxRows bound) rather than relying solely on the
+	 * throttled publish-path sweep.
+	 *
+	 * @olderThanMinutes Delete events older than this many minutes (default: retentionMinutes).
+	 * @maxRows Maximum number of rows to delete in this pass. 0 (default) deletes all expired rows.
+	 * @return Number of rows deleted (best effort; 0 on error or when the engine doesn't report it).
+	 */
+	public numeric function cleanup(
+		numeric olderThanMinutes = variables.retentionMinutes,
+		numeric maxRows = 0
+	) {
+		$ensureEventsTable();
+
+		local.cutoff = DateAdd("n", -arguments.olderThanMinutes, Now());
+
+		try {
+			if (arguments.maxRows > 0) {
+				// Bounded pass: select the oldest expired ids first, then delete only
+				// those, so the DELETE (the lock-holding statement) stays small and
+				// indexed even when a large backlog has accumulated. The row bound is
+				// pushed into dialect SQL (TOP / FETCH FIRST / LIMIT) so the database
+				// does an index-assisted top-n read instead of materializing the whole
+				// expired backlog and truncating it client-side.
+				local.candidateSelect = "SELECT id FROM wheels_events WHERE createdAt < :cutoff ORDER BY createdAt ASC";
+				local.candidateSql = $applyRowBound(
+					sqlText = local.candidateSelect,
+					dbType = $detectDatabaseType(),
+					maxRows = arguments.maxRows
+				);
+				// The driver-level maxrows option is only used when the dialect
+				// rewrite applied nothing — $applyRowBound returns the statement
+				// unchanged exactly in that case, and there it is the only bound
+				// available. Everywhere else it is redundant, and redundant is not
+				// free: on BoxLang the option reaches PgPreparedStatement as
+				// setLargeMaxRows(), which pgjdbc has never implemented, so the whole
+				// pass threw and cleanup() reported 0 deleted on postgres and
+				// cockroachdb (#3302). JobWorker.$claimNext already bounds this way
+				// and carries a NOTE saying why; this path kept the option as
+				// belt-and-braces and reintroduced the failure the note warns about.
+				local.candidateOptions = {datasource: variables.$datasource};
+				if (local.candidateSql == local.candidateSelect) {
+					local.candidateOptions.maxrows = Int(arguments.maxRows);
+				}
+				local.candidates = queryExecute(
+					local.candidateSql,
+					{
+						cutoff: {value: local.cutoff, cfsqltype: "cf_sql_timestamp"}
+					},
+					local.candidateOptions
+				);
+				if (local.candidates.recordCount == 0) {
+					return 0;
+				}
+				// Repeat the cutoff predicate so the blast radius stays limited to
+				// expired rows even if an application-supplied event id contains a comma
+				queryExecute(
+					"DELETE FROM wheels_events WHERE createdAt < :cutoff AND id IN (:ids)",
+					{
+						cutoff: {value: local.cutoff, cfsqltype: "cf_sql_timestamp"},
+						ids: {value: ValueList(local.candidates.id), cfsqltype: "cf_sql_varchar", list: true}
+					},
+					{datasource: variables.$datasource}
+				);
+				return local.candidates.recordCount;
+			}
+
+			queryExecute(
+				"DELETE FROM wheels_events WHERE createdAt < :cutoff",
+				{
+					cutoff: {value: local.cutoff, cfsqltype: "cf_sql_timestamp"}
+				},
+				{datasource: variables.$datasource, result: "local.deleteResult"}
+			);
+			if (StructKeyExists(local, "deleteResult") && StructKeyExists(local.deleteResult, "recordCount")) {
+				return local.deleteResult.recordCount;
+			}
+			return 0;
+		} catch (any e) {
+			writeLog(
+				text="DatabaseAdapter cleanup error: #e.message#",
+				type="error",
+				file="wheels_channels"
+			);
+			return 0;
+		}
+	}
+
+	/**
+	 * Throttled cleanup on the publish path — runs at most once every 5 minutes
+	 * (every 15 seconds while a backlog is draining) and deletes at most
+	 * cleanupBatchSize rows per pass so no single publish() blocks on a large
+	 * DELETE. Full sweeps remain available via cleanup() for scheduled tasks.
+	 */
+	private void function $maybeCleanup() {
+		local.now = GetTickCount() / 1000;
+		local.interval = variables.cleanupBacklog ? 15 : 300;
+		if (local.now - variables.lastCleanup > local.interval) {
+			variables.lastCleanup = local.now;
+			local.deleted = cleanup(maxRows = variables.cleanupBatchSize);
+			variables.cleanupBacklog = local.deleted >= variables.cleanupBatchSize;
+		}
+	}
+
+	/**
+	 * Auto-create the wheels_events table if it doesn't exist.
+	 * Pattern copied from Job.cfc $ensureJobTable().
+	 */
+	private boolean function $ensureEventsTable() {
+		if (variables.tableVerified) {
+			return true;
+		}
+
+		try {
+			queryExecute(
+				"SELECT COUNT(*) AS cnt FROM wheels_events WHERE 1=0",
+				{},
+				{datasource: variables.$datasource}
+			);
+			variables.tableVerified = true;
+			return true;
+		} catch (any e) {
+			// Table doesn't exist — create it
+		}
+
+		try {
+			local.dbType = $detectDatabaseType();
+
+			if (local.dbType == "oracle") {
+				local.varcharType = "VARCHAR2";
+				local.textType = "CLOB";
+				local.datetimeType = "TIMESTAMP";
+			} else if (local.dbType == "postgresql") {
+				local.varcharType = "VARCHAR";
+				local.textType = "TEXT";
+				local.datetimeType = "TIMESTAMP";
+			} else if (local.dbType == "h2") {
+				local.varcharType = "VARCHAR";
+				local.textType = "CLOB";
+				local.datetimeType = "TIMESTAMP";
+			} else if (local.dbType == "sqlserver") {
+				local.varcharType = "VARCHAR";
+				local.textType = "TEXT";
+				local.datetimeType = "DATETIME2";
+			} else {
+				local.varcharType = "VARCHAR";
+				local.textType = "TEXT";
+				// DATETIME(6): sub-second precision so poll() can order events
+				// by createdAt deterministically. Plain DATETIME keeps only
+				// second precision — two publishes within the same second tie,
+				// and the (channel, createdAt) index then falls back to
+				// primary-key (UUID) order, which is arbitrary (BoxLang legs
+				// observed the reversal; Lucee/Adobe were just lucky).
+				local.datetimeType = "DATETIME(6)";
+			}
+
+			queryExecute("
+				CREATE TABLE wheels_events (
+					id #local.varcharType#(255) NOT NULL PRIMARY KEY,
+					channel #local.varcharType#(255) NOT NULL,
+					event #local.varcharType#(255) NOT NULL,
+					data #local.textType#,
+					createdAt #local.datetimeType# NOT NULL
+				)
+			", {}, {datasource: variables.$datasource});
+
+			try {
+				queryExecute(
+					"CREATE INDEX idx_wevents_channel ON wheels_events (channel, createdAt)",
+					{},
+					{datasource: variables.$datasource}
+				);
+				queryExecute(
+					"CREATE INDEX idx_wevents_cleanup ON wheels_events (createdAt)",
+					{},
+					{datasource: variables.$datasource}
+				);
+			} catch (any indexError) {
+				// Indexes are optional
+			}
+
+			writeLog(text="Auto-created wheels_events table", type="information", file="wheels_channels");
+			variables.tableVerified = true;
+			return true;
+		} catch (any createError) {
+			writeLog(
+				text="Failed to auto-create wheels_events table: #createError.message#",
+				type="error",
+				file="wheels_channels"
+			);
+			return false;
+		}
+	}
+
+	/**
+	 * Detect the database type from the datasource via JDBC metadata.
+	 * Returns: "oracle", "postgresql", "h2", "mysql", "sqlserver", "sqlite", or "default".
+	 *
+	 * Public with $ prefix (internal naming convention), matching its caller
+	 * $applyRowBound, so a spec can reproduce the dialect the bounded cleanup
+	 * pass actually chose on the engine/database pair it is running against.
+	 */
+	public string function $detectDatabaseType() {
+		try {
+			cfdbinfo(type="version", datasource="#variables.$datasource#", name="local.info");
+			local.product = local.info.database_productname;
+			if (FindNoCase("oracle", local.product)) return "oracle";
+			if (FindNoCase("postgre", local.product)) return "postgresql";
+			if (FindNoCase("h2", local.product)) return "h2";
+			if (FindNoCase("mysql", local.product) || FindNoCase("mariadb", local.product)) return "mysql";
+			if (FindNoCase("sql server", local.product)) return "sqlserver";
+			if (FindNoCase("sqlite", local.product)) return "sqlite";
+		} catch (any e) {
+			// cfdbinfo not available — fall through to default
+		}
+		return "default";
+	}
+
+	/**
+	 * Rewrite a candidate SELECT so the row bound is applied in dialect SQL and the
+	 * database can do an index-assisted top-n read instead of materializing every
+	 * matching row and relying on client-side truncation.
+	 *
+	 * - sqlserver: SELECT TOP n ...
+	 * - oracle: ... FETCH FIRST n ROWS ONLY
+	 * - mysql / postgresql / sqlite / h2: ... LIMIT n
+	 * - anything else (incl. "default" when $detectDatabaseType() falls back on a
+	 *   cfdbinfo failure): statement UNCHANGED — appending LIMIT would be a syntax
+	 *   error on SQL Server/Oracle. Returning the statement unchanged is the signal
+	 *   the caller uses to fall back to the driver-level maxrows option, which is
+	 *   then the only bound on the read. That option is not portable (BoxLang routes
+	 *   it to a pgjdbc method that does not exist), so it is used only here, where
+	 *   the alternative is no bound at all.
+	 *
+	 * The bound is hardened with Int() so only a plain integer is ever interpolated
+	 * into the SQL string. A bound of zero or less returns the statement unchanged.
+	 * Public with $ prefix (internal naming convention) so it stays unit-testable.
+	 *
+	 * @sqlText The SELECT statement to bound.
+	 * @dbType Database type as returned by $detectDatabaseType().
+	 * @maxRows Maximum number of rows the statement may return.
+	 */
+	public string function $applyRowBound(
+		required string sqlText,
+		required string dbType,
+		required numeric maxRows
+	) {
+		local.bound = Int(arguments.maxRows);
+		if (local.bound <= 0) {
+			return arguments.sqlText;
+		}
+		if (arguments.dbType == "sqlserver") {
+			return ReplaceNoCase(arguments.sqlText, "SELECT ", "SELECT TOP #local.bound# ", "one");
+		}
+		if (arguments.dbType == "oracle") {
+			return arguments.sqlText & " FETCH FIRST #local.bound# ROWS ONLY";
+		}
+		if (ListFindNoCase("mysql,postgresql,sqlite,h2", arguments.dbType)) {
+			return arguments.sqlText & " LIMIT #local.bound#";
+		}
+		// Unknown dialect (incl. the "default" cfdbinfo-failure fallback): leave the
+		// statement alone rather than risk invalid syntax; driver maxrows bounds it.
+		return arguments.sqlText;
+	}
+
+}

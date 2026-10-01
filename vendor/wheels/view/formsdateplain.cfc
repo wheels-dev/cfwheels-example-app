@@ -286,7 +286,7 @@ component {
 	}
 
 	/**
-	 * Builds and returns a string containing a `select` form control for the days of the week based on the supplied name.
+	 * Builds and returns a string containing a `select` form control for the days of the month based on the supplied name.
 	 *
 	 * [section: View Helpers]
 	 * [category: Form Tag Functions]
@@ -330,7 +330,7 @@ component {
 	 * [category: Form Tag Functions]
 	 *
 	 * @name [see:textFieldTag].
-	 * @selected The day that should be selected initially.
+	 * @selected The hour that should be selected initially.
 	 * @includeBlank [see:select].
 	 * @label [see:textField].
 	 * @labelPlacement [see:textField].
@@ -370,7 +370,7 @@ component {
 	 * [category: Form Tag Functions]
 	 *
 	 * @name [see:textFieldTag].
-	 * @selected The day that should be selected initially.
+	 * @selected The minute that should be selected initially.
 	 * @minuteStep [see:timeSelect].
 	 * @includeBlank [see:select].
 	 * @label [see:textField].
@@ -410,7 +410,7 @@ component {
 	 * [category: Form Tag Functions]
 	 *
 	 * @name [see:textFieldTag].
-	 * @selected The day that should be selected initially.
+	 * @selected The second that should be selected initially.
 	 * @secondStep [see:timeSelect].
 	 * @includeBlank [see:select].
 	 * @label [see:textField].
@@ -463,8 +463,12 @@ component {
 				break;
 		}
 
-		// Handle February.
-		if (local.month == 2 && ((!IsLeapYear(local.year) && local.day > 29) || (IsLeapYear(local.year) && local.day > 28))) {
+		// Handle February: clamp the day to the month's actual maximum
+		// (29 in a leap year, 28 otherwise). The previous thresholds were
+		// inverted — day 29 in a non-leap February slipped through to
+		// CreateDate(2026, 2, 29), an invalid date that Lucee/Adobe silently
+		// roll over to March 1 but RustCFML's strict datetime cast rejects.
+		if (local.month == 2 && ((!IsLeapYear(local.year) && local.day > 28) || (IsLeapYear(local.year) && local.day > 29))) {
 			if (IsLeapYear(local.year)) {
 				local.day = 29;
 			} else {

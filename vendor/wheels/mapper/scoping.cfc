@@ -13,6 +13,7 @@ component {
 	 * @shallowPath Shallow path prefix.
 	 * @shallowName Shallow name prefix.
 	 * @constraints Variable patterns to use for matching.
+	 * @callback A callback function to define nested routes within this scope. If provided, the scope is automatically closed when the callback completes.
 	 */
 	public struct function scope(
 		string name,
@@ -23,8 +24,22 @@ component {
 		string shallowPath,
 		string shallowName,
 		struct constraints,
+		any middleware,
+		any binding,
+		any bindBy,
+		any callback,
 		string $call = "scope"
 	) {
+		// Consume `callback` before it can land on the scope stack. Mirrors group():
+		// without this, the extra named argument was silently dropped — the callback
+		// never ran (its routes 404'd) and nothing closed the scope, so every route
+		// declared after inherited this scope's path and middleware. namespace(),
+		// package(), and controller() forward here, so they inherit this support too.
+		if (StructKeyExists(arguments, "callback")) {
+			local.callback = arguments.callback;
+			StructDelete(arguments, "callback");
+		}
+
 		// Set shallow path and prefix if not in a resource.
 		if (!ListFindNoCase("resource,resources", variables.scopeStack[1].$call)) {
 			if (!StructKeyExists(arguments, "shallowPath") && StructKeyExists(arguments, "path")) {
@@ -61,6 +76,21 @@ component {
 			StructAppend(arguments.constraints, variables.scopeStack[1].constraints, false);
 		}
 
+		// Merge middleware from parent scope with current scope.
+		if (StructKeyExists(arguments, "middleware") || StructKeyExists(variables.scopeStack[1], "middleware")) {
+			local.parentMiddleware = StructKeyExists(variables.scopeStack[1], "middleware") ? variables.scopeStack[1].middleware : [];
+			local.currentMiddleware = StructKeyExists(arguments, "middleware") ? arguments.middleware : [];
+			if (IsSimpleValue(local.currentMiddleware)) {
+				local.currentMiddleware = ListToArray(local.currentMiddleware);
+			}
+			if (IsSimpleValue(local.parentMiddleware)) {
+				local.parentMiddleware = ListToArray(local.parentMiddleware);
+			}
+			arguments.middleware = [];
+			ArrayAppend(arguments.middleware, local.parentMiddleware, true);
+			ArrayAppend(arguments.middleware, local.currentMiddleware, true);
+		}
+
 		// Put scope arguments on the stack.
 		if (structKeyExists(server, "boxlang")) {
 			for (local.k in variables.scopeStack[1]) {
@@ -72,6 +102,15 @@ component {
 			StructAppend(arguments, variables.scopeStack[1], false);
 		}
 		ArrayPrepend(variables.scopeStack, arguments);
+
+		// If a callback was provided, execute it to declare the nested routes and
+		// auto-close the scope — keeping namespace()/package()/controller() consistent
+		// with group()/resources(). Use IsCustomFunction (as group() does) so the same
+		// closure shape works across Lucee, Adobe, and BoxLang.
+		if (StructKeyExists(local, "callback") && IsCustomFunction(local.callback)) {
+			local.callback(this);
+			end();
+		}
 
 		return this;
 	}
@@ -91,7 +130,9 @@ component {
 		string package = arguments.name,
 		string path = hyphenize(arguments.name)
 	) {
-		return scope(name = arguments.name, package = arguments.package, path = arguments.path, $call = "namespace");
+		// Forward all arguments so scope() options like middleware and binding are
+		// not silently dropped.
+		return scope(argumentCollection = arguments, $call = "namespace");
 	}
 
 	/**
@@ -104,7 +145,9 @@ component {
 	 * @package Subfolder (package) to reference for controllers. This defaults to the value provided for `name`.
 	 */
 	public struct function package(required string name, string package = arguments.name) {
-		return scope(name = arguments.name, package = arguments.package, $call = "package");
+		// Forward all arguments so scope() options like middleware and binding are
+		// not silently dropped.
+		return scope(argumentCollection = arguments, $call = "package");
 	}
 
 	/**
@@ -129,5 +172,86 @@ component {
 	 */
 	public struct function constraints() {
 		return scope(constraints = arguments, $call = "constraints");
+	}
+
+	/**
+	 * Group routes together with shared attributes like path prefix, name prefix, and constraints without implying a controller package or namespace. Unlike `namespace()` (which maps to a subfolder and URL prefix) or `package()` (which maps to a subfolder), `group()` is a pure organizational grouping mechanism.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @name Name to prepend to child route names for use when building links, forms, and other URLs.
+	 * @path URL path prefix to apply to all child routes.
+	 * @constraints Variable patterns (regex constraints) to apply to all child routes.
+	 * @callback A callback function to define nested routes within this group. If provided, the group is automatically closed when the callback completes.
+	 */
+	public struct function group(
+		string name,
+		string path,
+		struct constraints,
+		any callback
+	) {
+		// Forward every passed argument so scope() options like middleware and
+		// binding are not silently dropped. Only `callback` is consumed by group()
+		// itself. (api() and version() delegate here, so they inherit this too.)
+		local.args = {};
+		for (local.key in arguments) {
+			if (local.key != "callback" && StructKeyExists(arguments, local.key) && !IsNull(arguments[local.key])) {
+				local.args[local.key] = arguments[local.key];
+			}
+		}
+		local.args.$call = "group";
+
+		scope(argumentCollection = local.args);
+
+		// If a callback is provided, execute it and auto-close the group.
+		if (StructKeyExists(arguments, "callback") && IsCustomFunction(arguments.callback)) {
+			arguments.callback(this);
+			end();
+		}
+
+		return this;
+	}
+
+	/**
+	 * Scope routes under an API path prefix. Shorthand for `.group(path="api", name="api", ...)`. Typically used in combination with `version()` to organize versioned API endpoints.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @path URL path prefix for the API. Defaults to `"api"`.
+	 * @name Name prefix for route names. Defaults to `"api"`.
+	 * @constraints Variable patterns to apply to all child routes.
+	 * @callback A callback function to define nested routes within this API scope.
+	 */
+	public struct function api(
+		string path = "api",
+		string name = "api",
+		struct constraints,
+		any callback
+	) {
+		return group(argumentCollection = arguments);
+	}
+
+	/**
+	 * Scope routes under a version prefix within an API group. Creates a URL path prefix of `v{number}` (e.g., `/api/v1/users`) and a name prefix of `v{number}` for named route generation.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @number The version number (e.g., `1` creates path prefix `v1`).
+	 * @path Override the path prefix. Defaults to `v{number}`.
+	 * @name Override the name prefix. Defaults to `v{number}`.
+	 * @callback A callback function to define nested routes within this version scope.
+	 */
+	public struct function version(
+		required numeric number,
+		string path = "v#Int(arguments.number)#",
+		string name = "v#Int(arguments.number)#",
+		any callback
+	) {
+		// Remove number so it doesn't pollute the scope stack.
+		StructDelete(arguments, "number");
+		return group(argumentCollection = arguments);
 	}
 }

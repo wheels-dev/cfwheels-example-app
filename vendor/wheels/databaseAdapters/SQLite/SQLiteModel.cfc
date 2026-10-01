@@ -47,6 +47,10 @@ component extends="wheels.databaseAdapters.Base" output=false {
 
 			case "datetime":
 			case "timestamp":
+				// SQLite stores datetimes as TEXT (see SQLiteMigrator's
+				// sqlTypes mapping). Bind as varchar; date objects are
+				// pre-formatted to ISO-8601 in $buildQueryParamValues
+				// before they reach the bind layer.
 				local.rv = "cf_sql_varchar";
 				break;
 
@@ -55,8 +59,7 @@ component extends="wheels.databaseAdapters.Base" output=false {
 				break;
 
 			default:
-				// SQLite is dynamically typed, so fallback to text if unknown.
-				local.rv = "cf_sql_varchar";
+				$throwUnknownColumnType(arguments.type);
 				break;
 		}
 
@@ -79,51 +82,131 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		return $performQuery(argumentCollection = arguments);
 	}
 
-    public any function $identitySelect(
-        required struct queryAttributes,
-        required struct result,
-        required string primaryKey
-    ) {
-        var query = {};
-        var local = {};
+	/**
+	 * Override Base adapter's $identitySelect hook.
+	 */
+	public any function $lastIdLookup(
+		required struct queryAttributes,
+		required struct result,
+		required string primaryKey,
+		any returningIdentity = "",
+		required string insertSql
+	) {
+		local.query = $query(
+			sql = "SELECT last_insert_rowid() AS lastId",
+			argumentCollection = arguments.queryAttributes
+		);
+		return local.query.lastId;
+	}
 
-        // Trim SQL of the executed statement
-        local.sql = Trim(arguments.result.sql);
+	/**
+	 * SQLite uses file-level locking and does not support advisory locks.
+	 * This is a no-op to allow code that uses advisory locks to run without errors on SQLite.
+	 */
+	public void function $acquireAdvisoryLock(required string name, numeric timeout = 10) {
+		// No-op: SQLite has file-level locking only.
+		// Advisory locks are not meaningful for SQLite.
+	}
 
-        // Only run if it was an INSERT statement and no generated key is already present
-        if (Left(local.sql, 11) == "INSERT INTO" && !StructKeyExists(arguments.result, $generatedKey())) {
+	/**
+	 * No-op release for SQLite.
+	 */
+	public void function $releaseAdvisoryLock(required string name) {
+		// No-op
+	}
 
-            // Extract columns list if present
-            local.startPar = Find("(", local.sql) + 1;
-            local.endPar = Find(")", local.sql);
-            local.columnList = "";
-            if (local.startPar > 1 && local.endPar > local.startPar) {
-                local.columnList = ReplaceList(
-                    Mid(local.sql, local.startPar, (local.endPar - local.startPar)),
-                    "#Chr(10)#,#Chr(13)#, ",
-                    ",,"
-                );
-            }
-            
-            // If the primary key column wasn't part of the INSERT, we fetch last inserted ID
-            if (!ListFindNoCase(local.columnList, ListFirst(arguments.primaryKey))) {
-                local.rv = {};
-                query = $query(
-                    sql = "SELECT last_insert_rowid() AS lastId",
-                    argumentCollection = arguments.queryAttributes
-                );
-                local.rv[$generatedKey()] = query.lastId;
-                return local.rv;
-            }
-        }
-    }
+	/**
+	 * SQLite has no advisory-lock primitive — file-level locking only.
+	 * `$acquireAdvisoryLock` / `$releaseAdvisoryLock` stay no-ops and are
+	 * unused because this flag is false. Callers (`withAdvisoryLock`, the
+	 * lockingSpec guard) skip the fake lock instead of pretending it works.
+	 */
+	public boolean function $supportsAdvisoryLocks() {
+		return false;
+	}
 
+	/**
+	 * SQLite does not support SELECT ... FOR UPDATE.
+	 * Returns empty string to no-op.
+	 */
+	public string function $forUpdateClause() {
+		return "";
+	}
 
 	/**
 	 * Default VALUES syntax (same as MySQL).
 	 */
 	public string function $defaultValues() {
 		return " DEFAULT VALUES";
+	}
+
+	/**
+	 * Override Base adapter's function.
+	 * SQLite uses double-quotes to quote identifiers (ANSI SQL standard).
+	 */
+	public string function $quoteIdentifier(required string name) {
+		return """#arguments.name#""";
+	}
+
+	/**
+	 * SQLite upsert using ON CONFLICT ... DO UPDATE SET syntax.
+	 */
+	public array function $upsertSQL(
+		required string tableName,
+		required array columns,
+		required array uniqueBy,
+		required array updateColumns,
+		required array validProperties,
+		required array records,
+		required numeric batchStart,
+		required numeric batchEnd,
+		required struct propertyInfo
+	) {
+		local.sql = [];
+
+		// Build column list.
+		local.colList = "";
+		for (local.col in arguments.columns) {
+			if (Len(local.colList)) local.colList &= ", ";
+			local.colList &= $quoteIdentifier(local.col);
+		}
+
+		ArrayAppend(local.sql, "INSERT INTO #arguments.tableName# (#local.colList#) VALUES ");
+
+		// Build value rows.
+		for (local.r = arguments.batchStart; local.r <= arguments.batchEnd; local.r++) {
+			if (local.r > arguments.batchStart) {
+				ArrayAppend(local.sql, ", ");
+			}
+			ArrayAppend(local.sql, "(");
+			for (local.p = 1; local.p <= ArrayLen(arguments.validProperties); local.p++) {
+				if (local.p > 1) ArrayAppend(local.sql, ", ");
+				local.propName = arguments.validProperties[local.p];
+				local.val = StructKeyExists(arguments.records[local.r], local.propName) ? arguments.records[local.r][local.propName] : "";
+				ArrayAppend(local.sql, $buildBulkParam(value=local.val, propName=local.propName, propertyInfo=arguments.propertyInfo));
+			}
+			ArrayAppend(local.sql, ")");
+		}
+
+		// ON CONFLICT clause.
+		local.uniqueList = "";
+		for (local.u in arguments.uniqueBy) {
+			if (Len(local.uniqueList)) local.uniqueList &= ", ";
+			local.uniqueList &= $quoteIdentifier(local.u);
+		}
+
+		if (ArrayLen(arguments.updateColumns)) {
+			local.setClause = "";
+			for (local.uc in arguments.updateColumns) {
+				if (Len(local.setClause)) local.setClause &= ", ";
+				local.setClause &= $quoteIdentifier(local.uc) & " = excluded." & $quoteIdentifier(local.uc);
+			}
+			ArrayAppend(local.sql, " ON CONFLICT (#local.uniqueList#) DO UPDATE SET #local.setClause#");
+		} else {
+			ArrayAppend(local.sql, " ON CONFLICT (#local.uniqueList#) DO NOTHING");
+		}
+
+		return local.sql;
 	}
 
 }

@@ -6,7 +6,7 @@ component extends="Base" {
 			Throw(
 				type = "wheels.model.migrate.DatabaseNotSupported",
 				message = "#dbType# is not supported by Wheels.",
-				extendedInfo = "Use SQL Server, MySQL, MariaDB, PostgreSQL, Oracle, SQLite or H2."
+				extendedInfo = "Use SQL Server, MySQL, MariaDB, PostgreSQL, CockroachDB, Oracle, SQLite or H2."
 			);
 		} else {
 			this.adapter = CreateObject("component", "wheels.databaseAdapters.#dbType#.#dbType#Migrator");
@@ -24,6 +24,10 @@ component extends="Base" {
 	 *
 	 */
 	public void function up() {
+		// The placeholder for a migration that never declares its own up().
+		// The migrator leaves only this inherited body untracked, detected by
+		// declaration (Migrator.$migrationStepIsPlaceholder, #3402 B1), so a
+		// migration's own up() that calls super.up() is still recorded.
 		announce("UP MIGRATION NOT IMPLEMENTED");
 	}
 
@@ -37,6 +41,7 @@ component extends="Base" {
 	 *
 	 */
 	public void function down() {
+		// See up(): only this inherited placeholder keeps its tracking row.
 		announce("DOWN MIGRATION NOT IMPLEMENTED");
 	}
 
@@ -112,10 +117,13 @@ component extends="Base" {
 	 * [category: Migration Functions]
 	 *
 	 * @name Name of the table to drop
+	 * @tableName Alias for `name` (the form `wheels destroy` generated before 4.1.1). Pass one or the other — not both.
 	 */
-	public void function dropTable(required string name) {
+	public void function dropTable(string name, string tableName) {
+		$combineArguments(args = arguments, combine = "name,tableName", required = true);
 		local.appKey = $appKey();
-		local.adapterName = $getDBType();
+		// init() already resolved the engine — no need to re-sniff via $getDBType().
+		local.adapterName = this.adapter.adapterName();
 		if (application[local.appKey].serverName != "lucee" && local.adapterName != "SQLite") {
 			local.foreignKeys = $getForeignKeys(arguments.name);
 			local.foreignKeysArray = ListToArray(local.foreignKeys);
@@ -153,7 +161,8 @@ component extends="Base" {
 	 * @table The Name of the table to add the column to
 	 * @columnType The type of the new column
 	 * @afterColumn The name of the column which this column should be inserted after
-	 * @columnName THe name of the new column
+	 * @columnName The name of the new column
+	 * @columnNames Modern alias for `columnName` (matches the plural form every TableDefinition column helper accepts). Pass one or the other — not both.
 	 * @referenceName Name for new reference column, see documentation for references function, required if columnType is 'reference'
 	 * @default Default value for this column
 	 * @allowNull Whether to allow NULL values
@@ -164,15 +173,22 @@ component extends="Base" {
 	public void function addColumn(
 		required string table,
 		required string columnType,
-		required string columnName = "",
+		string columnName,
+		string columnNames,
 		string afterColumn = "",
 		string referenceName = "",
-		string default,
+		default,
 		boolean allowNull,
 		numeric limit,
 		numeric precision,
 		numeric scale
 	) {
+		// Resolve the alias here so addColumn is self-contained — a future
+		// refactor that stops delegating to changeColumn won't silently lose
+		// the columnNames alias path. Required unless columnType="reference"
+		// (in that branch the column name is computed from referenceName, so
+		// columnName/columnNames are not needed).
+		$combineArguments(args = arguments, combine = "columnName,columnNames", required = (arguments.columnType != "reference"));
 		arguments.addColumns = true;
 		changeColumn(argumentCollection = arguments);
 	}
@@ -185,7 +201,8 @@ component extends="Base" {
 	 * [category: Migration Functions]
 	 *
 	 * @table The Name of the table where the column is
-	 * @columnName THe name of the column
+	 * @columnName The name of the column
+	 * @columnNames Modern alias for `columnName` (matches the plural form every TableDefinition column helper accepts). Pass one or the other — not both.
 	 * @columnType The type of the column
 	 * @afterColumn The name of the column which this column should be inserted after
 	 * @referenceName Name for reference column, see documentation for references function, required if columnType is 'reference'
@@ -198,23 +215,32 @@ component extends="Base" {
 	 */
 	public void function changeColumn(
 		required string table,
-		required string columnName,
+		string columnName,
+		string columnNames,
 		required string columnType,
 		string afterColumn = "",
 		string referenceName = "",
-		string default,
+		default,
 		boolean allowNull,
 		numeric limit,
 		numeric precision,
 		numeric scale,
 		boolean addColumns = "false"
 	) {
+		// Accept columnNames as alias for columnName (consistency with
+		// TableDefinition column helpers — #2781 follow-up). Required unless
+		// columnType="reference" — that branch ignores columnName and uses
+		// referenceName instead. Restores the missing-arg enforcement the
+		// original `required string columnName` parameter provided before
+		// this PR widened the signature to accept the alias.
+		$combineArguments(args = arguments, combine = "columnName,columnNames", required = (arguments.columnType != "reference"));
+
 		var t = changeTable(arguments.table);
 		if (arguments.columnType == "reference") {
 			arguments.columnType = "references";
 			arguments.referenceNames = arguments.referenceName;
 		} else {
-			arguments.columnNames = arguments.columnName;
+			arguments.columnNames = arguments.columnName ?: "";
 		}
 		invoke(t, arguments.columnType, arguments);
 		t.change(addColumns = arguments.addColumns);
@@ -251,11 +277,26 @@ component extends="Base" {
 	 *
 	 * @table The table containing the column to remove
 	 * @columnName The column name to remove
+	 * @columnNames Modern alias for `columnName` (matches the plural form every TableDefinition column helper accepts). Pass one or the other — not both.
 	 * @referenceName optional reference name
 	 */
-	public void function removeColumn(required string table, string columnName = "", string referenceName = "") {
+	public void function removeColumn(
+		required string table,
+		string columnName,
+		string columnNames,
+		string referenceName = ""
+	) {
+		// Accept columnNames as alias for columnName via the standard helper —
+		// matches every other site in this file. If both are passed, the alias
+		// (columnNames) wins, consistent with $combineArguments precedence
+		// across the framework.
+		$combineArguments(args = arguments, combine = "columnName,columnNames", required = false);
+		if (!StructKeyExists(arguments, "columnName")) {
+			arguments.columnName = "";
+		}
 		if (arguments.referenceName != "") {
-			arguments.columnName = arguments.referenceName & "id";
+			local.idSuffix = $get("useUnderscoreReferenceColumns") ? "_id" : "id";
+			arguments.columnName = arguments.referenceName & local.idSuffix;
 		}
 		$execute(this.adapter.dropColumnFromTable(name = arguments.table, columnName = arguments.columnName));
 		announce("Removed column #arguments.columnName# from #arguments.table#");
@@ -270,12 +311,26 @@ component extends="Base" {
 	 *
 	 * @table The table name to perform the operation on
 	 * @referenceName The reference table name to perform the operation on
+	 * @columnName Alias for `referenceName` (consistent with the modern migrator surface — `columnName` / `columnNames` are accepted alongside the legacy form).
+	 * @columnNames Plural alias for `referenceName`. When both `columnName` and `columnNames` are supplied, `columnNames` wins.
 	 */
-	public void function addReference(required string table, required string referenceName) {
+	public void function addReference(
+		required string table,
+		string referenceName,
+		string columnName,
+		string columnNames
+	) {
+		// Accept columnName / columnNames as aliases for referenceName.
+		// Precedence (per $combineArguments semantics): the alias wins. If a
+		// caller passes both `referenceName` and `columnName`/`columnNames`,
+		// the alias overwrites — same shape every other helper here uses.
+		$combineArguments(args = arguments, combine = "referenceName,columnName", required = false);
+		$combineArguments(args = arguments, combine = "referenceName,columnNames", required = true);
+		local.idSuffix = $get("useUnderscoreReferenceColumns") ? "_id" : "id";
 		addForeignKey(
 			table = arguments.table,
 			referenceTable = pluralize(arguments.referenceName),
-			column = "#arguments.referenceName#id",
+			column = arguments.referenceName & local.idSuffix,
 			referenceColumn = "id"
 		);
 	}
@@ -290,14 +345,19 @@ component extends="Base" {
 	 * @table The table name to perform the operation on
 	 * @referenceTable The reference table name to perform the operation on
 	 * @column The column name to perform the operation on
+	 * @columnName Modern alias for `column` (consistent with the rest of the migrator surface).
 	 * @referenceColumn The reference column name to perform the operation on
 	 */
 	public void function addForeignKey(
 		required string table,
 		required string referenceTable,
-		required string column,
+		string column,
+		string columnName,
 		required string referenceColumn
 	) {
+		// Accept columnName as alias for column (consistency with the rest
+		// of the migrator surface).
+		$combineArguments(args = arguments, combine = "column,columnName", required = true);
 		var foreignKey = CreateObject("component", "ForeignKeyDefinition").init(
 			adapter = this.adapter,
 			argumentCollection = arguments
@@ -315,10 +375,28 @@ component extends="Base" {
 	 *
 	 * @table The table name to perform the operation on
 	 * @referenceName the name of the reference to drop
+	 * @columnName Alias for `referenceName` (consistent with the modern migrator surface — `columnName` / `columnNames` are accepted alongside the legacy form).
+	 * @columnNames Plural alias for `referenceName`. When both `columnName` and `columnNames` are supplied, `columnNames` wins.
 	 *
 	 */
-	public void function dropReference(required string table, required string referenceName) {
-		dropForeignKey(arguments.table, "FK_#arguments.table#_#pluralize(arguments.referenceName)#");
+	public void function dropReference(
+		required string table,
+		string referenceName,
+		string columnName,
+		string columnNames
+	) {
+		// Accept columnName / columnNames as aliases for referenceName.
+		// Precedence (per $combineArguments semantics): the alias wins. See
+		// addReference for the same pattern.
+		$combineArguments(args = arguments, combine = "referenceName,columnName", required = false);
+		$combineArguments(args = arguments, combine = "referenceName,columnNames", required = true);
+		local.idSuffix = $get("useUnderscoreReferenceColumns") ? "_id" : "id";
+		local.column = arguments.referenceName & local.idSuffix;
+		local.refTable = pluralize(arguments.referenceName);
+		dropForeignKey(
+			arguments.table,
+			"FK_#objectCase(arguments.table)#_#objectCase(local.refTable)#_#objectCase(local.column)#"
+		);
 	}
 
 	/**
@@ -346,6 +424,7 @@ component extends="Base" {
 	 *
 	 * @table The table name to perform the index operation on
 	 * @columnNames One or more column names to index, comma separated
+	 * @columnName Singular alias for `columnNames` (matches the convention every other migrator helper follows). Pass one or the other — not both.
 	 * @unique If true will create a unique index constraint
 	 * @indexName The name of the index to add: Defaults to table name + underscore + first column name
 	 */
@@ -353,9 +432,16 @@ component extends="Base" {
 		required string table,
 		string columnNames,
 		boolean unique = "false",
-		string indexName = objectCase("#arguments.table#_#ListFirst(arguments.columnNames)#")
+		string indexName = ""
 	) {
 		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
+		// Compute the default index name here, AFTER $combineArguments has
+		// resolved the columnName alias — a parameter-default expression would
+		// dereference arguments.columnNames before the alias resolves and throw
+		// an undefined-key error on the documented columnName path.
+		if (!Len(arguments.indexName)) {
+			arguments.indexName = objectCase("#arguments.table#_#ListFirst(arguments.columnNames)#");
+		}
 		$execute(this.adapter.addIndex(argumentCollection = arguments));
 		announce("Added index to column(s) #arguments.columnNames# in table #arguments.table#");
 	}
@@ -401,17 +487,22 @@ component extends="Base" {
 	public void function addRecord(required string table) {
 		local.appKey = $appKey();
 		local.columnNames = "";
-		local.columnValues = "";
+		local.placeholders = "";
+		local.params = [];
+		// One metadata probe per record (cached per request inside $getColumns)
+		// — previously each timestamp check below issued its own full
+		// table-column round-trip.
+		local.tableColumns = $getColumns(arguments.table);
 		if (
 			!StructKeyExists(arguments, application[local.appKey].timeStampOnCreateProperty)
-			&& ListFindNoCase($getColumns(arguments.table), application[local.appKey].timeStampOnCreateProperty)
+			&& ListFindNoCase(local.tableColumns, application[local.appKey].timeStampOnCreateProperty)
 		) {
 			arguments[application[local.appKey].timeStampOnCreateProperty] = $timestamp();
 		}
 		if (
 			application[local.appKey].setUpdatedAtOnCreate
 			&& !StructKeyExists(arguments, application[local.appKey].timeStampOnUpdateProperty)
-			&& ListFindNoCase($getColumns(arguments.table), application[local.appKey].timeStampOnUpdateProperty)
+			&& ListFindNoCase(local.tableColumns, application[local.appKey].timeStampOnUpdateProperty)
 		) {
 			arguments[application[local.appKey].timeStampOnUpdateProperty] = $timestamp();
 		}
@@ -419,40 +510,32 @@ component extends="Base" {
 		for (local.key in arguments) {
 			if (local.key neq "table") {
 				local.columnNames = ListAppend(local.columnNames, this.adapter.quoteColumnName(local.key));
-				if (IsNumeric(arguments[local.key])) {
-					local.columnValues = ListAppend(local.columnValues, arguments[local.key]);
-				} else if (IsBoolean(arguments[local.key])) {
-					local.columnValues = ListAppend(local.columnValues, IIf(arguments[local.key], 1, 0));
-				} else if (IsDate(arguments[local.key])) {
-					if(get("adapterName") == "SQLiteModel" && $isTimestampLiteral(arguments[local.key])){
-						local.columnValues = '"#$convertToString(arguments[local.key])#"';
-					} else {
-						local.columnValues = ListAppend(local.columnValues, "#arguments[local.key]#");
-					}
+				local.placeholders = ListAppend(local.placeholders, "?");
+				local.value = arguments[local.key];
+				// Strip wrapping single quotes if present (legacy convention)
+				if (IsSimpleValue(local.value) && REFind("^'.*'$", local.value)) {
+					local.value = Mid(local.value, 2, Len(local.value) - 2);
+				}
+				if (IsNumeric(local.value) && !REFind("^0\d", local.value)) {
+					ArrayAppend(local.params, {value: local.value, cfsqltype: "cf_sql_numeric"});
+				} else if (IsBoolean(local.value) && !IsNumeric(local.value)) {
+					ArrayAppend(local.params, {value: local.value ? 1 : 0, cfsqltype: "cf_sql_integer"});
+				} else if (IsDate(local.value) && !IsNumeric(local.value)) {
+					ArrayAppend(local.params, {value: local.value, cfsqltype: "cf_sql_timestamp"});
 				} else {
-					if (REFind("^'.*'$", arguments[local.key])) {
-						// strip only first and last quote
-						local.cleaned = Mid(arguments[local.key], 2, Len(arguments[local.key]) - 2);
-						// wrap in double quotes
-						local.columnValues = ListAppend(local.columnValues, '"' & local.cleaned & '"');
-					} else {
-						// normal values
-						local.columnValues = ListAppend(
-							local.columnValues,
-							"'#Replace(arguments[local.key], "'", "''", "all")#'"
-						);
-					}
+					ArrayAppend(local.params, {value: local.value, cfsqltype: "cf_sql_varchar"});
 				}
 			}
 		}
 		if (local.columnNames != '') {
-			if (ListContainsNoCase(local.columnnames, "[id]")) {
+			if (ListContainsNoCase(local.columnNames, "[id]")) {
 				$execute(this.adapter.addRecordPrefix(arguments.table));
 			}
-			$execute(
-				"INSERT INTO #this.adapter.quoteTableName(arguments.table)# ( #local.columnNames# ) VALUES ( #local.columnValues# )"
+			$executeWithParams(
+				sql = "INSERT INTO #this.adapter.quoteTableName(arguments.table)# ( #local.columnNames# ) VALUES ( #local.placeholders# )",
+				params = local.params
 			);
-			if (ListContainsNoCase(local.columnnames, "[id]")) {
+			if (ListContainsNoCase(local.columnNames, "[id]")) {
 				$execute(this.adapter.addRecordSuffix(arguments.table));
 			}
 			announce("Added record to table #arguments.table#");
@@ -467,11 +550,19 @@ component extends="Base" {
 	 * [category: Migration Functions]
 	 *
 	 * @table The table name where the record is
-	 * @where The where clause, i.e admin = 1
+	 * @where The where clause, i.e admin = 1. Raw SQL — callers must supply a predicate or all=true.
+	 * @all When true, an empty where updates every row. Default false (fail-closed).
 	 */
-	public void function updateRecord(required string table, string where = "") {
+	public void function updateRecord(required string table, string where = "", boolean all = false) {
+		if (!Len(Trim(arguments.where)) && !arguments.all) {
+			Throw(
+				type = "Wheels.Migrator.MissingWhere",
+				message = "updateRecord() requires a where clause or all=true. An empty where would update every row."
+			);
+		}
 		local.appKey = $appKey();
-		local.columnUpdates = "";
+		local.setClauses = "";
+		local.params = [];
 		if (
 			!StructKeyExists(arguments, application[local.appKey].timeStampOnUpdateProperty)
 			&& ListFindNoCase($getColumns(arguments.table), application[local.appKey].timeStampOnUpdateProperty)
@@ -479,40 +570,32 @@ component extends="Base" {
 			arguments[application[local.appKey].timeStampOnUpdateProperty] = $timestamp();
 		}
 		for (local.key in arguments) {
-			if (local.key neq "table" && local.key neq "where") {
-				local.update = "#this.adapter.quoteColumnName(local.key)# = ";
-				if (IsNumeric(arguments[local.key])) {
-					local.update = local.update & "#arguments[local.key]#";
-				} else if (IsBoolean(arguments[local.key])) {
-					local.update = local.update & "#IIf(arguments[local.key], 1, 0)#";
-				} else if (IsDate(arguments[local.key])) {
-					if(get("adapterName") == "SQLiteModel" && $isTimestampLiteral(arguments[local.key])){
-						local.update =  local.update &  '"#$convertToString(arguments[local.key])#"';
-					} else {
-						local.update = local.update & "#arguments[local.key]#";
-					}
-				} else {
-					if (REFind("^'.*'$", arguments[local.key])) {
-						// strip only first and last quote
-						local.cleaned = Mid(arguments[local.key], 2, Len(arguments[local.key]) - 2);
-						// wrap in double quotes
-						local.update = local.update & '"' & local.cleaned & '"';
-					} else {
-						arguments[local.key] = ReplaceNoCase(arguments[local.key], "'", "''", "all");
-						local.update = local.update & "'#arguments[local.key]#'";
-					}
+			if (local.key neq "table" && local.key neq "where" && local.key neq "all") {
+				local.setClauses = ListAppend(local.setClauses, "#this.adapter.quoteColumnName(local.key)# = ?");
+				local.value = arguments[local.key];
+				// Strip wrapping single quotes if present (legacy convention)
+				if (IsSimpleValue(local.value) && REFind("^'.*'$", local.value)) {
+					local.value = Mid(local.value, 2, Len(local.value) - 2);
 				}
-				local.columnUpdates = ListAppend(local.columnUpdates, local.update);
+				if (IsNumeric(local.value) && !REFind("^0\d", local.value)) {
+					ArrayAppend(local.params, {value: local.value, cfsqltype: "cf_sql_numeric"});
+				} else if (IsBoolean(local.value) && !IsNumeric(local.value)) {
+					ArrayAppend(local.params, {value: local.value ? 1 : 0, cfsqltype: "cf_sql_integer"});
+				} else if (IsDate(local.value) && !IsNumeric(local.value)) {
+					ArrayAppend(local.params, {value: local.value, cfsqltype: "cf_sql_timestamp"});
+				} else {
+					ArrayAppend(local.params, {value: local.value, cfsqltype: "cf_sql_varchar"});
+				}
 			}
 		}
-		if (local.columnUpdates != '') {
-			local.sql = 'UPDATE #this.adapter.quoteTableName(arguments.table)# SET #local.columnUpdates#';
+		if (local.setClauses != '') {
+			local.sql = 'UPDATE #this.adapter.quoteTableName(arguments.table)# SET #local.setClauses#';
 			local.message = 'Updated record(s) in table #arguments.table#';
 			if (arguments.where != '') {
 				local.sql = local.sql & ' WHERE #arguments.where#';
 				local.message = local.message & ' where #arguments.where#';
 			}
-			$execute(local.sql);
+			$executeWithParams(sql = local.sql, params = local.params);
 			announce(local.message);
 		}
 	}
@@ -525,9 +608,16 @@ component extends="Base" {
 	 * [category: Migration Functions]
 	 *
 	 * @table The table name to remove the record from
-	 * @where The where clause, i.e id = 123
+	 * @where The where clause, i.e id = 123. Raw SQL — callers must supply a predicate or all=true.
+	 * @all When true, an empty where deletes every row. Default false (fail-closed).
 	 */
-	public void function removeRecord(required string table, string where = "") {
+	public void function removeRecord(required string table, string where = "", boolean all = false) {
+		if (!Len(Trim(arguments.where)) && !arguments.all) {
+			Throw(
+				type = "Wheels.Migrator.MissingWhere",
+				message = "removeRecord() requires a where clause or all=true. An empty where would delete every row."
+			);
+		}
 		local.sql = 'DELETE FROM #this.adapter.quoteTableName(arguments.table)#';
 		local.message = 'Removed record(s) from table #arguments.table#';
 		if (arguments.where != '') {

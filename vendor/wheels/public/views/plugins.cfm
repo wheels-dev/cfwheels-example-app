@@ -2,50 +2,79 @@
 // Check for JSON format request
 param name="request.wheels.params.format" default="html";
 
-if(!application.wheels.enablePluginsComponent)
-	throw(type="wheels.plugins", message="The Wheels Plugin component is disabled...");
-
-loadedPlugins = application.wheels.plugins;
-
-// If JSON format is requested, return JSON response
-if (request.wheels.params.format == "json") {
-	local.pluginsData = {
-		"version": application.wheels.version,
-		"timestamp": now(),
-		"plugins": {
-			"enabled": application.wheels.enablePluginsComponent,
-			"loaded": {}
-		}
+if (!StructKeyExists(variables, "$pluginsEnsureEnabled")) {
+	variables.$pluginsEnsureEnabled = function() {
+		if(!application.wheels.enablePluginsComponent)
+			throw(type="wheels.plugins", message="The Wheels Plugin component is disabled...");
 	};
-
-	// Add loaded plugins
-	for (local.pluginName in loadedPlugins) {
-		local.pluginsData.plugins.loaded[local.pluginName] = loadedPlugins[local.pluginName];
-	}
-
-	// Add incompatible plugins if any
-	if (isDefined("application.wheels.incompatiblePlugins") && len(application.wheels.incompatiblePlugins)) {
-		local.pluginsData.plugins.incompatible = listToArray(application.wheels.incompatiblePlugins);
-	}
-
-	// Add dependent plugins if any
-	if (isDefined("application.wheels.dependantPlugins") && len(application.wheels.dependantPlugins)) {
-		local.pluginsData.plugins.dependent = [];
-		for (local.dep in listToArray(application.wheels.dependantPlugins)) {
-			arrayAppend(local.pluginsData.plugins.dependent, {
-				"plugin": listFirst(local.dep, "|"),
-				"needs": listLast(local.dep, "|")
-			});
-		}
-	}
-
-	local.pluginsData.plugins.count = structCount(loadedPlugins);
-
-	cfcontent(type="application/json", reset=true);
-	writeOutput(serializeJSON(local.pluginsData));
-	abort;
 }
 
+if (!StructKeyExists(variables, "$pluginsRenderJson")) {
+	variables.$pluginsRenderJson = function() {
+		loadedPlugins = application.wheels.plugins;
+
+		// If JSON format is requested, return JSON response
+		local.pluginsData = {
+			"version": application.wheels.version,
+			"timestamp": now(),
+			"plugins": {
+				"enabled": application.wheels.enablePluginsComponent,
+				"loaded": {}
+			}
+		};
+
+		// Add loaded plugins
+		for (local.pluginName in loadedPlugins) {
+			local.pluginsData.plugins.loaded[local.pluginName] = loadedPlugins[local.pluginName];
+		}
+
+		// Add incompatible plugins if any
+		if (isDefined("application.wheels.incompatiblePlugins") && len(application.wheels.incompatiblePlugins)) {
+			local.pluginsData.plugins.incompatible = listToArray(application.wheels.incompatiblePlugins);
+		}
+
+		// Add dependent plugins if any
+		if (isDefined("application.wheels.dependantPlugins") && len(application.wheels.dependantPlugins)) {
+			local.pluginsData.plugins.dependent = [];
+			for (local.dep in listToArray(application.wheels.dependantPlugins)) {
+				arrayAppend(local.pluginsData.plugins.dependent, {
+					"plugin": listFirst(local.dep, "|"),
+					"needs": listLast(local.dep, "|")
+				});
+			}
+		}
+
+		// Add version mismatch plugins if any
+		if (isDefined("application.wheels.versionMismatchPlugins") && len(application.wheels.versionMismatchPlugins)) {
+			local.pluginsData.plugins.versionMismatches = [];
+			for (local.mm in listToArray(application.wheels.versionMismatchPlugins)) {
+				arrayAppend(local.pluginsData.plugins.versionMismatches, {
+					"plugin": listGetAt(local.mm, 1, "|"),
+					"dependency": listGetAt(local.mm, 2, "|"),
+					"required": listGetAt(local.mm, 3, "|"),
+					"loaded": listGetAt(local.mm, 4, "|")
+				});
+			}
+		}
+
+		// Add mixin collisions if any
+		if (isDefined("application.wheels.mixinCollisions") && arrayLen(application.wheels.mixinCollisions)) {
+			local.pluginsData.plugins.mixinCollisions = application.wheels.mixinCollisions;
+		}
+
+		local.pluginsData.plugins.count = structCount(loadedPlugins);
+
+		cfcontent(type="application/json", reset=true);
+		writeOutput(serializeJSON(local.pluginsData));
+		abort;
+	};
+}
+
+$pluginsEnsureEnabled();
+
+if (request.wheels.params.format == "json") {
+	$pluginsRenderJson();
+}
 </cfscript>
 <cfinclude template="../layout/_header.cfm">
 <cfoutput>
@@ -53,16 +82,22 @@ if (request.wheels.params.format == "json") {
 <div class="ui container">
 	#pageHeader("Plugins", "What you've got loaded..")#
 
-		<cfif ($get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins)) OR Len(application.wheels.dependantPlugins)>
+		<cfif ($get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins)) OR Len(application.wheels.dependantPlugins) OR (isDefined("application.wheels.versionMismatchPlugins") AND Len(application.wheels.versionMismatchPlugins)) OR (isDefined("application.wheels.mixinCollisions") AND arrayLen(application.wheels.mixinCollisions))>
 			<div class="ui error message">
 				<div class="header">
 					Warnings:
 				</div>
 					<cfif $get("showIncompatiblePlugins") AND Len(application.wheels.incompatiblePlugins)>
-							<cfloop list="#application.wheels.incompatiblePlugins#" index="local.i">The #local.i# plugin may be incompatible with this version of Wheels, please look for a compatible version of the plugin<br></cfloop>
+							<cfloop list="#application.wheels.incompatiblePlugins#" index="local.i">The #EncodeForHTML(local.i)# plugin may be incompatible with this version of Wheels, please look for a compatible version of the plugin<br></cfloop>
 						</cfif>
 						<cfif Len(application.wheels.dependantPlugins)>
-							<cfloop list="#application.wheels.dependantPlugins#" index="local.i"><cfset needs = ListLast(local.i, "|")>The #ListFirst(local.i, "|")# plugin needs the following plugin<cfif ListLen(needs) GT 1>s</cfif> to work properly: #needs#<br></cfloop>
+							<cfloop list="#application.wheels.dependantPlugins#" index="local.i"><cfset needs = ListLast(local.i, "|")>The #EncodeForHTML(ListFirst(local.i, "|"))# plugin needs the following plugin<cfif ListLen(needs) GT 1>s</cfif> to work properly: #EncodeForHTML(needs)#<br></cfloop>
+						</cfif>
+						<cfif isDefined("application.wheels.versionMismatchPlugins") AND Len(application.wheels.versionMismatchPlugins)>
+							<cfloop list="#application.wheels.versionMismatchPlugins#" index="local.mm">Plugin <strong>#EncodeForHTML(ListGetAt(local.mm, 1, "|"))#</strong> requires <strong>#EncodeForHTML(ListGetAt(local.mm, 2, "|"))#</strong> #EncodeForHTML(ListGetAt(local.mm, 3, "|"))# but version <strong>#EncodeForHTML(ListGetAt(local.mm, 4, "|"))#</strong> is loaded<br></cfloop>
+						</cfif>
+						<cfif isDefined("application.wheels.mixinCollisions") AND arrayLen(application.wheels.mixinCollisions)>
+							<cfloop array="#application.wheels.mixinCollisions#" index="local.c">Method <strong>#EncodeForHTML(local.c.method)#</strong> on <strong>#EncodeForHTML(local.c.target)#</strong>: provided by <strong>#EncodeForHTML(local.c.firstProvider)#</strong>, overridden by <strong>#EncodeForHTML(local.c.secondProvider)#</strong><br></cfloop>
 						</cfif>
 			</div>
 		</cfif>
@@ -80,11 +115,11 @@ if (request.wheels.params.format == "json") {
 			<cfloop collection="#$get('plugins')#" item="local.i">
 				<tr>
 					<td>
-						<a href="#urlFor(route="wheelsPluginEntry", name=local.i)#">#local.i#</a>
+						<a href="#urlFor(route="wheelsPluginEntry", name=local.i)#">#EncodeForHTML(local.i)#</a>
 					</td>
 					<td>
 						<cfif StructCount($get("pluginMeta")) IS NOT 0 && structKeyExists($get("pluginMeta"), local.i) AND len($get("pluginMeta")[local.i]['version'])>
-							#$get("pluginMeta")[local.i]['version']#
+							#EncodeForHTML($get("pluginMeta")[local.i]['version'])#
 						<cfelse>
 							<em>Unknown</em>
 						</cfif>
@@ -108,10 +143,10 @@ if (request.wheels.params.format == "json") {
 <cfelse>
 	<div class="ui placeholder segment">
 		<div class="ui icon header">
-			<svg xmlns="http://www.w3.org/2000/svg" height="60" width="40" viewBox="0 0 384 512"><path d="M96 0C78.3 0 64 14.3 64 32v96h64V32c0-17.7-14.3-32-32-32zM288 0c-17.7 0-32 14.3-32 32v96h64V32c0-17.7-14.3-32-32-32zM32 160c-17.7 0-32 14.3-32 32s14.3 32 32 32v32c0 77.4 55 142 128 156.8V480c0 17.7 14.3 32 32 32s32-14.3 32-32V412.8C297 398 352 333.4 352 256V224c17.7 0 32-14.3 32-32s-14.3-32-32-32H32z"/></svg>
+			<svg xmlns="http://www.w3.org/2000/svg" height="60" width="40" viewBox="0 0 384 512"><path fill="##6c7086" d="M96 0C78.3 0 64 14.3 64 32v96h64V32c0-17.7-14.3-32-32-32zM288 0c-17.7 0-32 14.3-32 32v96h64V32c0-17.7-14.3-32-32-32zM32 160c-17.7 0-32 14.3-32 32s14.3 32 32 32v32c0 77.4 55 142 128 156.8V480c0 17.7 14.3 32 32 32s32-14.3 32-32V412.8C297 398 352 333.4 352 256V224c17.7 0 32-14.3 32-32s-14.3-32-32-32H32z"/></svg>
 			<br>No plugins found!
 		</div>
-		<a href="https://forgebox.io/type/cfwheels-plugins" target="_blank" ref="noopener" class="ui primary button">Browse plugins on Forgebox.io</a>
+		<a href="https://forgebox.io/type/wheels-plugins" target="_blank" ref="noopener" class="ui primary button">Browse plugins on Forgebox.io</a>
 	</div>
 </cfif>
 

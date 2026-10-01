@@ -1,12 +1,112 @@
 component output="false" extends="wheels.Global"{
 
-	property name="Mixins" inject = "wheels.Plugins";
 
 	/**
 	 * Returns itself (the Dispatch object).
+	 *
+	 * Middleware lifecycle contract (see #2954):
+	 *   - Global middleware is resolved once here and reused for every request.
+	 *   - Route-scoped string middleware is resolved on first encounter and
+	 *     cached in `application[$appKey()].$middlewareInstanceCache` keyed by
+	 *     component path so subsequent requests reuse the same instance. The
+	 *     cache lives in application scope so a hard reload (which calls
+	 *     `applicationStop()`) clears it alongside `application.wheels.*`.
+	 *   - The preflight-capability boolean is computed once here and stored
+	 *     on `variables.$preflightCapable` instead of being re-scanned per
+	 *     OPTIONS request.
+	 *
+	 * Implication: middleware components must be safe to share across
+	 * concurrent requests (mutate only via thread-safe state, e.g. CFML
+	 * locks). All built-in middleware already follow this contract.
 	 */
 	public any function $init() {
+		// Initialize the middleware pipeline from application settings.
+		variables.$middlewarePipeline = $buildMiddlewarePipeline();
+		variables.$preflightCapable = $computePreflightCapable(variables.$middlewarePipeline.getMiddleware());
 		return this;
+	}
+
+	/**
+	 * Build the middleware pipeline from application.wheels.middleware (user-configured)
+	 * and application.wheels.pluginMiddleware (registered by plugins via onPluginLoad).
+	 * Plugin middleware runs after user-configured global middleware.
+	 */
+	private any function $buildMiddlewarePipeline() {
+		local.appKey = $appKey();
+		local.middlewareInstances = [];
+
+		// 1. Load user-configured global middleware.
+		local.configured = StructKeyExists(application[local.appKey], "middleware")
+			? application[local.appKey].middleware
+			: [];
+
+		for (local.item in local.configured) {
+			ArrayAppend(local.middlewareInstances, $resolveMiddlewareInstance(local.item));
+		}
+
+		// 2. Append plugin-registered middleware, sorted by priority and before/after constraints.
+		local.pluginMiddleware = $getPluginMiddlewareConfig();
+		if (ArrayLen(local.pluginMiddleware)) {
+			local.resolver = new wheels.middleware.MiddlewareOrderResolver();
+			local.sorted = local.resolver.resolve(local.pluginMiddleware);
+			for (local.entry in local.sorted) {
+				ArrayAppend(local.middlewareInstances, $resolveMiddlewareInstance(local.entry.middleware));
+			}
+		}
+
+		return new wheels.middleware.Pipeline(middleware = local.middlewareInstances);
+	}
+
+	/**
+	 * Retrieve plugin-registered middleware from the application scope.
+	 * Returns the pluginMiddleware array or an empty array if not present.
+	 */
+	private array function $getPluginMiddlewareConfig() {
+		local.appKey = $appKey();
+		if (StructKeyExists(application[local.appKey], "pluginMiddleware")) {
+			return application[local.appKey].pluginMiddleware;
+		}
+		return [];
+	}
+
+	/**
+	 * Resolve a middleware item: instantiate from component path string, or return as-is if already an object.
+	 *
+	 * String paths resolve to cached singletons keyed by the path so route-scoped
+	 * middleware survives across requests (#2954). The cache lives under
+	 * `application[$appKey()].$middlewareInstanceCache` and is cleared whenever
+	 * `applicationStop()` runs (the password-gated reload path).
+	 *
+	 * Concurrency: cache population uses double-checked locking via a named
+	 * `cflock` (matching the pattern in `wheels.middleware.RateLimiter`) so two
+	 * threads racing on the first request for the same component path cannot
+	 * each instantiate their own copy and silently drop the loser's state
+	 * mutations. The fast path is a lock-free struct read once the slot is
+	 * populated; the slow path takes an exclusive lock and re-checks before
+	 * creating the instance.
+	 */
+	public any function $resolveMiddlewareInstance(required any middleware) {
+		if (!IsSimpleValue(arguments.middleware)) {
+			return arguments.middleware;
+		}
+		local.appKey = $appKey();
+		// Fast path: once the slot is populated, the struct read is safe without a lock.
+		if (
+			StructKeyExists(application[local.appKey], "$middlewareInstanceCache")
+			&& StructKeyExists(application[local.appKey].$middlewareInstanceCache, arguments.middleware)
+		) {
+			return application[local.appKey].$middlewareInstanceCache[arguments.middleware];
+		}
+		// Slow path: exclusive lock guards the check-then-create against concurrent first-touch races.
+		cflock(name = "wheels.middlewareCache.#local.appKey#", type = "exclusive", timeout = 10) {
+			if (!StructKeyExists(application[local.appKey], "$middlewareInstanceCache")) {
+				application[local.appKey].$middlewareInstanceCache = {};
+			}
+			if (!StructKeyExists(application[local.appKey].$middlewareInstanceCache, arguments.middleware)) {
+				application[local.appKey].$middlewareInstanceCache[arguments.middleware] = CreateObject("component", arguments.middleware).init();
+			}
+		}
+		return application[local.appKey].$middlewareInstanceCache[arguments.middleware];
 	}
 
 	/**
@@ -23,6 +123,7 @@ component output="false" extends="wheels.Global"{
 		local.rv = $parseJsonBody(params = local.rv);
 		local.rv = $mergeRoutePattern(params = local.rv, route = arguments.route, path = arguments.path);
 		local.rv = $deobfuscateParams(params = local.rv);
+		local.rv = $resolveRouteModelBinding(params = local.rv, route = arguments.route);
 		local.rv = $translateBlankCheckBoxSubmissions(params = local.rv);
 		local.rv = $translateDatePartSubmissions(params = local.rv);
 		local.rv = $createNestedParamStruct(params = local.rv);
@@ -31,12 +132,6 @@ component output="false" extends="wheels.Global"{
 		local.rv = $ensureControllerAndAction(params = local.rv, route = arguments.route);
 		local.rv = $addRouteFormat(params = local.rv, route = arguments.route);
 		local.rv = $addRouteName(params = local.rv, route = arguments.route);
-		
-		// Debug log for testbox route
-		if (structKeyExists(arguments.route, "name") && arguments.route.name == "wheelsTestbox") {
-			writeLog(file="application", text="Route details - controller: #arguments.route.controller#, action: #arguments.route.action#");
-			writeLog(file="application", text="Final params - controller: #local.rv.controller#, action: #local.rv.action#");
-		}
 
 		return local.rv;
 	}
@@ -51,21 +146,8 @@ component output="false" extends="wheels.Global"{
 				// Object form field.
 				local.name = SpanExcluding(local.key, "[");
 
-				// BoxLang compatibility: Check if we're running on BoxLang and handle differently
-				if (StructKeyExists(server, "boxlang")) {
-					// BoxLang specific parsing to handle the bracket parsing differences
-					local.keyWithoutName = ReplaceNoCase(local.key, local.name & "[", "", "one");
-					local.keyWithoutEndBracket = Left(local.keyWithoutName, Len(local.keyWithoutName) - 1);
-					local.nested = [];
-					local.segments = ListToArray(local.keyWithoutEndBracket, "][", false);
-					for (local.segment in local.segments) {
-						local.cleanSegment = Replace(Replace(local.segment, "[", "", "all"), "]", "", "all");
-						ArrayAppend(local.nested, local.cleanSegment);
-					}
-				} else {
-					// Standard behavior for Lucee/Adobe CF
-					local.nested = ListToArray(ReplaceList(local.key, local.name & "[,]", ""), "[", true);
-				}
+				// Use engine adapter for cross-engine bracket-parsing differences
+				local.nested = application.wheels.engineAdapter.parseFormKey(local.key, local.name);
 				if (!StructKeyExists(local.rv, local.name)) {
 					local.rv[local.name] = {};
 				}
@@ -105,31 +187,62 @@ component output="false" extends="wheels.Global"{
 		array routes = application.wheels.routes,
 		component mapper = application.wheels.mapper
 	) {
-		// If this is a HEAD request, look for the corresponding GET route
+		// If this is a HEAD request, look for the corresponding GET route.
 		if (arguments.requestMethod == 'HEAD') {
 			arguments.requestMethod = 'GET';
 		}
 
-		// Loop over Wheels routes.
-		for (local.route in arguments.routes) {
-			// If method doesn't match, skip this route.
-			if (StructKeyExists(local.route, "methods") && !ListFindNoCase(local.route.methods, arguments.requestMethod)) {
-				continue;
-			}
+		local.methodKey = UCase(arguments.requestMethod);
 
-			// Make sure route has been converted to regular expression.
-			if (!StructKeyExists(local.route, "regex")) {
-				local.route.regex = arguments.mapper.$patternToRegex(local.route.pattern);
+		// --- Fast path: Static route O(1) lookup ---
+		// Static routes (no variables in pattern) are indexed in a hash map at registration time.
+		// This avoids regex matching entirely for common static paths like /login, /about, etc.
+		// NOTE: this is a deliberate precedence rule, not just a perf shortcut — a literal path
+		// beats a placeholder route regardless of declaration order. Declaration order still
+		// decides placeholder-vs-placeholder conflicts and ties between identical static
+		// patterns. Pinned by tests/specs/dispatch/RoutePrecedenceSpec.cfc (issue 3073).
+		if (StructKeyExists(application.wheels, "staticRoutes")) {
+			local.staticKey = local.methodKey & ":/" & arguments.path;
+			if (StructKeyExists(application.wheels.staticRoutes, local.staticKey)) {
+				local.rv = $copyRouteForRequest(application.wheels.staticRoutes[local.staticKey]);
 			}
-
-			// If route matches regular expression, set it for return.
-			if (ReFindNoCase(local.route.regex, arguments.path) || (!Len(arguments.path) && local.route.pattern == "/")) {
-				local.rv = Duplicate(local.route);
-				break;
+			// Also try the root path.
+			if (!StructKeyExists(local, "rv") && !Len(arguments.path)) {
+				local.staticKey = local.methodKey & ":/";
+				if (StructKeyExists(application.wheels.staticRoutes, local.staticKey)) {
+					local.rv = $copyRouteForRequest(application.wheels.staticRoutes[local.staticKey]);
+				}
 			}
 		}
 
-		// If returned route contains a redirect, execute that asap
+		// --- Fallback: Full linear scan ---
+		// Scan all routes in registration order, filtering by HTTP method.
+		if (!StructKeyExists(local, "rv")) {
+			for (local.route in arguments.routes) {
+				// If method doesn't match, skip this route.
+				if (StructKeyExists(local.route, "methods") && !ListFindNoCase(local.route.methods, arguments.requestMethod)) {
+					continue;
+				}
+
+				// Make sure route has been converted to regular expression.
+				if (!StructKeyExists(local.route, "regex")) {
+					local.route.regex = arguments.mapper.$patternToRegex(local.route.pattern);
+				}
+
+				// If route matches regular expression, set it for return.
+				// Run the regex once with sub-expressions and stash the result on the
+				// per-request copy so $mergeRoutePattern can reuse it instead of
+				// re-executing the same regex against the same path.
+				local.match = ReFindNoCase(local.route.regex, arguments.path, 1, true);
+				if (local.match.pos[1] > 0 || (!Len(arguments.path) && local.route.pattern == "/")) {
+					local.rv = $copyRouteForRequest(local.route);
+					local.rv.regexMatch = local.match;
+					break;
+				}
+			}
+		}
+
+		// If returned route contains a redirect, execute that asap.
 		if (StructKeyExists(local, "rv") && StructKeyExists(local.rv, "redirect")) {
 			$location(url = local.rv.redirect, addToken = false);
 		}
@@ -139,14 +252,10 @@ component output="false" extends="wheels.Global"{
 			local.alternativeMatchingMethodsForURL = "";
 
 			// Try and provide some more information for why the route hasn't matched:
-			// For example, the developer is accidentally GETing to a route which only allows POST
+			// For example, the developer is accidentally GETing to a route which only allows POST.
 			for (local.route in arguments.routes) {
-				// Make sure route has been converted to regular expression.
-				if (!StructKeyExists(local.route, "regex")) {
-					local.route.regex = arguments.mapper.$patternToRegex(local.route.pattern);
-				}
-
-				// If route matches regular expression, append to alternatives to display
+				// If route matches regular expression, append to alternatives to display.
+				// (regex was already compiled during the main matching loop above)
 				if (ReFindNoCase(local.route.regex, arguments.path) || (!Len(arguments.path) && local.route.pattern == "/")) {
 					local.alternativeMatchingMethodsForURL = ListAppend(local.alternativeMatchingMethodsForURL, local.route.methods);
 				}
@@ -168,6 +277,40 @@ component output="false" extends="wheels.Global"{
 			}
 		}
 
+		return local.rv;
+	}
+
+	/**
+	 * Returns a per-request copy of a matched route struct. Top-level keys are shallow-copied
+	 * and any non-simple members (constraints, etc.) are duplicated so request
+	 * code (middleware reading request.wheels.currentRoute, for example) can never mutate
+	 * the shared route table through the copy. Used by both the static fast path and the
+	 * regex fallback in $findMatchingRoute so the two paths share identical copy semantics.
+	 *
+	 * The `middleware` key is intentionally exempted from the Duplicate pass — instances
+	 * registered there are singletons under the dispatch lifecycle contract (see #2954),
+	 * and Adobe CF's Duplicate() of an array containing CFCs clones the instances, which
+	 * would silently reset any state the middleware holds across requests. The array itself
+	 * is shallow-copied so callers can append/replace entries without mutating the route
+	 * table; the instance references inside the new array are preserved.
+	 */
+	public struct function $copyRouteForRequest(required struct route) {
+		local.rv = StructCopy(arguments.route);
+		for (local.key in local.rv) {
+			if (local.key == "middleware") {
+				if (IsArray(local.rv[local.key])) {
+					local.copy = [];
+					for (local.mw in local.rv[local.key]) {
+						ArrayAppend(local.copy, local.mw);
+					}
+					local.rv[local.key] = local.copy;
+				}
+				continue;
+			}
+			if (!IsSimpleValue(local.rv[local.key])) {
+				local.rv[local.key] = Duplicate(local.rv[local.key]);
+			}
+		}
 		return local.rv;
 	}
 
@@ -203,6 +346,45 @@ component output="false" extends="wheels.Global"{
 			$debugPoint("setup");
 		}
 
+		// CORS preflight short-circuit: when the global middleware pipeline contains
+		// a `wheels.middleware.Cors` instance, run OPTIONS through the pipeline
+		// before route matching so unmatched preflight verbs reach the CORS handler
+		// instead of 404ing in $findMatchingRoute. The legacy
+		// `set(allowCorsRequests=true)` path aborted OPTIONS in EventMethods.cfc
+		// before dispatch; this preserves that contract for middleware users.
+		// See issue #2703.
+		local.preflightMethod = "";
+		try {
+			local.preflightMethod = $getRequestMethod();
+		} catch (any e) {
+			// Swallow intentionally: when request.cgi is not yet populated
+			// (e.g. test contexts or unusual dispatch paths) we fail closed by
+			// leaving preflightMethod empty so the short-circuit guard below is
+			// skipped and normal routing proceeds.
+		}
+		if (UCase(local.preflightMethod) == "OPTIONS" && $hasPreflightCapableMiddleware()) {
+			request.wheels.params = {};
+			// Cors.handle() reads the verb from arguments.request.cgi.request_method
+			// rather than arguments.request.method, so we don't carry the method
+			// field on this context — the `cgi` member supplies it (#3074).
+			// Cors is the only middleware that gates on this path; once it
+			// short-circuits, middleware registered after it does not run.
+			// Middleware registered before Cors still executes.
+			local.preflightContext = {
+				params = {},
+				route = {},
+				pathInfo = arguments.pathInfo,
+				cgi = $buildMiddlewareCgiScope()
+			};
+			local.preflightHandler = function(required struct request) {
+				return "";
+			};
+			return variables.$middlewarePipeline.run(
+				request = local.preflightContext,
+				coreHandler = local.preflightHandler
+			);
+		}
+
 		local.params = $paramParser(argumentCollection = arguments);
 
 		// Set params in the request scope as well so we can display it in the debug info outside of the controller context.
@@ -214,47 +396,191 @@ component output="false" extends="wheels.Global"{
 
 		// Hi-jack any wheels controller requests for GUI
 		if (ListFirst(local.params.controller, '.') EQ "wheels") {
-			if (!application.wheels.enablePublicComponent) {
-				// Hard abort if GUI turned off
-				cfabort;
+			if (!$get("enablePublicComponent")) {
+				// Return 404 so the surface is not fingerprintable. A silent
+				// cfabort responds HTTP 200 with an empty body, which leaks
+				// the existence of the internal GUI routes. See issue #2233.
+				// Must be the script keyword `abort;` — the bare tag-in-script
+				// statement form (`cfabort;`) is Lucee-only; Adobe parses it
+				// as an undefined VARIABLE reference and throws "Variable
+				// CFABORT is undefined" at runtime. See issue #3029.
+				cfheader(statuscode=404);
+				cfcontent(type="text/plain");
+				writeOutput("Not Found");
+				abort;
 			} else {
 				// BoxLang compatibility: Check for null action parameter
 				if (IsNull(local.params.action) || !Len(local.params.action)) {
 					throw(
-						type="Wheels.ActionParameterMissing", 
+						type="Wheels.ActionParameterMissing",
 						message="The action parameter is missing or null. Controller: #local.params.controller#");
 				}
 
-				if (structKeyExists(server, "boxlang")) {
-					local.method = application.wheels.public[local.params.action];
-					local.method();
-				} else {
-					// Debug log the controller and action being called
-					writeLog(file="application", text="Wheels dispatch - controller: #local.params.controller#, action: #local.params.action#");
-
-					// Call the action method directly on the component to preserve context
-					// Use 'object' and 'methodname' for older Adobe CF versions compatibility
-					invoke(object=application.wheels.public, methodname=local.params.action);
+				// Dev-tools network-origin gate: the password-less /wheels GUI
+				// endpoints only answer requests addressed to a local host name
+				// (Host header + no non-loopback X-Forwarded-For; not the socket, so
+				// Docker port-mapped access keeps working). Mutating endpoints add
+				// their own loopback-socket + CSRF / password checks on top. Guarded
+				// so a test double swapped in for the public component (which need not
+				// implement the gate) still dispatches.
+				if (StructKeyExists(application.wheels.public, "$enforceDevToolLocalAccess")) {
+					application.wheels.public.$enforceDevToolLocalAccess();
 				}
+
+				$engineAdapter().invokeMethod(application.wheels.public, local.params.action);
 				// The wheels controller methods handle their own output and abort
 				// So we need to ensure we don't continue processing
 				return "";
 			}
 		} else {
-			// Create the requested controller and call the action on it.
-			local.controller = controller(name = local.params.controller, params = local.params);
-			local.controller.processAction();
+			// Build the request context for middleware. The `cgi` member carries
+			// the sanitized request.cgi copy overlaid on the full inbound HTTP
+			// header set so documented patterns like a RateLimiter keyFunction
+			// reading `req.cgi.http_x_api_key` resolve per client (#3074).
+			local.requestContext = {
+				params = local.params,
+				route = StructKeyExists(request.wheels, "currentRoute") ? request.wheels.currentRoute : {},
+				pathInfo = arguments.pathInfo,
+				method = $getRequestMethod(),
+				cgi = $buildMiddlewareCgiScope()
+			};
 
-			// If there is a delayed redirect pending we execute it here thus halting the rest of the request.
-			if (local.controller.$performedRedirect()) {
-				$location(argumentCollection = local.controller.getRedirect());
+			// The core handler that middleware wraps around.
+			local.coreHandler = function(required struct request) {
+				local.ctrl = controller(name = arguments.request.params.controller, params = arguments.request.params);
+				local.ctrl.processAction();
+
+				if (local.ctrl.$performedRedirect()) {
+					$location(argumentCollection = local.ctrl.getRedirect());
+				}
+
+				local.ctrl.$flashClear();
+				return local.ctrl.response();
+			};
+
+			// Merge global + route-scoped middleware and run through the pipeline.
+			local.routeMiddleware = $getRouteMiddleware(local.params);
+			if (ArrayLen(local.routeMiddleware)) {
+				local.allMiddleware = [];
+				ArrayAppend(local.allMiddleware, variables.$middlewarePipeline.getMiddleware(), true);
+				ArrayAppend(local.allMiddleware, local.routeMiddleware, true);
+				local.pipeline = new wheels.middleware.Pipeline(middleware = local.allMiddleware);
+				return local.pipeline.run(request = local.requestContext, coreHandler = local.coreHandler);
 			}
 
-			// Clear out the flash (note that this is not done for redirects since the processing does not get here).
-			local.controller.$flashClear();
-
-			return local.controller.response();
+			return variables.$middlewarePipeline.run(request = local.requestContext, coreHandler = local.coreHandler);
 		}
+	}
+
+	/**
+	 * Build the `cgi` member of the middleware request context (#3074).
+	 *
+	 * Starts from the inbound HTTP headers — each mapped to its CGI-style
+	 * `http_*` name — and overlays the sanitized `request.cgi` copy so the
+	 * standard keys keep the IIS/encoding fixes applied by `$cgiScope()` (and
+	 * so test specs that inject values into `request.cgi` win over the live
+	 * header snapshot). The header mapping is what makes arbitrary headers
+	 * like `X-Api-Key` resolve: `$cgiScope()` copies a fixed key list, and
+	 * the engine CGI scope exposes arbitrary headers by name but is not
+	 * enumerable on Adobe CF.
+	 *
+	 * The `headers` argument exists for spec injection; live dispatch omits
+	 * it and reads the real inbound headers via `$requestHttpHeaders()`.
+	 */
+	public struct function $buildMiddlewareCgiScope(struct headers) {
+		if (!StructKeyExists(arguments, "headers")) {
+			arguments.headers = $requestHttpHeaders();
+		}
+		// $requestHttpHeaders() can hand back null on some servlet hosts (BoxLang
+		// under certain servers); iterating a null subject NPEs there where
+		// Lucee/Adobe iterate an empty struct. Default to an empty struct.
+		if (IsNull(arguments.headers) || !IsStruct(arguments.headers)) {
+			arguments.headers = {};
+		}
+		local.rv = {};
+		for (local.headerName in arguments.headers) {
+			if (Len(local.headerName) && IsSimpleValue(arguments.headers[local.headerName])) {
+				local.rv["http_" & Replace(LCase(local.headerName), "-", "_", "all")] = arguments.headers[local.headerName];
+			}
+		}
+		if (StructKeyExists(request, "cgi") && IsStruct(request.cgi)) {
+			StructAppend(local.rv, request.cgi, true);
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Snapshot of the inbound HTTP headers, or an empty struct when they are
+	 * unavailable (test contexts or unusual dispatch paths). Prefers the
+	 * body-skipping form of GetHttpRequestData so reading headers never
+	 * consumes the request input stream.
+	 */
+	public struct function $requestHttpHeaders() {
+		try {
+			return GetHttpRequestData(false).headers;
+		} catch (any e) {
+			// Fall through: some engines may not support the boolean argument.
+		}
+		try {
+			return GetHttpRequestData().headers;
+		} catch (any e) {
+			// Fall through: no servlet request available in this context.
+		}
+		return {};
+	}
+
+	/**
+	 * Returns true if the global middleware pipeline contains a CORS middleware
+	 * instance capable of handling an OPTIONS preflight short-circuit. Used to
+	 * preserve the legacy `allowCorsRequests=true` short-circuit semantics in
+	 * the new middleware pipeline. See issue #2703.
+	 *
+	 * The boolean is computed once at `$init` from the pipeline snapshot and
+	 * stored on `variables.$preflightCapable`; this method is a single struct
+	 * read on the dispatch hot path instead of an `IsInstanceOf` scan per
+	 * OPTIONS request (#2954).
+	 */
+	public boolean function $hasPreflightCapableMiddleware() {
+		return variables.$preflightCapable;
+	}
+
+	/**
+	 * Internal: scan the given middleware array for a CORS instance. Called
+	 * once at `$init` to compute the cached preflight-capability boolean.
+	 */
+	private boolean function $computePreflightCapable(required array middleware) {
+		for (local.mw in arguments.middleware) {
+			if (IsObject(local.mw) && IsInstanceOf(local.mw, "wheels.middleware.Cors")) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Resolve route-scoped middleware from the matched route's `middleware` property.
+	 * Returns an array of instantiated middleware components. String paths resolve
+	 * to cached singletons via `$resolveMiddlewareInstance` so route-scoped
+	 * stateful middleware (e.g. an in-memory RateLimiter) survives across requests
+	 * (#2954).
+	 */
+	public array function $getRouteMiddleware(required struct params) {
+		local.instances = [];
+		// The matched route is stored on request.wheels.currentRoute during $findMatchingRoute.
+		if (!StructKeyExists(request.wheels, "currentRoute") || !StructKeyExists(request.wheels.currentRoute, "middleware")) {
+			return local.instances;
+		}
+
+		local.routeMiddleware = request.wheels.currentRoute.middleware;
+		if (IsSimpleValue(local.routeMiddleware)) {
+			local.routeMiddleware = ListToArray(local.routeMiddleware);
+		}
+
+		for (local.item in local.routeMiddleware) {
+			ArrayAppend(local.instances, $resolveMiddlewareInstance(local.item));
+		}
+
+		return local.instances;
 	}
 
 	/**
@@ -268,6 +594,10 @@ component output="false" extends="wheels.Global"{
 	) {
 		local.path = $getPathFromRequest(pathInfo = arguments.pathInfo, scriptName = arguments.scriptName);
 		local.route = $findMatchingRoute(path = local.path);
+
+		// Store the matched route so middleware and other components can inspect it.
+		request.wheels.currentRoute = local.route;
+
 		return $createParams(
 			path = local.path,
 			route = local.route,
@@ -296,10 +626,7 @@ component output="false" extends="wheels.Global"{
 	/**
 	 * If content type is JSON, deserialize it into a struct and add to the params struct.
 	 */
-	public struct function $parseJsonBody(
-		required struct params,
-		struct httpRequestData = GetHTTPRequestData()
-	) {
+	public struct function $parseJsonBody(required struct params) {
 		local.headers = request.wheels.httpRequestData.headers;
 		local.content = request.wheels.httpRequestData.content;
 		if (StructKeyExists(local.headers, "Content-Type")) {
@@ -338,8 +665,21 @@ component output="false" extends="wheels.Global"{
 	 */
 	public struct function $mergeRoutePattern(required struct params, required struct route, required string path) {
 		local.rv = arguments.params;
-		local.matches = ReFindNoCase(arguments.route.regex, arguments.path, 1, true);
-		local.iEnd = ArrayLen(local.matches.pos);
+		// Reuse the match result stashed by $findMatchingRoute when present so the route
+		// regex only executes once per request. Fall back to a fresh match for routes that
+		// did not go through the regex fallback (static fast path or direct calls).
+		if (StructKeyExists(arguments.route, "regexMatch")) {
+			local.matches = arguments.route.regexMatch;
+		} else {
+			local.matches = ReFindNoCase(arguments.route.regex, arguments.path, 1, true);
+		}
+
+		// Bound the loop by the number of route variables. Constraint patterns are
+		// normalized to non-capturing groups at draw time, but this guard ensures an
+		// unexpected extra capturing group can never push extraction past the variable
+		// list (wrong values or a ListGetAt out-of-bounds crash).
+		local.variableCount = StructKeyExists(arguments.route, "foundVariables") ? ListLen(arguments.route.foundVariables) : 0;
+		local.iEnd = Min(ArrayLen(local.matches.pos), local.variableCount + 1);
 		for (local.i = 2; local.i <= local.iEnd; local.i++) {
 			local.key = ListGetAt(arguments.route.foundVariables, local.i - 1);
 			local.rv[local.key] = Mid(arguments.path, local.matches.pos[local.i], local.matches.len[local.i]);
@@ -364,6 +704,201 @@ component output="false" extends="wheels.Global"{
 			}
 		}
 		return local.rv;
+	}
+
+	/**
+	 * Resolves a model instance from params.key when route model binding is enabled.
+	 * The resolved model is stored in params under the singularized controller name (e.g., params.user).
+	 * Throws Wheels.RecordNotFound if the record doesn't exist. Convention-derived bindings skip
+	 * silently (with a negative cache, cleared on reload) when the model class can't be resolved;
+	 * explicit bindings (binding="BlogPost") rethrow resolution failures since they indicate a
+	 * configuration error. Query errors from the finder always propagate.
+	 */
+	public struct function $resolveRouteModelBinding(required struct params, required struct route) {
+		local.rv = arguments.params;
+
+		// Determine if binding is enabled: route-level takes precedence, then global setting.
+		local.binding = false;
+		if (StructKeyExists(arguments.route, "binding")) {
+			local.binding = arguments.route.binding;
+		} else if ($get("routeModelBinding")) {
+			local.binding = true;
+		}
+
+		// Skip if disabled or no key parameter exists.
+		if (IsBoolean(local.binding) && !local.binding) {
+			// Binding is off. Emit a dev-mode hint if this route looks like a binding
+			// candidate (has a key and dispatches to a member action). See gap tracker
+			// item #5: silent failure when developers write `params.post` without
+			// setting `binding=true`.
+			$maybeWarnRouteBinding(params = local.rv, route = arguments.route);
+			return local.rv;
+		}
+		if (!StructKeyExists(local.rv, "key")) {
+			return local.rv;
+		}
+
+		// Derive the model name.
+		local.explicitBinding = IsSimpleValue(local.binding) && !IsBoolean(local.binding) && Len(local.binding);
+		if (local.explicitBinding) {
+			// Explicit model name override (e.g., binding="BlogPost").
+			local.modelName = local.binding;
+		} else {
+			// Convention: singularize + capitalize controller name.
+			// Check params first, then fall back to route struct (controller may not be in params yet).
+			if (StructKeyExists(local.rv, "controller")) {
+				local.controllerName = local.rv.controller;
+			} else if (StructKeyExists(arguments.route, "controller")) {
+				local.controllerName = arguments.route.controller;
+			} else {
+				return local.rv;
+			}
+			local.modelName = capitalize(singularize(local.controllerName));
+		}
+
+		// Negative cache: a conventional binding that previously failed to resolve is skipped
+		// without re-acquiring the app-wide model lock and re-running the model bootstrap
+		// (including its DB metadata query) on every request. Lives in the application.wheels
+		// struct so it's cleared on reload.
+		local.appKey = $appKey();
+		if (
+			!local.explicitBinding
+			&& StructKeyExists(application[local.appKey], "unresolvableRouteBindings")
+			&& StructKeyExists(application[local.appKey].unresolvableRouteBindings, local.modelName)
+		) {
+			return local.rv;
+		}
+
+		// Resolve the model class in its own try so only class/bootstrap resolution failures
+		// are handled here.
+		try {
+			local.modelClass = model(local.modelName);
+		} catch (any e) {
+			// An explicit binding name (binding="BlogPost") that fails to resolve is a
+			// configuration error — surface it instead of silently skipping.
+			if (local.explicitBinding) {
+				rethrow;
+			}
+			// Conventional binding against a non-model-backed controller: skip silently so
+			// non-model routes keep working, but negative-cache the miss so the failed
+			// bootstrap doesn't repeat on every request, and leave a dev-mode breadcrumb.
+			if (!StructKeyExists(application[local.appKey], "unresolvableRouteBindings")) {
+				application[local.appKey].unresolvableRouteBindings = {};
+			}
+			application[local.appKey].unresolvableRouteBindings[local.modelName] = true;
+			if ($get("environment") != "production") {
+				writeLog(
+					file = "wheels",
+					type = "warning",
+					text = "Route model binding could not resolve model `#local.modelName#` (#e.type#: #e.message#). Binding is skipped for this model until reload."
+				);
+			}
+			return local.rv;
+		}
+
+		// Run the finder outside the try so query errors (DB connection failures, missing
+		// tables at query time, SQL errors) propagate instead of being masked as a missing
+		// model class.
+		if (StructKeyExists(arguments.route, "bindBy") && Len(Trim(arguments.route.bindBy))) {
+			// bindBy="slug" looks the record up by a non-PK column via the
+			// parameterized dynamic finder. invoke() form (not a bracket call)
+			// per Cross-Engine Invariant 4.
+			local.instance = invoke(local.modelClass, "findOneBy" & arguments.route.bindBy, { 1 = local.rv.key });
+		} else {
+			local.instance = local.modelClass.findByKey(local.rv.key);
+		}
+
+		// If no record was found, throw a 404.
+		if (IsBoolean(local.instance) && !local.instance) {
+			$throwErrorOrShow404Page(
+				type = "Wheels.RecordNotFound",
+				message = "#local.modelName# record not found.",
+				extendedInfo = "A #local.modelName# record with key `#EncodeForHTML(local.rv.key)#` could not be found."
+			);
+		}
+
+		// Store the resolved model in params under the singular name.
+		local.paramKey = LCase(Left(local.modelName, 1)) & Mid(local.modelName, 2, Len(local.modelName) - 1);
+		local.rv[local.paramKey] = local.instance;
+
+		return local.rv;
+	}
+
+	/**
+	 * Emits a one-time dev-mode log warning when a route looks like a route-model-binding
+	 * candidate but binding is not enabled. The heuristic: params.key is present AND the
+	 * resolved action is one of the member binding-eligible actions (show, edit, update,
+	 * delete). Writes one line per unique controller+action pair per JVM process to avoid
+	 * log spam. Gated behind environment != "production" and suppressRouteBindingWarnings=false.
+	 * The warning points the developer at either the per-resource `binding=true` flag or the
+	 * global `routeModelBinding` setting. Safe to call regardless of state — returns silently
+	 * on any error so it never interferes with dispatch.
+	 */
+	public boolean function $maybeWarnRouteBinding(required struct params, required struct route) {
+		try {
+			// Resolve the settings namespace ($wheels or wheels depending on runtime).
+			local.appKey = $appKey();
+			local.settings = application[local.appKey];
+
+			// Gate: production skips entirely.
+			local.env = StructKeyExists(local.settings, "environment") ? local.settings.environment : "";
+			if (local.env == "production") {
+				return false;
+			}
+
+			// Gate: user opt-out.
+			if (StructKeyExists(local.settings, "suppressRouteBindingWarnings") && local.settings.suppressRouteBindingWarnings) {
+				return false;
+			}
+
+			// Only warn when a key is in the URL (binding wouldn't fire without one).
+			if (!StructKeyExists(arguments.params, "key")) {
+				return false;
+			}
+
+			// Only warn for member binding-eligible actions.
+			local.action = StructKeyExists(arguments.params, "action") ? arguments.params.action : (StructKeyExists(arguments.route, "action") ? arguments.route.action : "");
+			if (!ListFindNoCase("show,edit,update,delete", local.action)) {
+				return false;
+			}
+
+			// Derive controller (for log detail + dedup key).
+			local.controller = StructKeyExists(arguments.params, "controller") ? arguments.params.controller : (StructKeyExists(arguments.route, "controller") ? arguments.route.controller : "");
+			if (!Len(local.controller)) {
+				return false;
+			}
+
+			// Dedup: one warning per controller+action per application lifetime.
+			// Resets on reload (application scope rebuild).
+			if (!StructKeyExists(application, "$wheelsRouteBindingWarnings")) {
+				application.$wheelsRouteBindingWarnings = {};
+			}
+			local.dedupKey = local.controller & "##" & local.action;
+			if (StructKeyExists(application.$wheelsRouteBindingWarnings, local.dedupKey)) {
+				return false;
+			}
+			application.$wheelsRouteBindingWarnings[local.dedupKey] = true;
+
+			// Derive the singular name binding would use (matches $resolveRouteModelBinding logic).
+			local.modelName = capitalize(singularize(local.controller));
+			local.singular = LCase(Left(local.modelName, 1)) & Mid(local.modelName, 2, Len(local.modelName) - 1);
+			local.routeName = StructKeyExists(arguments.route, "name") ? arguments.route.name : "";
+
+			local.msg = "Wheels Route Binding Hint: #UCase(local.action)# on controller '#local.controller#'"
+				& (Len(local.routeName) ? " (route '#local.routeName#')" : "")
+				& " dispatched with params.key but route model binding is not enabled on this resource."
+				& " If you intended params.#local.singular# to be auto-loaded from the #local.modelName# model, add binding=true to the resource:"
+				& "  .resources(name=""#local.controller#"", binding=true)."
+				& " Or enable globally in config/settings.cfm: set(routeModelBinding=true)."
+				& " To silence this hint: set(suppressRouteBindingWarnings=true) in config/settings.cfm."
+				& " (Hint fires in development only.)";
+
+			writeLog(file="wheels", type="warning", text=local.msg);
+			return true;
+		} catch (any ignored) {
+			// Warning emission is best-effort; never block dispatch.
+			return false;
+		}
 	}
 
 	/**
@@ -448,63 +983,52 @@ component output="false" extends="wheels.Global"{
 			StructDelete(local.rv, local.key & "($hour)");
 			StructDelete(local.rv, local.key & "($minute)");
 			StructDelete(local.rv, local.key & "($second)");
+			StructDelete(local.rv, local.key & "($ampm)");
 		}
 		return local.rv;
 	}
 
 	/**
 	 * Ensure that the controller and action params exist and are camelized.
+	 * A matched route that names a controller/action always wins over query,
+	 * form, or JSON body values. Mapper.$addRoute already deletes those keys
+	 * when the pattern contains [controller] / [action], so wildcard
+	 * path-derived names still come from $mergeRoutePattern. The pattern
+	 * check is a second gate for route structs built outside $addRoute.
 	 */
 	public struct function $ensureControllerAndAction(required struct params, required struct route) {
 		local.rv = arguments.params;
-		if (!StructKeyExists(local.rv, "controller")) {
+		local.pattern = StructKeyExists(arguments.route, "pattern") ? arguments.route.pattern : "";
+		if (
+			StructKeyExists(arguments.route, "controller")
+			&& Len(arguments.route.controller)
+			&& !FindNoCase("[controller]", local.pattern)
+		) {
 			local.rv.controller = arguments.route.controller;
+		} else if (!StructKeyExists(local.rv, "controller")) {
+			local.rv.controller = StructKeyExists(arguments.route, "controller") ? arguments.route.controller : "";
 		}
-		if (!StructKeyExists(local.rv, "action")) {
+		if (
+			StructKeyExists(arguments.route, "action")
+			&& Len(arguments.route.action)
+			&& !FindNoCase("[action]", local.pattern)
+		) {
 			local.rv.action = arguments.route.action;
+		} else if (!StructKeyExists(local.rv, "action")) {
+			local.rv.action = StructKeyExists(arguments.route, "action") ? arguments.route.action : "";
 		}
 
 		// We now need to have dot notation allowed in the controller hence the \.
 		local.rv.controller = ReReplace(local.rv.controller, "[^0-9A-Za-z-_\.]", "", "all");
 
 		// Filter out illegal characters from the controller and action arguments.
-		// Debug log before filtering
-		if (local.rv.controller == "wheels.public" && local.rv.action == "tests_testbox") {
-			writeLog(file="application", text="Before filter - action: #local.rv.action#");
-		}
 		local.rv.action = ReReplace(local.rv.action, "[^0-9A-Za-z-_\.]", "", "all");
 
-		// Convert controller to upperCamelCase.
-		// BoxLang compatibility: Handle consecutive dots differently
-		if (StructKeyExists(server, "boxlang")) {
-			// For BoxLang, manually handle the leading dots issue
-			local.dotPrefix = "";
-			local.cleanName = local.rv.controller;
-
-			while (Left(local.cleanName, 1) == ".") {
-				local.dotPrefix &= ".";
-				local.cleanName = Right(local.cleanName, Len(local.cleanName) - 1);
-			}
-
-			local.cleanName = ReReplace(local.cleanName, "(^|-)([a-z])", "\u\2", "all");
-			local.rv.controller = local.dotPrefix & local.cleanName;
-		} else {
-			// Standard behavior for Lucee/Adobe CF
-			local.cName = ListLast(local.rv.controller, ".");
-			local.cName = ReReplace(local.cName, "(^|-)([a-z])", "\u\2", "all");
-			local.cLen = ListLen(local.rv.controller, ".");
-			if (local.cLen) {
-				local.rv.controller = ListSetAt(local.rv.controller, local.cLen, local.cName, ".");
-			}
-		}
+		// Convert controller to upperCamelCase via engine adapter
+		local.rv.controller = application.wheels.engineAdapter.controllerNameToUpperCamelCase(local.rv.controller);
 
 		// Action to normal camelCase.
 		local.rv.action = ReReplace(local.rv.action, "-([a-z])", "\u\1", "all");
-		
-		// Debug log final values
-		if (local.rv.controller == "wheels.public") {
-			writeLog(file="application", text="Final dispatch params - controller: #local.rv.controller#, action: #local.rv.action#");
-		}
 
 		return local.rv;
 	}
@@ -533,20 +1057,26 @@ component output="false" extends="wheels.Global"{
 
 	/**
 	 * Determine HTTP verb used in request.
+	 * `_method` is honored only on POST and only for PUT / PATCH / DELETE —
+	 * the verbs `startFormTag()` emits. GET/HEAD cannot become a
+	 * state-changing verb, and POST cannot become a CSRF-safe verb.
 	 */
 	public string function $getRequestMethod() {
-		// If request is a post, check for alternate verb.
 		if (request.cgi.request_method == "post" && StructKeyExists(form, "_method")) {
-			return form["_method"];
+			local.override = form["_method"];
+			if (ListFindNoCase("put,patch,delete", local.override)) {
+				return local.override;
+			}
 		}
 
 		return request.cgi.request_method;
 	}
 
 	function onDIComplete(){
-		if (structKeyExists(server, "boxlang")) {
-			variables.this = this;
-		}
-		Mixins.$initializeMixins(variables);
+		$engineAdapter().prepareDIComplete(variables, this);
+		// Shared application-cached instance; $pluginObj() falls back to a fresh
+		// wheels.Plugins during bootstrap windows before $loadPlugins has cached
+		// one (issue 2897).
+		$pluginObj().$initializeMixins(variables);
 	}
 }

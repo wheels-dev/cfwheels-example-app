@@ -30,6 +30,10 @@ component {
 	/**
 	 * Use this in an individual controller action to define which formats the action will respond with.
 	 * This can be used to define provides behavior in individual actions or to override a global setting set with `provides` in the controller's `config()`.
+	 * Restrictions are enforced (since 4.0.4): `renderWith()` falls back to the `html` view for a
+	 * format outside the list. When the action renders nothing itself, a request whose `format`
+	 * param (e.g. the route's `.[format]` segment) names a format outside the list answers
+	 * 406 Not Acceptable (since 4.1.2).
 	 *
 	 * [section: Controller]
 	 * [category: Provides Functions]

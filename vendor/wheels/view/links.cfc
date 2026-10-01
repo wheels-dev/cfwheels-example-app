@@ -20,6 +20,7 @@ component {
 	 * @port Set this to override the current port number.
 	 * @href Pass a link to an external site here if you want to bypass the Wheels routing system altogether and link to an external URL.
 	 * @encode [see:styleSheetLinkTag].
+	 * @sanitizeHref When true, blank out caller-supplied `javascript:` / `data:` hrefs. Default false (B3: default deny is a public-behavior change).
 	 */
 	public string function linkTo(
 		string text,
@@ -34,7 +35,8 @@ component {
 		string protocol,
 		numeric port,
 		string href,
-		any encode
+		any encode,
+		boolean sanitizeHref
 	) {
 		$args(name = "linkTo", args = arguments);
 
@@ -45,24 +47,30 @@ component {
 				if (!StructKeyExists(arguments, "rel")) {
 					arguments.rel = "";
 				}
-				arguments.rel = ListAppend(arguments.rel, "no-follow", " ");
+				arguments.rel = ListAppend(arguments.rel, "nofollow", " ");
 			}
 		}
 
 		local.encodeExcept = "";
 		if (!StructKeyExists(arguments, "href")) {
-			local.args = Duplicate(arguments);
+			// Shallow copy is enough here (we only add/override top-level keys for URLFor);
+			// Duplicate() would deep-clone model objects passed as `key` on every link.
+			local.args = StructCopy(arguments);
 			local.args.$encodeForHtmlAttribute = true;
 			if (local.args.encode == "attributes") {
 				local.args.encode = true;
 			}
 			arguments.href = uRLFor(argumentCollection = local.args);
 			local.encodeExcept = "href";
+		} else if (IsBoolean(arguments.sanitizeHref) && arguments.sanitizeHref) {
+			// Opt-in fail-closed gate. Default sanitizeHref=false keeps
+			// javascript:/data: hrefs working (B3 public-behavior escalation).
+			arguments.href = $sanitizeLinkToHref(arguments.href);
 		}
 		if (!StructKeyExists(arguments, "text")) {
 			arguments.text = arguments.href;
 		}
-		local.skip = "text,route,controller,action,key,params,anchor,onlyPath,host,protocol,port,encode";
+		local.skip = "text,route,controller,action,key,params,anchor,onlyPath,host,protocol,port,encode,sanitizeHref";
 		if (Len(arguments.route)) {
 			// variables passed in as route arguments should not be added to the html element
 			local.skip = ListAppend(local.skip, $routeVariables(argumentCollection = arguments));
@@ -75,6 +83,60 @@ component {
 			encode = arguments.encode,
 			encodeExcept = local.encodeExcept
 		);
+	}
+
+	/**
+	 * Opt-in fail-closed href gate for `linkTo(href=)`. Strips javascript:
+	 * and data: schemes (case-insensitive, optional whitespace before `:`).
+	 * Default `sanitizeHref=false` leaves those hrefs unchanged.
+	 */
+	public string function $sanitizeLinkToHref(required string href) {
+		local.trimmed = Trim(arguments.href);
+		if (ReFindNoCase("^(javascript|data)\s*:", local.trimmed)) {
+			return "";
+		}
+		return arguments.href;
+	}
+
+	/**
+	 * Internal function. Reports whether the ambient route name from
+	 * `request.wheels.params` can safely be adopted as paginationLinks()'s own
+	 * `route` (#3638).
+	 *
+	 * Two things have to hold. The name must resolve to exactly one configured
+	 * route: a multi-candidate name such as `wildcard` (one candidate per method x
+	 * pattern) cannot be disambiguated by `$findRoute()` without an HTTP method or
+	 * path variables, and paginationLinks() supplies neither, so the adoption used
+	 * to throw `Wheels.RouteNotFound` — a whole-page 404 in production, where the
+	 * route error path aborts. And every path variable the chosen route requires
+	 * must already be present in `args`, because `URLFor()` throws
+	 * `Wheels.IncorrectRoutingArguments` for an adopted route with an unsupplied
+	 * variable. When either check fails, the caller leaves `route` unset and
+	 * `URLFor()` builds the controller/action URL instead.
+	 */
+	public boolean function $canAdoptAmbientRoute(required string route, required struct args) {
+		if (!Len(arguments.route) || !StructKeyExists(application.wheels, "namedRoutePositions")) {
+			return false;
+		}
+		if (!StructKeyExists(application.wheels.namedRoutePositions, arguments.route)) {
+			return false;
+		}
+		local.positions = application.wheels.namedRoutePositions[arguments.route];
+		if (Find(",", local.positions)) {
+			return false;
+		}
+		local.route = application.wheels.routes[ListGetAt(local.positions, 1)];
+		if (!StructKeyExists(local.route, "foundvariables")) {
+			return true;
+		}
+		local.iEnd = ListLen(local.route.foundvariables);
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			local.variable = ListGetAt(local.route.foundvariables, local.i);
+			if (!StructKeyExists(arguments.args, local.variable) || !Len(arguments.args[local.variable])) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	/**
@@ -129,8 +191,13 @@ component {
 				local.method = "get";
 			}
 		}
-		arguments.method = local.method;
-		local.args = Duplicate(arguments);
+		// Route resolution below must use the caller's real verb (delete/put/patch),
+		// not the spoofed HTML form method. Singular member routes have no POST
+		// candidate, so passing "post" to URLFor / $findRoute threw
+		// Wheels.RouteNotFound (issue #3551). The spoofed form method is applied just
+		// before the form element is rendered.
+		// Shallow copy for the same reason as in linkTo() above.
+		local.args = StructCopy(arguments);
 		local.args.$encodeForHtmlAttribute = true;
 		if (local.args.encode == "attributes") {
 			local.args.encode = true;
@@ -146,7 +213,11 @@ component {
 			// variables passed in as route arguments should not be added to the html element
 			local.skip = ListAppend(local.skip, $routeVariables(argumentCollection = arguments));
 		}
-		local.encode = IsBoolean(arguments.encode) && arguments.encode ? "attributes" : false;
+		// The form element itself submits with the spoofed HTML method (post, or get for
+		// get requests); the real verb for put/patch/delete is carried in the hidden
+		// `_method` field added above.
+		arguments.method = local.method;
+		local.encode = $coerceEncode(arguments.encode, "attributes");
 		if ($isRequestProtectedFromForgery() && ListFindNoCase("post,put,patch,delete", arguments.method)) {
 			local.content &= authenticityTokenField();
 		}
@@ -199,6 +270,7 @@ component {
 	 * @prepend String or HTML to be prepended before result.
 	 * @append String or HTML to be appended after result.
 	 * @prependToPage String or HTML to be prepended before each page number.
+	 * @addActiveClassToPrependedParent Whether or not to add an active class to the parent element of the current page link (requires prependToPage to contain a class attribute).
 	 * @prependOnFirst Whether or not to prepend the prependToPage string on the first page in the list.
 	 * @prependOnAnchor Whether or not to prepend the prependToPage string on the anchors.
 	 * @appendToPage String or HTML to be appended after each page number.
@@ -232,15 +304,34 @@ component {
 		boolean pageNumberAsParam,
 		any encode
 	) {
+		// Per-request short-circuit (#2714); the once-per-application logging and
+		// registration policy lives in the shared $deprecated() helper.
+		if (!StructKeyExists(request.wheels, "$paginationLinksDeprecationLogged")) {
+			request.wheels.$paginationLinksDeprecationLogged = true;
+			$deprecated(
+				feature = "paginationLinks",
+				message = "paginationLinks() is deprecated and will be removed in a future release. Use paginationNav() instead (or compose the individual helpers: firstPageLink/previousPageLink/pageNumberLinks/nextPageLink/lastPageLink).",
+				docUrl = "https://github.com/wheels-dev/wheels/issues/1930"
+			);
+		}
+
 		/* To fix the bug below:
 			https://github.com/wheels-dev/wheels/issues/942
 
 			The paginationLinks() function does not set the correct URL on the anchor tag if route is not passed in. Added condition to default the route, if it is not passed in, to the route defined in the request.wheels.params, if the action is index.
+
+			The ambient name is only adopted when it can actually be resolved from
+			here (#3638): paginationLinks() passes neither an HTTP method nor the
+			current request's route variables, so an ambiguous name (the six
+			`wildcard` candidates) or a route with unsupplied path variables would
+			throw instead of rendering the pagination.
 		*/
 		if (!StructKeyExists(arguments, "route")) {
 			if(structKeyExists(request.wheels, 'params') AND structKeyExists(request.wheels.params, 'route')) {
 				if(request.wheels.params.action EQ "index"){
-					arguments.route = request.wheels.params.route;
+					if ($canAdoptAmbientRoute(route = request.wheels.params.route, args = arguments)) {
+						arguments.route = request.wheels.params.route;
+					}
 				}
 			}
 		}
@@ -261,7 +352,7 @@ component {
 		local.start = "";
 		local.middle = "";
 		local.end = "";
-		if (StructKeyExists(arguments, "route")) {
+		if (StructKeyExists(arguments, "route") && Len(arguments.route)) {
 			// when a route name is specified and the name argument is part
 			// of the route variables specified, we need to force the
 			// arguments.pageNumberAsParam to be false
@@ -272,136 +363,47 @@ component {
 		}
 
 		// Encode all prepend / append type arguments if specified.
-		if (IsBoolean(arguments.encode) && arguments.encode && $get("encodeHtmlTags")) {
-			if (Len(arguments.prepend)) {
-				arguments.prepend = EncodeForHTML($canonicalize(arguments.prepend));
-			}
-			if (Len(arguments.prependToPage)) {
-				arguments.prependToPage = EncodeForHTML($canonicalize(arguments.prependToPage));
-			}
-			if (Len(arguments.append)) {
-				arguments.append = EncodeForHTML($canonicalize(arguments.append));
-			}
-			if (Len(arguments.appendToPage)) {
-				arguments.appendToPage = EncodeForHTML($canonicalize(arguments.appendToPage));
-			}
-		}
+		$encodeArgsForHtml(args = arguments, keys = "prepend,prependToPage,append,appendToPage,anchorDivider");
 
 		if (arguments.showSinglePage || local.totalPages > 1) {
+			local.sanitizedAppend = $paginationSanitizeWrapper(arguments.appendToPage);
 			if (Len(arguments.prepend)) {
 				local.start &= arguments.prepend;
 			}
+			// Sanitize prependToPage before first/last anchors AND the middle
+			// loop. alwaysShowAnchors previously concatenated the raw string.
+			local.sanitizedPrepend = $paginationSanitizeWrapper(arguments.prependToPage);
 			if (arguments.alwaysShowAnchors) {
 				if ((local.currentPage - arguments.windowSize) > 1) {
-					local.pageNumber = 1;
-					if (!arguments.pageNumberAsParam) {
-						local.linkToArguments[arguments.name] = local.pageNumber;
-					} else {
-						local.linkToArguments.params = arguments.name & "=" & local.pageNumber;
-						if (StructKeyExists(arguments, "params")) {
-							local.linkToArguments.params &= "&" & arguments.params;
-						}
-					}
-					local.linkToArguments.text = NumberFormat(local.pageNumber);
-					if (Len(arguments.prependToPage) && arguments.prependOnAnchor) {
-						local.start &= arguments.prependToPage;
-					}
-					local.start &= linkTo(argumentCollection = local.linkToArguments);
-					if (Len(arguments.appendToPage) && arguments.appendOnAnchor) {
-						local.start &= arguments.appendToPage;
-					}
+					local.start &= $paginationAnchorLink(
+						linkToArguments = local.linkToArguments,
+						args = arguments,
+						pageNumber = 1,
+						sanitizedPrepend = local.sanitizedPrepend,
+						sanitizedAppend = local.sanitizedAppend
+					);
 					local.start &= arguments.anchorDivider;
 				}
 			}
-			local.middle = "";
-			for (local.i = 1; local.i <= local.totalPages; local.i++) {
-				if (
-					(local.i >= (local.currentPage - arguments.windowSize) && local.i <= local.currentPage)
-					|| (local.i <= (local.currentPage + arguments.windowSize) && local.i >= local.currentPage)
-				) {
-					if (!arguments.pageNumberAsParam) {
-						local.linkToArguments[arguments.name] = local.i;
-					} else {
-						local.linkToArguments.params = arguments.name & "=" & local.i;
-						if (StructKeyExists(arguments, "params")) {
-							local.linkToArguments.params &= "&" & arguments.params;
-						}
-					}
-					local.linkToArguments.text = NumberFormat(local.i);
-					if (Len(arguments.classForCurrent) && local.currentPage == local.i) {
-						// apply the classForCurrent class if specified and this is the current page
-						local.linkToArguments.class = arguments.classForCurrent;
-					} else if (StructKeyExists(arguments, "class") && Len(arguments.class)) {
-						// allow the class attribute to be applied to the anchor tag if specified
-						local.linkToArguments.class = arguments.class;
-					} else {
-						// clear the class argument if not provided
-						StructDelete(local.linkToArguments, "class");
-					}
-					if (Len(arguments.prependToPage)) {
 
-						/*
-							To fix the bug below:
-							https://github.com/wheels-dev/wheels/issues/908
-
-							We need the paginationLinks() function to set the active class to the parent of the current page item.
-							The changes made here set the active class to the immediate parent of the current page element in case nested elements are passed in.
-						 */
-						if(local.currentPage == local.i  && arguments.addActiveClassToPrependedParent && findNoCase('class', arguments.prependToPage)) {
-							local.prependToPageElementArr = listToArray(arguments.prependToPage, '<');
-							local.lastElementArrIndex = arrayLen(local.prependToPageElementArr);
-							local.lastElement = local.prependToPageElementArr[local.lastElementArrIndex];
-							local.classStringIndex = findNoCase('class=', local.lastElement) + 6;
-							local.startString = mid(local.lastElement, 1, local.classStringIndex);
-							local.midString = mid(local.lastElement, local.classStringIndex+1, len(local.lastElement)-local.classStringIndex+1);
-							local.activeMidString = 'active ' & local.midString;
-							local.modifiedLastElement = local.startString & local.activeMidString;
-							local.prependToPageElementArr[local.lastElementArrIndex] = local.modifiedLastElement;
-							local.activePrependToPage = arrayToList(local.prependToPageElementArr, '<');
-							local.activePrependToPage = '<' & local.activePrependToPage;
-							local.middle &= local.activePrependToPage;
-						} else {
-							local.middle &= arguments.prependToPage;
-						}
-					}
-					if (local.currentPage != local.i || arguments.linkToCurrentPage) {
-						local.middle &= linkTo(argumentCollection = local.linkToArguments);
-					} else {
-						if (Len(arguments.classForCurrent)) {
-							local.middle &= $element(
-								name = "span",
-								content = NumberFormat(local.i),
-								class = arguments.classForCurrent,
-								encode = arguments.encode
-							);
-						} else {
-							local.middle &= NumberFormat(local.i);
-						}
-					}
-					if (Len(arguments.appendToPage)) {
-						local.middle &= arguments.appendToPage;
-					}
-				}
-			}
+			local.middle = $paginationWindowMiddle(
+				linkToArguments = local.linkToArguments,
+				args = arguments,
+				currentPage = local.currentPage,
+				totalPages = local.totalPages,
+				sanitizedPrepend = local.sanitizedPrepend,
+				sanitizedAppend = local.sanitizedAppend
+			);
 			if (arguments.alwaysShowAnchors) {
 				if (local.totalPages > (local.currentPage + arguments.windowSize)) {
-					if (!arguments.pageNumberAsParam) {
-						local.linkToArguments[arguments.name] = local.totalPages;
-					} else {
-						local.linkToArguments.params = arguments.name & "=" & local.totalPages;
-						if (StructKeyExists(arguments, "params")) {
-							local.linkToArguments.params &= "&" & arguments.params;
-						}
-					}
-					local.linkToArguments.text = NumberFormat(local.totalPages);
 					local.end &= arguments.anchorDivider;
-					if (Len(arguments.prependToPage) && arguments.prependOnAnchor) {
-						local.end &= arguments.prependToPage;
-					}
-					local.end &= linkTo(argumentCollection = local.linkToArguments);
-					if (Len(arguments.appendToPage) && arguments.appendOnAnchor) {
-						local.end &= arguments.appendToPage;
-					}
+					local.end &= $paginationAnchorLink(
+						linkToArguments = local.linkToArguments,
+						args = arguments,
+						pageNumber = local.totalPages,
+						sanitizedPrepend = local.sanitizedPrepend,
+						sanitizedAppend = local.sanitizedAppend
+					);
 				}
 			}
 			if (Len(arguments.append)) {
@@ -410,17 +412,173 @@ component {
 		}
 		if (Len(local.middle)) {
 			if (Len(arguments.prependToPage) && !arguments.prependOnFirst) {
-				local.middle = Mid(
-					local.middle,
-					Len(arguments.prependToPage) + 1,
-					Len(local.middle) - Len(arguments.prependToPage)
+				// Strip exactly the prefix emitted for the first page in the window. That is the
+				// sanitized (and possibly entity-decoded) string, or its "active " variant when the
+				// first page is the current page, so its length can differ from the raw argument.
+				local.firstPrefix = $paginationPrependForPage(
+					args = arguments,
+					sanitizedPrepend = local.sanitizedPrepend,
+					isCurrentPage = (Max(1, local.currentPage - arguments.windowSize) == local.currentPage)
 				);
+				local.firstPrefixLen = Len(local.firstPrefix);
+				if (
+					local.firstPrefixLen > 0
+					&& Len(local.middle) >= local.firstPrefixLen
+					&& Compare(Left(local.middle, local.firstPrefixLen), local.firstPrefix) == 0
+				) {
+					local.middle = Mid(local.middle, local.firstPrefixLen + 1, Len(local.middle) - local.firstPrefixLen);
+				}
 			}
-			if (Len(arguments.appendToPage) && !arguments.appendOnLast) {
-				local.middle = Mid(local.middle, 1, Len(local.middle) - Len(arguments.appendToPage));
+			if (Len(local.sanitizedAppend) && !arguments.appendOnLast) {
+				local.middle = Mid(local.middle, 1, Len(local.middle) - Len(local.sanitizedAppend));
 			}
 		}
 		return local.start & local.middle & local.end;
+	}
+
+	/**
+	 * Internal: sets the page-number argument (a route variable or a `params`
+	 * query-string entry) plus the link `text` on a copy of the `linkTo`
+	 * argument struct used by `paginationLinks()`.
+	 */
+	public struct function $paginationLinkPageArgs(
+		required struct linkToArguments,
+		required struct args,
+		required numeric pageNumber
+	) {
+		local.lta = StructCopy(arguments.linkToArguments);
+		if (!arguments.args.pageNumberAsParam) {
+			local.lta[arguments.args.name] = arguments.pageNumber;
+		} else {
+			local.lta.params = arguments.args.name & "=" & arguments.pageNumber;
+			if (StructKeyExists(arguments.args, "params")) {
+				local.lta.params &= "&" & arguments.args.params;
+			}
+		}
+		local.lta.text = NumberFormat(arguments.pageNumber);
+		return local.lta;
+	}
+
+	/**
+	 * Internal: renders a first/last anchor for `paginationLinks()`. The
+	 * surrounding `anchorDivider` is applied by the caller so first and last
+	 * anchors keep their existing (opposite) divider placement.
+	 */
+	public string function $paginationAnchorLink(
+		required struct linkToArguments,
+		required struct args,
+		required numeric pageNumber,
+		required string sanitizedPrepend,
+		required string sanitizedAppend
+	) {
+		local.rv = "";
+		local.lta = $paginationLinkPageArgs(
+			linkToArguments = arguments.linkToArguments,
+			args = arguments.args,
+			pageNumber = arguments.pageNumber
+		);
+		if (Len(arguments.args.prependToPage) && arguments.args.prependOnAnchor) {
+			local.rv &= arguments.sanitizedPrepend;
+		}
+		local.rv &= linkTo(argumentCollection = local.lta);
+		if (Len(arguments.sanitizedAppend) && arguments.args.appendOnAnchor) {
+			local.rv &= arguments.sanitizedAppend;
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Internal: renders the window of numbered page links for `paginationLinks()`.
+	 */
+	public string function $paginationWindowMiddle(
+		required struct linkToArguments,
+		required struct args,
+		required numeric currentPage,
+		required numeric totalPages,
+		required string sanitizedPrepend,
+		required string sanitizedAppend
+	) {
+		local.middle = "";
+		for (local.i = 1; local.i <= arguments.totalPages; local.i++) {
+			if (
+				(local.i >= (arguments.currentPage - arguments.args.windowSize) && local.i <= arguments.currentPage)
+				|| (local.i <= (arguments.currentPage + arguments.args.windowSize) && local.i >= arguments.currentPage)
+			) {
+				local.lta = $paginationLinkPageArgs(
+					linkToArguments = arguments.linkToArguments,
+					args = arguments.args,
+					pageNumber = local.i
+				);
+				if (Len(arguments.args.classForCurrent) && arguments.currentPage == local.i) {
+					// apply the classForCurrent class if specified and this is the current page
+					local.lta.class = arguments.args.classForCurrent;
+				} else if (StructKeyExists(arguments.args, "class") && Len(arguments.args.class)) {
+					// allow the class attribute to be applied to the anchor tag if specified
+					local.lta.class = arguments.args.class;
+				} else {
+					// clear the class argument if not provided
+					StructDelete(local.lta, "class");
+				}
+				if (Len(arguments.args.prependToPage)) {
+
+					/*
+						To fix the bug below:
+						https://github.com/wheels-dev/wheels/issues/908
+
+						We need the paginationLinks() function to set the active class to the parent of the current page item.
+						The changes made here set the active class to the immediate parent of the current page element in case nested elements are passed in.
+					 */
+
+					local.middle &= $paginationPrependForPage(
+						args = arguments.args,
+						sanitizedPrepend = arguments.sanitizedPrepend,
+						isCurrentPage = (arguments.currentPage == local.i)
+					);
+				}
+				if (arguments.currentPage != local.i || arguments.args.linkToCurrentPage) {
+					local.middle &= linkTo(argumentCollection = local.lta);
+				} else {
+					if (Len(arguments.args.classForCurrent)) {
+						local.middle &= $element(
+							name = "span",
+							content = NumberFormat(local.i),
+							class = arguments.args.classForCurrent,
+							encode = arguments.args.encode
+						);
+					} else {
+						local.middle &= NumberFormat(local.i);
+					}
+				}
+				if (Len(arguments.sanitizedAppend)) {
+					local.middle &= arguments.sanitizedAppend;
+				}
+			}
+		}
+		return local.middle;
+	}
+
+	/**
+	 * Internal: returns the `prependToPage` string `paginationLinks()` emits before a page link,
+	 * injecting "active " into the parent's class attribute for the current page when
+	 * `addActiveClassToPrependedParent` is set.
+	 */
+	public string function $paginationPrependForPage(
+		required struct args,
+		required string sanitizedPrepend,
+		required boolean isCurrentPage
+	) {
+		if (
+			arguments.isCurrentPage
+			&& arguments.args.addActiveClassToPrependedParent
+			&& findNoCase('class', arguments.sanitizedPrepend)
+		) {
+			// Inject "active " into the class attribute value via regex
+			if (reFindNoCase('class\s*=\s*[''"]', arguments.sanitizedPrepend)) {
+				return reReplaceNoCase(arguments.sanitizedPrepend, '(class\s*=\s*[''"])', '\1active ', 'one');
+			}
+			return reReplaceNoCase(arguments.sanitizedPrepend, '(class\s*=\s*)', '\1active ', 'one');
+		}
+		return arguments.sanitizedPrepend;
 	}
 
 	/**
@@ -440,8 +598,7 @@ component {
 
 		// Create anchor elements with an href attribute for all URLs found in the text.
 		if (arguments.link != "emailAddresses") {
-			// For BoxLang compatibility
-			if (structKeyExists(server, "boxlang")) {
+			if ($engineAdapter().isBoxLang()) {
 				local.anchors = [];
 				local.tempText = arguments.text;
 				local.anchorMatches = ReMatchNoCase("<a\s[^>]*>.*?</a>", local.tempText);
@@ -496,11 +653,14 @@ component {
 				local.str = ReReplaceNoCase(local.str, local.punctuationRegEx, "", "all");
 
 				// Make sure that links beginning with "www." have a protocol.
-				if (Left(local.str, 4) == "www." && !Len(arguments.protocol)) {
-					arguments.protocol = "http://";
+				// Computed per match (not stored on `arguments`) so a www-form URL doesn't
+				// prefix subsequent absolute URLs in the same text with "http://".
+				local.protocol = arguments.protocol;
+				if (Left(local.str, 4) == "www." && !Len(local.protocol)) {
+					local.protocol = "http://";
 				}
 
-				arguments.href = arguments.protocol & local.str;
+				arguments.href = local.protocol & local.str;
 				local.element = $element(
 					name = "a",
 					content = local.str,
@@ -521,15 +681,75 @@ component {
 		return arguments.text;
 	}
 
-	public string function $paramsToQueryString(required any params) {
+	/**
+	 * Decodes HTML numeric entities (decimal &#NNN; and hex &#xHH;) to their character equivalents.
+	 * Used to normalise input before regex-based XSS sanitisation so that entity-encoded
+	 * payloads like &#111;nmouseover cannot bypass the pattern checks.
+	 */
+	public string function $decodeHtmlEntities(required string input) {
+		local.result = arguments.input;
+		// Decode hex entities: &#xHH;
+		local.pos = 1;
+		while (true) {
+			local.match = reFindNoCase('&##x([0-9a-f]+);', local.result, local.pos, true);
+			if (local.match.pos[1] == 0) break;
+			local.hex = Mid(local.result, local.match.pos[2], local.match.len[2]);
+			// Cap the code point to the valid Unicode range (1..0x10FFFF) so overlong or
+			// out-of-range references can't crash Chr(); invalid entities are left untouched.
+			local.digits = ReReplace(local.hex, "^0+", "");
+			local.codePoint = (Len(local.digits) && Len(local.digits) <= 6) ? InputBaseN(local.digits, 16) : 0;
+			if (local.codePoint < 1 || local.codePoint > 1114111) {
+				local.pos = local.match.pos[1] + local.match.len[1];
+				continue;
+			}
+			local.char = Chr(local.codePoint);
+			// Lucee 7 doesn't allow Left(str, 0); guard against match at position 1
+			local.prefix = local.match.pos[1] > 1 ? Left(local.result, local.match.pos[1] - 1) : "";
+			local.result = local.prefix & local.char & Mid(local.result, local.match.pos[1] + local.match.len[1], Len(local.result));
+			local.pos = local.match.pos[1] + Len(local.char);
+		}
+		// Decode decimal entities: &#NNN;
+		local.pos = 1;
+		while (true) {
+			local.match = reFind('&##(\d+);', local.result, local.pos, true);
+			if (local.match.pos[1] == 0) break;
+			local.dec = Mid(local.result, local.match.pos[2], local.match.len[2]);
+			// Same range cap as the hex branch above (1..0x10FFFF = 1114111).
+			local.digits = ReReplace(local.dec, "^0+", "");
+			local.codePoint = (Len(local.digits) && Len(local.digits) <= 7) ? Int(local.digits) : 0;
+			if (local.codePoint < 1 || local.codePoint > 1114111) {
+				local.pos = local.match.pos[1] + local.match.len[1];
+				continue;
+			}
+			local.char = Chr(local.codePoint);
+			local.prefix = local.match.pos[1] > 1 ? Left(local.result, local.match.pos[1] - 1) : "";
+			local.result = local.prefix & local.char & Mid(local.result, local.match.pos[1] + local.match.len[1], Len(local.result));
+			local.pos = local.match.pos[1] + Len(local.char);
+		}
+		return local.result;
+	}
+
+	public string function $paramsToQueryString(required any params, boolean encode = true) {
 		if (!isStruct(arguments.params)) {
 			return arguments.params;
 		}
+		// Mixin copies can drop the declared default; missing means encode (S8).
+		// Do not read arguments.encode unless it exists (Lucee will throw).
+		local.doEncode = true;
+		if (StructKeyExists(arguments, "encode") && IsBoolean(arguments.encode) && !arguments.encode) {
+			local.doEncode = false;
+		}
 		local.queryString = "";
-		for (key in arguments.params) {
-			local.value = arguments.params[key];
+		for (local.key in arguments.params) {
+			local.value = arguments.params[local.key];
 			if (!isNull(local.value) && local.value != "") {
-				local.queryString &= (Len(local.queryString) ? "&" : "") & key & "=" & encodeForUrl(local.value);
+				// encode=true keeps the public helper's existing contract.
+				// $paginationLinkToArgs passes false so URLFor encodes once (S8).
+				if (local.doEncode) {
+					local.queryString &= (Len(local.queryString) ? "&" : "") & encodeForUrl(local.key) & "=" & encodeForUrl(local.value);
+				} else {
+					local.queryString &= (Len(local.queryString) ? "&" : "") & local.key & "=" & local.value;
+				}
 			}
 		}
 		return local.queryString;

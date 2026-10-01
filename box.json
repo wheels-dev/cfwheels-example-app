@@ -14,7 +14,7 @@
     },
     "bugs":"https://github.com/cfwheels/cfwheels-example-app/issues",
     "slug":"cfwheels-example-app",
-    "shortDescription":"A Wheels 3.x example app with user management, role based permissions and password resets",
+    "shortDescription":"A Wheels 4.x example app with user management, role based permissions and password resets",
     "changelog":"https://github.com/cfwheels/cfwheels-example-app/CHANGELOG.md",
     "type":"projects",
     "keywords":[
@@ -31,17 +31,13 @@
         }
     ],
     "dependencies":{
-        "wheels-core":"3.0.0+33",
-        "wirebox":"^7.0.0",
-        "testbox":"^6.0.0",
+        "wheels-core":"4.1.2",
         "cfwheels-flashmessages-bootstrap":"^1.0.2",
         "cfwheels-authenticateThis":"^1.0.1",
         "cfwheels-js-confirm":"^1.0.5"
     },
     "installPaths":{
         "wheels-core":"vendor/wheels/",
-        "wirebox":"vendor/wirebox/",
-        "testbox":"vendor/testbox/",
         "cfwheels-flashmessages-bootstrap":"plugins/FlashMessagesBootstrap",
         "cfwheels-authenticateThis":"plugins/authenticateThis",
         "cfwheels-js-confirm":"plugins/jsconfirm"

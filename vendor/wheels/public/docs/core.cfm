@@ -39,34 +39,8 @@ if (StructKeyExists(application.wheels, "docs")) {
 	// Now safely append to documentScope
 	ArrayAppend(documentScope, {"name" = "model", "scope" = modelInstance});
 	
-	/* 
-		To fix the issue below:
-		https://github.com/wheels-dev/wheels/issues/1132
-		
-		To add the test framework functions in the documentation. Added the Test component in the documentScope.
-
-		As app/test/functions/Example.cfc can be deleted, so check if that component exists then create that component's object.
-		As Example.cfc extends tests.Test so we are checking the Example.cfc first as that will include both component's functions.
-	*/
-	try{
-		// BoxLang compatibility: Use correct component path
-		if (StructKeyExists(server, "boxlang")) {
-			ArrayAppend(documentScope, {"name" = "test", "scope" = CreateObject("component", "wheels.tests.functions.Example")});
-		} else {
-			ArrayAppend(documentScope, {"name" = "test", "scope" = CreateObject("component", "tests.functions.Example")});
-		}
-	}
-	catch (any exception){
-		// BoxLang compatibility: Use correct component path
-		if (StructKeyExists(server, "boxlang")) {
-			ArrayAppend(documentScope, {"name" = "test", "scope" = CreateObject("component", "wheels.tests.Test")});
-		} else {
-			ArrayAppend(documentScope, {"name" = "test", "scope" = CreateObject("component", "tests.Test")});
-		}
-	}
-
 	ArrayAppend(documentScope, {"name" = "mapper", "scope" = application.wheels.mapper});
-	if (application.wheels.enablePluginsComponent) {
+	if (application.wheels.enableMigratorComponent) {
 		ArrayAppend(documentScope, {"name" = "migrator", "scope" = application.wheels.migrator});
 		ArrayAppend(
 			documentScope,
@@ -100,5 +74,11 @@ if (StructKeyExists(application.wheels, "docs")) {
 	application.wheels.docs = docs;
 }
 
-include "layouts/#request.wheels.params.format#.cfm";
+// Validate `format` against an alphanumeric allowlist before interpolating
+// it into the include path. Without this, `format=../views/info` would
+// climb out of layouts/ — same LFI traversal class $getRequestFormat was
+// hardened against (issue #2974). Unscoped on purpose: this template runs
+// both at template level (views/docs.cfm) and inside a UDF (views/ai.cfm).
+docFormat = $resolveDocFormat(request.wheels.params.format);
+include "layouts/#docFormat#.cfm";
 </cfscript>

@@ -9,16 +9,32 @@ component extends="wheels.Global"{
 	 */
 	public function announce(required string message) {
 		param name="request.$wheelsMigrationOutput" default="";
-		request.$wheelsMigrationOutput = request.$wheelsMigrationOutput & arguments.message & Chr(13);
+		request.$wheelsMigrationOutput = request.$wheelsMigrationOutput & arguments.message & Chr(13) & Chr(10);
+		request.$wheelsMigrationDidAnnounce = true;
 	}
 
-	public string function $getDBType() {
+	public string function $getDBType(string dataSource = "") {
 		local.appKey = $appKey();
+		local.dsName = Len(arguments.dataSource) ? arguments.dataSource : $migratorDataSource();
+
+		// Memoize the resolved adapter name per datasource: engine identity is
+		// stable for the life of the application, and discovery paths (e.g.
+		// Migrator.getAvailableMigrations()) instantiate every migration CFC —
+		// without this cache each init() triggers a fresh $dbinfo(version)
+		// round-trip (plus a SELECT version() on PostgreSQL).
+		if (
+			StructKeyExists(application[local.appKey], "$migratorAdapterNames")
+			&& StructKeyExists(application[local.appKey].$migratorAdapterNames, local.dsName)
+		) {
+			return application[local.appKey].$migratorAdapterNames[local.dsName];
+		}
+
+		local.creds = $migratorDataSourceCredentials();
 		local.info = $dbinfo(
 			type = "version",
-			datasource = application[local.appKey].dataSourceName,
-			username = application[local.appKey].dataSourceUserName,
-			password = application[local.appKey].dataSourcePassword
+			datasource = local.dsName,
+			username = local.creds.username,
+			password = local.creds.password
 		);
 		local.adapterName = "";
 		if (
@@ -30,8 +46,25 @@ component extends="wheels.Global"{
 			local.adapterName = "MicrosoftSQLServer";
 		} else if (local.info.driver_name Contains "MySQL") {
 			local.adapterName = "MySQL";
+		} else if (local.info.database_productname Contains "CockroachDB") {
+			local.adapterName = "CockroachDB";
 		} else if (local.info.driver_name Contains "PostgreSQL") {
-			local.adapterName = "PostgreSQL";
+			// The PostgreSQL JDBC driver reports "PostgreSQL" as product name even
+			// when connected to CockroachDB. Query version() to distinguish.
+			try {
+				local.versionQuery = queryExecute(
+					"SELECT version() AS v",
+					[],
+					{datasource: local.dsName}
+				);
+				if (IsQuery(local.versionQuery) && FindNoCase("CockroachDB", local.versionQuery.v)) {
+					local.adapterName = "CockroachDB";
+				} else {
+					local.adapterName = "PostgreSQL";
+				}
+			} catch (any e) {
+				local.adapterName = "PostgreSQL";
+			}
 			// NB: using mySQL adapter for H2 as the cli defaults to this for development
 		} else if (local.info.driver_name Contains "H2") {
 			// determine the emulation mode
@@ -58,42 +91,124 @@ component extends="wheels.Global"{
 		} else if (local.info.driver_name Contains "SQLite") {
 			local.adapterName = "SQLite";
 		}
+		// Only cache successful detection — an empty string means the engine
+		// could not be identified and callers surface their own errors.
+		if (Len(local.adapterName)) {
+			if (!StructKeyExists(application[local.appKey], "$migratorAdapterNames")) {
+				application[local.appKey].$migratorAdapterNames = {};
+			}
+			application[local.appKey].$migratorAdapterNames[local.dsName] = local.adapterName;
+		}
 		return local.adapterName;
 	}
 
 	private string function $getForeignKeys(required string table) {
 		local.appKey = $appKey();
 		local.foreignKeyList = "";
-		local.tables = $dbinfo(
-			type = "tables",
-			datasource = application[local.appKey].dataSourceName,
-			username = application[local.appKey].dataSourceUserName,
-			password = application[local.appKey].dataSourcePassword
-		);
-		if (ListFindNoCase(ValueList(local.tables.table_name), arguments.table)) {
+		// Probe the single table for existence instead of listing every table
+		// in the schema — a failed zero-row SELECT means the table doesn't
+		// exist, so there are no foreign keys to report. (Mutate a struct field
+		// rather than assigning a bare local inside catch: BoxLang discards
+		// `local.X = ...` assignments made in a catch body.)
+		local.state = {tableExists = true};
+		// Migration.init() always sets this.adapter, so a missing adapter is a
+		// broken instantiation — fail loudly rather than silently interpolating
+		// an UNQUOTED table name into SQL (#2937 review, #2977).
+		if (!StructKeyExists(this, "adapter")) {
+			Throw(
+				type = "Wheels.Migrator.MissingAdapter",
+				message = "$getForeignKeys() requires an initialized database adapter. Instantiate migrations through Migration.init()."
+			);
+		}
+		local.quotedTable = this.adapter.quoteTableName(arguments.table);
+		try {
+			$query(
+				datasource = $migratorDataSource(),
+				sql = "SELECT 1 FROM #local.quotedTable# WHERE 1=0"
+			);
+		} catch (any e) {
+			local.state.tableExists = false;
+		}
+		if (local.state.tableExists) {
+			local.creds = $migratorDataSourceCredentials();
 			local.foreignKeys = $dbinfo(
 				type = "foreignkeys",
 				table = arguments.table,
-				datasource = application[local.appKey].dataSourceName,
-				username = application[local.appKey].dataSourceUserName,
-				password = application[local.appKey].dataSourcePassword
+				datasource = $migratorDataSource(),
+				username = local.creds.username,
+				password = local.creds.password
 			);
-			local.foreignKeyList = ValueList(local.foreignKeys.FKCOLUMN_NAME);
+			// S2: FKCOLUMN_NAME is the local column, not the constraint name.
+			// Adobe dropTable() fed that list to dropForeignKey(keyname=).
+			local.foreignKeyList = $foreignKeyConstraintNames(local.foreignKeys);
 		}
 		return local.foreignKeyList;
 	}
 
-	private void function $execute(required string sql) {
+	/**
+	 * Constraint names from a cfdbinfo(type="foreignkeys") query.
+	 * Prefers FK_NAME. Never falls back to FKCOLUMN_NAME — that is the
+	 * referencing column, and using it as a constraint name breaks DROP
+	 * on Adobe / non-SQLite.
+	 */
+	public string function $foreignKeyConstraintNames(required query foreignKeys) {
+		if (
+			IsQuery(arguments.foreignKeys)
+			&& ListFindNoCase(arguments.foreignKeys.columnList, "FK_NAME")
+		) {
+			return ValueList(arguments.foreignKeys.FK_NAME);
+		}
+		return "";
+	}
+
+	private void function $execute(required any sql, string dataSource = "") {
+		// Adapters may return an array of statements for multi-step DDL
+		// (notably SQLite's recreate-table pattern for changeColumnInTable).
+		if (IsArray(arguments.sql)) {
+			for (local.stmt in arguments.sql) {
+				if (Len(Trim(local.stmt))) {
+					$execute(sql = local.stmt, dataSource = arguments.dataSource);
+				}
+			}
+			return;
+		}
+		local.appKey = $appKey();
+		local.dsName = Len(arguments.dataSource) ? arguments.dataSource : $migratorDataSource();
+		// Executed statements may change the schema — drop the request-scoped
+		// column cache so the next $getColumns() re-probes.
+		StructDelete(request, "$wheelsMigratorColumns");
+		local.prepared = $prepareMigrationSql(sql = arguments.sql, dsName = local.dsName);
+		if (!local.prepared.captured) {
+			$query(datasource = local.dsName, sql = local.prepared.sql);
+		}
+	}
+
+	/**
+	 * Executes a parameterized SQL statement for safe data operations.
+	 */
+	private void function $executeWithParams(required string sql, required array params, string dataSource = "") {
+		local.appKey = $appKey();
+		local.dsName = Len(arguments.dataSource) ? arguments.dataSource : $migratorDataSource();
+		local.prepared = $prepareMigrationSql(sql = arguments.sql, dsName = local.dsName);
+		if (!local.prepared.captured) {
+			queryExecute(local.prepared.sql, arguments.params, {datasource: local.dsName});
+		}
+	}
+
+	/**
+	 * Shared pre-execution pipeline for $execute()/$executeWithParams(): trims
+	 * the statement, appends the ";" terminator (except on Oracle — resolved
+	 * via the memoized $getDBType() rather than a per-statement $dbinfo
+	 * round-trip), appends to the migration SQL file when enabled, and captures
+	 * the statement on request.$wheelsDebugSQLResult in dry-run mode.
+	 * Returns {sql, captured}; captured=true means the caller must not execute
+	 * the statement.
+	 */
+	private struct function $prepareMigrationSql(required string sql, required string dsName) {
 		local.appKey = $appKey();
 		local.sql = Trim(arguments.sql);
-		local.info = $dbinfo(
-			type = "version",
-			datasource = application.wheels.dataSourceName,
-			username = application.wheels.dataSourceUserName,
-			password = application.wheels.dataSourcePassword
-		);
-		if (Right(local.sql, 1) neq ";" && !FindNoCase("Oracle", local.info.database_productname)) {
-			local.sql = local.sql &= ";";
+		if (Right(local.sql, 1) neq ";" && $getDBType(arguments.dsName) != "Oracle") {
+			local.sql &= ";";
 		}
 		if (StructKeyExists(request, "$wheelsMigrationSQLFile") && application[local.appKey].writeMigratorSQLFiles) {
 			$file(
@@ -104,26 +219,57 @@ component extends="wheels.Global"{
 				fixNewLine = "yes"
 			);
 		}
-		if (StructKeyExists(request, "$wheelsDebugSQL") && request.$wheelsDebugSQL) {
+		local.captured = StructKeyExists(request, "$wheelsDebugSQL") && request.$wheelsDebugSQL;
+		if (local.captured) {
 			if (!StructKeyExists(request, "$wheelsDebugSQLResult")) {
 				request.$wheelsDebugSQLResult = [];
 			}
 			ArrayAppend(request.$wheelsDebugSQLResult, local.sql);
-		} else {
-			$query(datasource = application[local.appKey].dataSourceName, sql = local.sql);
 		}
+		// Any real SQL (including debug capture) means this step is not announce-only.
+		request.$wheelsMigrationDidExecute = true;
+		return {sql: local.sql, captured: local.captured};
 	}
 
 	public string function $getColumns(required string tableName) {
 		local.appKey = $appKey();
+		// Request-scoped cache: addRecord()/updateRecord() consult the column
+		// list for every inserted/updated row, so a multi-row seed migration
+		// would otherwise issue a full table-metadata round-trip per row.
+		// $execute() drops the cache whenever a statement runs, so DDL in the
+		// same request (addColumn() etc.) is reflected on the next read.
+		// Key on the VERBATIM table name: the $dbinfo probe below uses original
+		// case, so case-folding the key would let `Authors` and `authors` share
+		// one slot on case-sensitive databases (#2937 review, #2977).
+		local.cacheKey = $migratorDataSource() & "|" & arguments.tableName;
+		if (
+			StructKeyExists(request, "$wheelsMigratorColumns")
+			&& StructKeyExists(request.$wheelsMigratorColumns, local.cacheKey)
+		) {
+			return request.$wheelsMigratorColumns[local.cacheKey];
+		}
+		local.creds = $migratorDataSourceCredentials();
 		local.columns = $dbinfo(
-			datasource = application[local.appKey].dataSourceName,
-			username = application[local.appKey].dataSourceUserName,
-			password = application[local.appKey].dataSourcePassword,
+			datasource = $migratorDataSource(),
+			username = local.creds.username,
+			password = local.creds.password,
 			type = "columns",
 			table = arguments.tableName
 		);
-		return ValueList(local.columns.COLUMN_NAME);
+		// This path calls $dbinfo directly rather than going through the model adapter, so it
+		// needs its own catalog-bleed guard: an unrestricted cfdbinfo matches the table name in
+		// every schema on the connection, and a table named after an `information_schema` view
+		// (`sequences`, `tables`, `columns`, …) picks up that view's columns too. A
+		// changeTable() adding a column whose name collides with one of them — `data_type`,
+		// `start_value` — would then see it as already present (issue #3349). No application
+		// table lives in a system schema, so this cannot drop a real column.
+		local.columns = $excludeSystemSchemaRows(columns = local.columns);
+		local.columnList = ValueList(local.columns.COLUMN_NAME);
+		if (!StructKeyExists(request, "$wheelsMigratorColumns")) {
+			request.$wheelsMigratorColumns = {};
+		}
+		request.$wheelsMigratorColumns[local.cacheKey] = local.columnList;
+		return local.columnList;
 	}
 
 	/**
@@ -158,10 +304,11 @@ component extends="wheels.Global"{
 
 	private string function $getColumnDefinition(required string tableName, required string columnName) {
 		local.appKey = $appKey();
+		local.creds = $migratorDataSourceCredentials();
 		local.columns = $dbinfo(
-			datasource = application[local.appKey].dataSourceName,
-			username = application[local.appKey].dataSourceUserName,
-			password = application[local.appKey].dataSourcePassword,
+			datasource = $migratorDataSource(),
+			username = local.creds.username,
+			password = local.creds.password,
 			type = "columns",
 			table = arguments.tableName
 		);

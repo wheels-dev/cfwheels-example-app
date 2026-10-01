@@ -7,7 +7,7 @@ component {
 	 * [section: Controller]
 	 * [category: Configuration Functions]
 	 *
-	 * @with How to handle invalid authenticity token checks. Valid values are `error` (throws a `Wheels.InvalidAuthenticityToken` error), `abort` (aborts the request silently and sends a blank response to the client), and `ignore` (ignores the check and lets the request proceed).
+	 * @with How to handle invalid authenticity token checks. Valid values are `exception` (the default — throws a `Wheels.InvalidAuthenticityToken` error), `abort` (aborts the request silently and sends a blank response to the client), and `ignore` (ignores the check and lets the request proceed).
 	 * @only List of actions that this check should only run on. Leave blank for all.
 	 * @except List of actions that this check should be omitted from running on. Leave blank for no exceptions.
 	 */
@@ -35,19 +35,31 @@ component {
 	 * Internal function.
 	 */
 	public function $runCsrfProtection(string action) {
-		if (StructKeyExists(variables.$class, "csrf")) {
+		// An instance-level override (set by processRequest()) wins over the class settings.
+		// It lives on this controller instance only, so the cached class is never changed (#3843).
+		if (StructKeyExists(variables, "$csrfOverride")) {
+			local.csrf = variables.$csrfOverride;
+		} else if (StructKeyExists(variables.$class, "csrf")) {
 			local.csrf = variables.$class.csrf;
-			if (
-				(!Len(local.csrf.only) && !Len(local.csrf.except))
-				|| (Len(local.csrf.only) && ListFindNoCase(local.csrf.only, arguments.action))
-				|| (Len(local.csrf.except) && !ListFindNoCase(local.csrf.except, arguments.action))
-			) {
-				$storeAuthenticityToken();
-				$flagRequestAsProtected();
-				$setAuthenticityToken();
-				$verifyAuthenticityToken();
-			}
+		} else {
+			return;
 		}
+		if ($appliesToAction(action = arguments.action, only = local.csrf.only, except = local.csrf.except)) {
+			$storeAuthenticityToken();
+			$flagRequestAsProtected();
+			$setAuthenticityToken();
+			$verifyAuthenticityToken(type = local.csrf.type);
+		}
+	}
+
+	/**
+	 * Internal function.
+	 *
+	 * Applies CSRF handling (`exception`, `abort` or `ignore`) to every action of this controller
+	 * instance, without touching the controller's class settings. Used by processRequest().
+	 */
+	public void function $setCsrfOverride(required string type) {
+		variables.$csrfOverride = {type = arguments.type, only = "", except = ""};
 	}
 
 	/**
@@ -60,9 +72,9 @@ component {
 	/**
 	 * Internal function.
 	 */
-	public function $verifyAuthenticityToken() {
+	public function $verifyAuthenticityToken(string type = variables.$class.csrf.type) {
 		if (!$isVerifiedRequest()) {
-			switch (variables.$class.csrf.type) {
+			switch (arguments.type) {
 				case "abort":
 					abort;
 				case "ignore":
@@ -142,7 +154,37 @@ component {
 	 */
 	public boolean function $isCookieAuthenticityTokenValid() {
 		local.authenticityToken = $generateCookieAuthenticityToken();
-		return Len(local.authenticityToken) && local.authenticityToken == params.authenticityToken;
+		// Exact and constant-time: CFML == ignores case and stops at the first difference.
+		return Len(local.authenticityToken)
+			&& IsSimpleValue(params.authenticityToken)
+			&& $secureCompare(local.authenticityToken, params.authenticityToken);
+	}
+
+	/**
+	 * Internal function.
+	 * Ensures a valid CSRF cookie encryption key exists when csrfStore is "cookie".
+	 */
+	public string function $ensureCsrfCookieEncryptionKey() {
+		if (!Len(application.wheels.csrfCookieEncryptionSecretKey)) {
+			// In production, require explicit configuration
+			if (application.wheels.environment == "production") {
+				Throw(
+					type = "Wheels.Security.MissingCsrfKey",
+					message = "csrfCookieEncryptionSecretKey must be configured in production.",
+					extendedInfo = "Set csrfCookieEncryptionSecretKey in your .env file or config/settings.cfm. Auto-generation is not allowed in production because the key is lost on application restart, invalidating all CSRF tokens."
+				);
+			}
+			// In non-production, auto-generate with warning
+			application.wheels.csrfCookieEncryptionSecretKey = GenerateSecretKey("AES");
+			try {
+				writeLog(
+					text = "Wheels WARNING: csrfCookieEncryptionSecretKey was empty — auto-generated a temporary AES key. Set this in config/settings.cfm for persistence across restarts.",
+					type = "warning",
+					file = "wheels_security"
+				);
+			} catch (any e) {}
+		}
+		return application.wheels.csrfCookieEncryptionSecretKey;
 	}
 
 	/**
@@ -153,11 +195,14 @@ component {
 
 		// If cookie doesn't yet exist, create it.
 		if (!Len(local.authenticityToken)) {
-			local.authenticityToken = GenerateSecretKey(application.wheels.csrfCookieEncryptionAlgorithm);
+			local.encryptionKey = $ensureCsrfCookieEncryptionKey();
+			// GenerateSecretKey() expects a bare cipher name ("AES"), not a full
+			// transformation string ("AES/GCM/NoPadding"), so strip mode/padding.
+			local.authenticityToken = GenerateSecretKey(ListFirst(application.wheels.csrfCookieEncryptionAlgorithm, "/"));
 			local.value = SerializeJSON({sessionId = CreateUUID(), authenticityToken = local.authenticityToken});
 			local.value = Encrypt(
 				local.value,
-				application.wheels.csrfCookieEncryptionSecretKey,
+				local.encryptionKey,
 				application.wheels.csrfCookieEncryptionAlgorithm,
 				application.wheels.csrfCookieEncryptionEncoding
 			);
@@ -189,19 +234,16 @@ component {
 		local.cookie = cookie[local.cookieName];
 
 		try {
-			local.cookieAttrs = Decrypt(
-				local.cookie,
-				application.wheels.csrfCookieEncryptionSecretKey,
-				application.wheels.csrfCookieEncryptionAlgorithm,
-				application.wheels.csrfCookieEncryptionEncoding
-			);
+			local.encryptionKey = $ensureCsrfCookieEncryptionKey();
 		} catch (any e) {
-			// When cookie is corrupted, return empty string.
+			// When no usable encryption key is available, treat the cookie as unreadable.
 			return "";
 		}
 
-		// If we don't have cookie attr from above for some strange reason, fail.
-		if (!StructKeyExists(local, "cookieAttrs")) {
+		local.cookieAttrs = $decryptCsrfCookieValue(local.cookie, local.encryptionKey);
+
+		// When cookie is corrupted (or encrypted with an unknown key/algorithm), fail.
+		if (!Len(local.cookieAttrs)) {
 			return "";
 		}
 
@@ -223,6 +265,78 @@ component {
 
 	/**
 	 * Internal function.
+	 * Decrypts an encrypted CSRF cookie value using the configured algorithm, falling
+	 * back to the legacy bare "AES" (ECB) algorithm so cookies issued before the
+	 * engine-aware IV-based default (AES/GCM/NoPadding or AES/CBC/PKCS5Padding, see
+	 * events/init/security.cfm) remain readable across the upgrade. Returns an empty
+	 * string when the value cannot be decrypted with either algorithm.
+	 */
+	public string function $decryptCsrfCookieValue(required string encryptedValue, required string encryptionKey) {
+		// State lives in a struct because local assignments made inside catch blocks
+		// do not persist after the catch on BoxLang.
+		local.state = {decrypted = ""};
+		local.legacyAvailable = application.wheels.csrfCookieEncryptionAlgorithm != "AES";
+
+		try {
+			local.state.decrypted = Decrypt(
+				arguments.encryptedValue,
+				arguments.encryptionKey,
+				application.wheels.csrfCookieEncryptionAlgorithm,
+				application.wheels.csrfCookieEncryptionEncoding
+			);
+		} catch (any e) {
+			// fall through to the legacy attempt below
+		}
+
+		// "Did not throw" is not the same as "decrypted correctly". Decrypting a
+		// bare-AES (ECB) ciphertext under AES/CBC/PKCS5Padding throws only when the
+		// trailing plaintext bytes fail padding validation, and they pass by chance
+		// roughly 1 time in 256 — so Decrypt() returns garbage, the legacy fallback
+		// never runs, and a perfectly good legacy cookie reads as corrupted (issue
+		// #3361). AES/GCM/NoPadding is authenticated and does reliably throw, so this
+		// only ever bit the engines that fall back to CBC.
+		//
+		// Checking the RESULT closes that window. This cookie's plaintext is always the
+		// JSON written by $generateCookieAuthenticityToken(), so anything else means we
+		// decrypted it with the wrong algorithm — which is exactly when the legacy
+		// attempt should still run.
+		if (local.legacyAvailable && !$isCsrfCookiePayload(local.state.decrypted)) {
+			try {
+				local.legacyDecrypted = Decrypt(
+					arguments.encryptedValue,
+					arguments.encryptionKey,
+					"AES",
+					application.wheels.csrfCookieEncryptionEncoding
+				);
+				// Only prefer the legacy result if it actually looks like the payload;
+				// otherwise keep whatever the configured algorithm produced so a
+				// genuinely corrupt cookie is not reported differently than before.
+				if ($isCsrfCookiePayload(local.legacyDecrypted)) {
+					local.state.decrypted = local.legacyDecrypted;
+				}
+			} catch (any legacyDecryptError) {
+				// Undecryptable with either algorithm — treat as a corrupted cookie.
+			}
+		}
+
+		return local.state.decrypted;
+	}
+
+	/**
+	 * Internal function.
+	 * Whether a decrypted string looks like the CSRF cookie payload rather than the
+	 * garbage a wrong-algorithm decrypt can return without throwing.
+	 *
+	 * `$generateCookieAuthenticityToken()` always writes `SerializeJSON({sessionId,
+	 * authenticityToken})`, so JSON-ness is an invariant of this cookie, not an
+	 * assumption about it. The caller re-checks the same thing before deserializing.
+	 */
+	public boolean function $isCsrfCookiePayload(required string value) {
+		return Len(arguments.value) > 0 && IsJSON(arguments.value);
+	}
+
+	/**
+	 * Internal function.
 	 */
 	public struct function $csrfCookieAttributeCollection(required string value) {
 		local.cookieStruct = {
@@ -232,6 +346,9 @@ component {
 			preserveCase = application.wheels.csrfCookiePreserveCase,
 			secure = application.wheels.csrfCookieSecure
 		};
+		if (Len(application.wheels.csrfCookieSameSite)) {
+			local.cookieStruct.sameSite = application.wheels.csrfCookieSameSite;
+		}
 		if (Len(application.wheels.csrfCookieDomain)) {
 			local.cookieStruct.domain = application.wheels.csrfCookieDomain;
 		}

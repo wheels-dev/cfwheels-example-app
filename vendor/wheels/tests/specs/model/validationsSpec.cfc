@@ -1,0 +1,1333 @@
+component extends="wheels.WheelsTest" {
+
+	function run() {
+
+		g = application.wo
+
+		describe("Tests association validations", () => {
+
+			beforeEach(() => {
+				user = g.model("user").new({username = "Mike", password = "password", firstname = "Michael", lastname = "Jackson"})
+				user.$classData().associations.author.nested.allow = true
+				user.$classData().associations.author.nested.autoSave = true
+			})
+
+			it("model valid returns whether associations are not valid", () => {
+				user.author = g.model("author").new();
+				user.author.firstname = ""
+				userValid = user.valid(validateAssociations = true)
+
+				expect(userValid).toBeFalse()
+			})
+
+			it("model valid returns whether nested associations are not valid", () => {
+				user.author = g.model("author").new()
+				user.author.profile = g.model("profile").new()
+				user.author.$classData().associations.profile.nested.allow = true
+				user.author.$classData().associations.profile.nested.autoSave = true
+				user.author.profile.dateOfBirth = ""
+				userValid = user.valid(validateAssociations = true)
+
+				expect(userValid).toBeFalse()
+			})
+
+			it("model valid returns whether associations are not valid with errors on parent and associations", () => {
+				user.author = g.model("author").new();
+				user.author.firstname = ""
+				user.author.profile = g.model("profile").new()
+				user.author.$classData().associations.profile.nested.allow = true
+				user.author.$classData().associations.profile.nested.autoSave = true
+				user.author.profile.dateOfBirth = ""
+				userValid = user.valid(validateAssociations = true)
+
+				expect(userValid).toBeFalse()
+			})
+
+			it("model valid returns whether associations are valid", () => {
+				userValid = user.valid(validateAssociations = true)
+
+				expect(userValid).toBeTrue()
+			})
+		})
+
+		describe("Tests automatic validations", () => {
+
+			it("tests automatic validations should validate primary keys", () => {
+				user = g.model("UserAutoMaticValidations").new(
+					username = 'tonyp1',
+					password = 'tonyp123',
+					firstname = 'Tony',
+					lastname = 'Petruzzi',
+					address = '123 Petruzzi St.',
+					city = 'SomeWhere1',
+					state = 'TX',
+					zipcode = '11111',
+					phone = '1235551212',
+					fax = '4565551212',
+					birthday = '11/01/1975',
+					birthdaymonth = 11,
+					birthdayyear = 1975,
+					isactive = 1
+				)
+
+				/* should be valid since id is not passed in */
+				expect(user.valid()).toBeTrue()
+
+				/* should _not_ be valid since id is not a number */
+				user.id = 'ABC'
+				expect(user.valid()).toBeFalse()
+
+				/* should be valid since id is blank */
+				user.id = ''
+				expect(user.valid()).toBeTrue()
+
+				/* should be valid since id is a number */
+				user.id = 1
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("automatic validations can be turned off for property", () => {
+				user = g.model("UserAutoMaticValidationsOff").new(
+					username = 'tonyp1',
+					password = 'tonyp123',
+					firstname = 'Tony',
+					lastname = 'Petruzzi',
+					address = '123 Petruzzi St.',
+					city = 'SomeWhere1',
+					state = 'TX',
+					zipcode = '11111',
+					phone = '1235551212',
+					fax = '4565551212',
+					birthday = '11/01/1975',
+					birthdaymonth = 11,
+					birthdayyear = 1975,
+					isactive = 1
+				)
+
+				/* should be valid even though id is not a number because we have turned off automatic validations for the id property */
+				user.id = 'ABC'
+				expect(user.valid()).toBeTrue()
+			})
+		})
+
+		describe("Tests conditional validations", () => {
+
+			beforeEach(() => {
+				user = application.wheelsdi.getInstance("wheels.tests._assets.models.Model").$initModelClass(
+					name = "c_o_r_e_Users",
+					path = g.get("modelPath")
+				)
+				user.username = "TheLongestNameInTheWorld"
+				args = {}
+				args.property = "username"
+				args.maximum = "5"
+			})
+
+			it("unless validation using expression valid", () => {
+				args.unless = "1 eq 1"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("unless validation using expression invalid", () => {
+				args.unless = "1 eq 0"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("unless validation using method valid", () => {
+				args.unless = "isnew()"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("unless validation using method invalid", () => {
+				args.unless = "!isnew()"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("unless validation using method mixin and parameters valid", () => {
+				user.stupid_mixin = stupid_mixin
+				args.unless = "this.stupid_mixin(b='1' , a='2') eq 3"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("unless validation using method mixin and parameters invalid", () => {
+				user.stupid_mixin = stupid_mixin
+				args.unless = "this.stupid_mixin(b='1' , a='2') neq 3"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("if validation using expression invalid", () => {
+				args.condition = "1 eq 1"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("if validation using expression valid", () => {
+				args.condition = "1 eq 0"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("if validation using uppercase word-form operator", () => {
+				// Word-form operators arrive raw in $evaluateLogicalExpression
+				// (only symbolic operators are pre-lowercased) — uppercase EQ
+				// used to hit the case-sensitive switch in $resolveOperator on
+				// Adobe CF and throw (##2977).
+				args.condition = "1 EQ 1"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("unless validation using uppercase word-form operator", () => {
+				args.unless = "1 EQ 1"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("if validation using method invalid", () => {
+				args.condition = "isnew()"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("if validation using method valid", () => {
+				args.condition = "!isnew()"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("if validation using method mixin and parameters invalid", () => {
+				user.stupid_mixin = stupid_mixin
+				args.condition = "this.stupid_mixin(b='1' , a='2') eq 3"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("if validation using method mixin and parameters valid", () => {
+				user.stupid_mixin = stupid_mixin
+				args.condition = "this.stupid_mixin(b='1' , a='2') neq 3"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("evaluates a this.method call with a single positional argument (##3238)", () => {
+				expect(user.$evaluateConditionString("this.propertyIsPresent('username')")).toBeTrue()
+				expect(user.$evaluateConditionString("this.propertyIsPresent('nonexistent')")).toBeFalse()
+			})
+
+			it("evaluates a this.method call with multiple positional arguments", () => {
+				user.stupid_mixin = stupid_mixin
+				expect(user.$evaluateConditionString("this.stupid_mixin('1', '2') eq 3")).toBeTrue()
+				expect(user.$evaluateConditionString("this.stupid_mixin('1', '2') neq 3")).toBeFalse()
+			})
+
+			it("if validation runs when a positional-argument method condition is true (##3238)", () => {
+				args.condition = "this.propertyIsPresent('username')"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("if validation is skipped when a positional-argument method condition is false (##3238)", () => {
+				args.condition = "this.propertyIsPresent('nonexistent')"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("both validations if triggered unless not triggered valid", () => {
+				args.condition = "1 eq 1"
+				args.unless = "this.username eq 'TheLongestNameInTheWorld'"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("both validations if triggered unless triggered invalid", () => {
+				args.condition = "1 eq 1"
+				args.unless = "this.username eq ''"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("both validations if not triggered unless not triggered valid", () => {
+				args.condition = "1 eq 0"
+				args.unless = "this.username eq 'TheLongestNameInTheWorld'"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("both validations if not triggered unless triggered valid", () => {
+				args.condition = "1 eq 0"
+				args.unless = "this.username eq ''"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("normalizes compound symbolic operators without mangling them", () => {
+				expect(user.$normalizeConditionOperators("a >= b")).toBe("a gte b")
+				expect(user.$normalizeConditionOperators("a <= b")).toBe("a lte b")
+				expect(user.$normalizeConditionOperators("a>=b")).toBe("a gte b")
+			})
+
+			it("evaluates symbolic comparison operators in condition strings", () => {
+				expect(user.$evaluateConditionString("5 >= 3")).toBeTrue()
+				expect(user.$evaluateConditionString("3 <= 5")).toBeTrue()
+				expect(user.$evaluateConditionString("3 >= 5")).toBeFalse()
+				expect(user.$evaluateConditionString("5 == 5")).toBeTrue()
+				expect(user.$evaluateConditionString("5 != 3")).toBeTrue()
+			})
+
+			it("does not split on operator names inside identifiers", () => {
+				user.frequency = "weekly"
+				expect(user.$evaluateConditionString("this.frequency eq 'weekly'")).toBeTrue()
+				user.adult = true
+				expect(user.$evaluateConditionString("this.adult")).toBeTrue()
+			})
+
+			it("if validation runs when condition property name contains an operator substring", () => {
+				user.frequency = "weekly"
+				args.condition = "this.frequency eq 'weekly'"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("if validation runs when condition uses a symbolic gte comparison", () => {
+				user.score = 20
+				args.condition = "this.score >= 10"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			// Compound boolean conditions (##3634): the evaluator used to hand
+			// `$evaluateLogicalExpression` the whole `a && b` string, which
+			// read tokens[2] as the operator and threw. Splitting on `&&`/`||`
+			// and evaluating each side is the fix; genuinely unsupported
+			// clauses still throw (see the fail-closed test below).
+			it("evaluates a compound && condition (##3634)", () => {
+				user.requestFor = "Engine Part"
+				expect(user.$evaluateConditionString("StructKeyExists(this, 'requestFor') && this.requestFor == 'Engine Part'")).toBeTrue()
+			})
+
+			it("evaluates compound && and || conditions", () => {
+				expect(user.$evaluateConditionString("1 eq 1 && 2 eq 2")).toBeTrue()
+				expect(user.$evaluateConditionString("1 eq 1 && 2 eq 3")).toBeFalse()
+				expect(user.$evaluateConditionString("1 eq 0 || 2 eq 2")).toBeTrue()
+				expect(user.$evaluateConditionString("1 eq 0 || 2 eq 3")).toBeFalse()
+			})
+
+			it("gives && higher precedence than ||", () => {
+				expect(user.$evaluateConditionString("1 eq 0 && 1 eq 1 || 1 eq 1")).toBeTrue()
+				expect(user.$evaluateConditionString("1 eq 1 || 1 eq 0 && 1 eq 0")).toBeTrue()
+				expect(user.$evaluateConditionString("1 eq 0 || 1 eq 1 && 1 eq 0")).toBeFalse()
+			})
+
+			it("does not split on && or || inside a quoted value", () => {
+				user.requestFor = "a && b || c"
+				expect(user.$evaluateConditionString("this.requestFor eq 'a && b || c'")).toBeTrue()
+			})
+
+			it("evaluates a bare StructKeyExists() clause", () => {
+				expect(user.$evaluateConditionString("StructKeyExists(this, 'username')")).toBeTrue()
+				expect(user.$evaluateConditionString("StructKeyExists(this, 'nonexistent')")).toBeFalse()
+			})
+
+			it("combines a whitelisted Len() call with a comparison", () => {
+				expect(user.$evaluateConditionString("Len(this.username) gt 3")).toBeTrue()
+				expect(user.$evaluateConditionString("Len(this.username) lt 3")).toBeFalse()
+			})
+
+			// List membership predicates are a shape legacy conditions really
+			// use (e.g. ListFind('24,32,63', this.countryId)). They match
+			// $isConditionFunctionCall, so without an explicit case the
+			// fail-closed evaluator would newly throw where 4.1.0 silently
+			// skipped — the exact upgrade regression #3634 is about.
+			it("evaluates the whitelisted list predicates", () => {
+				expect(user.$evaluateConditionString("ListFind('a,b,c', 'b')")).toBeTrue()
+				expect(user.$evaluateConditionString("ListFind('a,b,c', 'z')")).toBeFalse()
+				expect(user.$evaluateConditionString("ListFindNoCase('a,b,c', 'B')")).toBeTrue()
+				expect(user.$evaluateConditionString("ListFindNoCase('a,b,c', 'z')")).toBeFalse()
+				expect(user.$evaluateConditionString("ListContains('a,b,c', 'b')")).toBeTrue()
+				expect(user.$evaluateConditionString("ListContains('a,b,c', 'z')")).toBeFalse()
+				expect(user.$evaluateConditionString("ListContainsNoCase('a,b,c', 'B')")).toBeTrue()
+				expect(user.$evaluateConditionString("ListContainsNoCase('a,b,c', 'z')")).toBeFalse()
+			})
+
+			it("evaluates a ListFind condition against a property (##3634)", () => {
+				user.countryId = "63"
+				expect(user.$evaluateConditionString("ListFind('24,32,63,67,117,167,191', this.countryId)")).toBeTrue()
+				user.countryId = "99"
+				expect(user.$evaluateConditionString("ListFind('24,32,63,67,117,167,191', this.countryId)")).toBeFalse()
+			})
+
+			it("runs a validation whose ListFind condition is true (##3634)", () => {
+				user.countryId = "63"
+				args.condition = "ListFind('24,32,63,67,117,167,191', this.countryId)"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("still fails closed for a non-whitelisted function such as ListSort()", () => {
+				args.condition = "ListSort('c,a,b')"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			it("still fails closed for an unrecognised function call", () => {
+				args.condition = "unknownConditionFunc(this.username)"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			it("runs a validation whose compound condition is true (##3634)", () => {
+				user.requestFor = "Engine Part"
+				args.condition = "StructKeyExists(this, 'requestFor') && this.requestFor eq 'Engine Part'"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, false)
+			})
+
+			it("skips a validation whose compound condition is false (##3634)", () => {
+				user.requestFor = "Bolt"
+				args.condition = "StructKeyExists(this, 'requestFor') && this.requestFor eq 'Engine Part'"
+				user.validatesLengthOf(argumentCollection = args)
+				assert_test(user, true)
+			})
+
+			it("still fails closed for a genuinely unsupported compound clause", () => {
+				args.condition = "1 eq 1 && noSuchMethod()"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			// A leading `!` negates the whole clause. Before this was handled,
+			// `$splitConditionOnOperator()` tore a negated call with arguments
+			// into `!StructKeyExists(this,` / `'x')`, and the clause fell through
+			// to the three-token parser — a 500 for the negation of a form the
+			// evaluator otherwise supports.
+			it("negates a whitelisted function call (##3634)", () => {
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'username')")).toBeFalse()
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'nonexistent')")).toBeTrue()
+			})
+
+			it("negates a list predicate (##3634)", () => {
+				expect(user.$evaluateConditionString("!ListFind('a,b,c', 'b')")).toBeFalse()
+				expect(user.$evaluateConditionString("!ListFind('a,b,c', 'z')")).toBeTrue()
+			})
+
+			it("negates a whitelisted call inside a compound clause (##3634)", () => {
+				expect(user.$evaluateConditionString("1 eq 1 && !StructKeyExists(this, 'nonexistent')")).toBeTrue()
+				expect(user.$evaluateConditionString("1 eq 0 || !ListFind('a,b,c', 'z')")).toBeTrue()
+			})
+
+			// `!` binds tighter than `&&`/`||`: a leading `!` negates only the first
+			// operand, not the whole compound. It used to invert the entire
+			// expression, so `!a || b` was evaluated as `!(a || b)`.
+			it("applies a leading ! only to the first operand of an || compound", () => {
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'username') || 1 eq 1")).toBeTrue()
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'nonexistent') || 1 eq 0")).toBeTrue()
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'username') || 1 eq 0")).toBeFalse()
+			})
+
+			it("applies a leading ! only to the first operand of an && compound", () => {
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'nonexistent') && 1 eq 0")).toBeFalse()
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'username') && 1 eq 0")).toBeFalse()
+				expect(user.$evaluateConditionString("!StructKeyExists(this, 'nonexistent') && 1 eq 1")).toBeTrue()
+			})
+
+			it("negates a whole parenthesised group", () => {
+				expect(user.$evaluateConditionString("!(StructKeyExists(this, 'username') || 1 eq 0)")).toBeFalse()
+				expect(user.$evaluateConditionString("!(StructKeyExists(this, 'nonexistent') || 1 eq 0)")).toBeTrue()
+				expect(user.$evaluateConditionString("!(1 eq 1) || (1 eq 1)")).toBeTrue()
+			})
+
+			it("negates a mid-expression operand only", () => {
+				expect(user.$evaluateConditionString("1 eq 1 && !StructKeyExists(this, 'username')")).toBeFalse()
+				expect(user.$evaluateConditionString("StructKeyExists(this, 'username') && !ListFind('a,b,c', 'z')")).toBeTrue()
+			})
+
+			// An argument that is not present on the instance resolves to an
+			// empty value rather than throwing, so `||` short-circuits the way
+			// it reads. Property absence is normal on a model instance, and the
+			// either/or shape below is exactly what the compound support is for.
+			it("short-circuits || when a property argument is absent (##3634)", () => {
+				expect(user.$evaluateConditionString("StructKeyExists(this, 'absentProp') || StructKeyExists(this, 'username')")).toBeTrue()
+				expect(user.$evaluateConditionString("IsNumeric(this.absentProp)")).toBeFalse()
+				expect(user.$evaluateConditionString("!IsNumeric(this.absentProp)")).toBeTrue()
+			})
+
+			it("evaluates a parenthesised group (##3634)", () => {
+				expect(user.$evaluateConditionString("(1 eq 0 || 1 eq 1) && 2 eq 2")).toBeTrue()
+				expect(user.$evaluateConditionString("(1 eq 1 && 1 eq 0) || 3 eq 3")).toBeTrue()
+			})
+
+			it("evaluates symbolic operators inside a compound clause (##3634)", () => {
+				expect(user.$evaluateConditionString("1 == 1 && 2 != 3")).toBeTrue()
+			})
+
+			// A bare call also ends in ")", but it is not a parenthesised group;
+			// unwrapping it would strip the call and change the result.
+			it("does not mistake a bare call for a parenthesised group (##3634)", () => {
+				expect(user.$evaluateConditionString("isnew() || 1 eq 0")).toBeTrue()
+			})
+
+			it("fails closed when a whitelisted function gets the wrong argument count (##3634)", () => {
+				args.condition = "Len('a', 'b')"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			it("throws in development when a condition cannot be evaluated", () => {
+				args.condition = "noSuchMethod()"
+				user.validatesLengthOf(argumentCollection = args)
+				var callValid = () => {
+					user.valid()
+				}
+				expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+			})
+
+			// M1: $evaluateCondition must fail closed when the expression cannot
+			// be evaluated. Returning false here means "skip this validation"
+			// ($validate: if ($evaluateCondition(...))), which is fail-open.
+			it("throws when a condition cannot be evaluated even if showErrorInformation is false", () => {
+				args.condition = "noSuchMethod()"
+				user.validatesLengthOf(argumentCollection = args)
+				var originalShowErrorInformation = application.wheels.showErrorInformation
+				try {
+					application.wheels.showErrorInformation = false
+					var callValid = () => {
+						user.valid()
+					}
+					expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+				} finally {
+					application.wheels.showErrorInformation = originalShowErrorInformation
+				}
+			})
+
+			it("throws when an unless expression cannot be evaluated even if showErrorInformation is false", () => {
+				args.unless = "noSuchMethod()"
+				user.validatesLengthOf(argumentCollection = args)
+				var originalShowErrorInformation = application.wheels.showErrorInformation
+				try {
+					application.wheels.showErrorInformation = false
+					var callValid = () => {
+						user.valid()
+					}
+					expect(callValid).toThrow("Wheels.InvalidValidationCondition")
+				} finally {
+					application.wheels.showErrorInformation = originalShowErrorInformation
+				}
+			})
+		})
+
+		describe("Tests default validations", () => {
+
+			beforeEach(() => {
+				user = g.model("UserBlank").new();
+				user.username = "gavin@wheels.dev"
+				user.password = "disismypassword"
+				user.firstName = "Gavin"
+				user.lastName = "Gavinsson"
+			})
+
+			it("validates presence of invalid", () => {
+				/* missing key */
+				StructDelete(user, "username")
+				/* zero length string */
+				user.password = ""
+				user.valid()
+
+				expect(user.allErrors()).toHaveLength(2)
+			})
+
+			it("validates presence of valid", () => {
+				user.password = "something"
+				user.firstName = "blahblah"
+
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validates presence of valid with default on update", () => {
+				user = g.model("UserBlank").findOne(); // use existing user to test update
+				user.birthtime = ""
+				user.save(transaction = "rollback")
+				arrResult = user.errorsOn("birthtime")
+
+				expect(arrResult).toHaveLength(1)
+				expect(arrResult[1].message).toBe("Birthtime can't be empty")
+			})
+
+			it("validates length of invalid", () => {
+				user.state = "Too many characters!"
+				user.valid()
+				arrResult = user.errorsOn("state")
+
+				expect(arrResult).toHaveLength(1)
+				expect(arrResult[1].message).toBe("State is the wrong length")
+			})
+
+			it("validates length of valid", () => {
+				user.state = "FL"
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validates numericality of invalid", () => {
+				user.birthDayMonth = "This is not a number!"
+				user.valid()
+				arrResult = user.errorsOn("birthDayMonth")
+
+				expect(arrResult).toHaveLength(1)
+				expect(arrResult[1].message).toBe("Birthdaymonth is not a number")
+			})
+
+			it("validates numericality of valid", () => {
+				user.birthDayMonth = "7"
+				
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validates numericality of integer invalid", () => {
+				user.birthDayMonth = "7.825"
+				user.valid()
+				arrResult = user.errorsOn("birthDayMonth")
+
+				expect(arrResult).toHaveLength(1)
+				expect(arrResult[1].message).toBe("Birthdaymonth is not a number")
+			})
+
+			it("validates format of date invalid", () => {
+				user.birthDay = "This is not a date!"
+				user.valid()
+				arrResult = user.errorsOn("birthDay")
+
+				expect(arrResult).toHaveLength(1)
+				expect(arrResult[1].message).toBe("Birth day is invalid")
+			})
+
+			it("validates format of date valid", () => {
+				user.birthDay = "01/01/2000"
+
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validates format of time invalid", () => {
+				user.birthTime = "This is not a time!"
+				user.valid()
+				arrResult = user.errorsOn("birthTime")
+
+				expect(arrResult).toHaveLength(1)
+				expect(arrResult[1].message).toBe("Birthtime is invalid")
+			})
+
+			it("validates format of time valid", () => {
+				user.birthTime = structKeyExists(server, "boxlang") ? "18:15" : "6:15 PM";
+
+				expect(user.valid()).toBeTrue()
+			})
+		})
+
+		describe("Tests low level validations", () => {
+
+			it("validate and validateOnCreate should be called when creating", () => {
+				user = g.model("user").new()
+				user.valid()
+
+				expect(user).toHaveKey("_validateCalled")
+				expect(user._validateCalled).toBeTrue()
+				expect(user).toHaveKey("_validateOnCreateCalled")
+				expect(user._validateOnCreateCalled).toBeTrue()
+			})
+
+			it("validate and validateOnUpdate should be called when updating", () => {
+				user = g.model("user").findOne(where = "username = 'perd'")
+				user.valid()
+
+				expect(user).toHaveKey("_validateCalled")
+				expect(user._validateCalled).toBeTrue()
+				expect(user).toHaveKey("_validateOnUpdateCalled")
+				expect(user._validateOnUpdateCalled).toBeTrue()
+			})
+		})
+
+		describe("Tests skip validations", () => {
+
+			beforeEach(() => {
+				user = g.model("user")
+				args = {username = "myusername", password = "mypassword", firstname = "myfirstname", lastname = "mylastname"}
+			})
+
+			it("can create new record validation execute", () => {
+				transaction {
+					u = user.new(args)
+					e = u.isnew()
+					r = u.save()
+					transaction action="rollback";
+				}
+
+				expect(e).toBeTrue()
+				expect(r).toBeTrue()
+			})
+
+			it("cannot create new record validation execute", () => {
+				transaction {
+					args.username = "1"
+					u = user.new(args)
+					e = u.isnew()
+					r = u.save()
+					transaction action="rollback";
+				}
+
+				expect(e).toBeTrue()
+				expect(r).toBeFalse()
+			})
+
+			it("can create new record validation skipped", () => {
+				transaction {
+					args.username = "1"
+					u = user.new(args)
+					e = u.isnew()
+					r = u.save(validate = "false")
+					transaction action="rollback";
+				}
+
+				expect(e).toBeTrue()
+				expect(r).toBeTrue()
+			})
+
+			it("can update existing record validation execute", () => {
+				transaction {
+					u = user.findOne(where = "lastname = 'Petruzzi'")
+					p = u.properties()
+					r = u.update(args)
+					e = u.isnew()
+					u.update(p)
+					transaction action="rollback";
+				}
+
+				expect(e).toBeFalse()
+				expect(r).toBeTrue()
+			})
+
+			it("cannot update existing record validation execute", () => {
+				transaction {
+					args.password = "1"
+					u = user.findOne(where = "lastname = 'Petruzzi'")
+					p = u.properties()
+					r = u.update(args)
+					e = u.isnew()
+					u.update(p)
+					transaction action="rollback";
+				}
+
+				expect(e).toBeFalse()
+				expect(r).toBeFalse()
+			})
+
+			it("cannot update existing record validation skipped", () => {
+				transaction {
+					args.password = "1"
+					u = user.findOne(where = "lastname = 'Petruzzi'")
+					p = u.properties()
+					u.setProperties(args)
+					e = u.isnew()
+					r = u.save(validate = "false")
+					u.update(p)
+					transaction action="rollback";
+				}
+
+				expect(e).toBeFalse()
+				expect(r).toBeTrue()
+			})
+		})
+
+		describe("Tests standard validations", () => {
+
+			beforeEach(() => {
+				StructDelete(application.wheels.models, "c_o_r_e_users", false)
+				user = g.model("c_o_r_e_users").new()
+			})
+
+			afterEach(() => {
+				StructDelete(variables, "user")
+			})
+
+			/* validatesConfirmationOf */
+			// ConfirmProperty and Property exist. CaseSensitive is OFF. Both match including case - VALID
+			it("validatesConfirmationOf_valid", () => {
+				user.password = "hamsterjelly"
+				user.passwordConfirmation = "hamsterjelly"
+				user.validatesConfirmationOf(properties = "password")
+				expect(user.valid()).toBeTrue()
+				expect(user.allErrors()).toHaveLength(0)
+			})
+
+			// ConfirmProperty and Property exist. CaseSensitive is OFF. Both match except case - VALID
+			it("validatesConfirmationOf_valid_allowcase", () => {
+				user.password = "hamsterjelly"
+				user.passwordConfirmation = "hamsterJelly"
+				user.validatesConfirmationOf(properties = "password")
+				expect(user.valid()).toBeTrue()
+				expect(user.allErrors()).toHaveLength(0)
+			})
+
+			// ConfirmProperty and Property exist. CaseSensitive is OFF. They don't match - INVALID
+			it("validatesConfirmationOf_invalid", () => {
+				user.password = "hamsterjelly"
+				user.passwordConfirmation = "hamsterjellysucks"
+				user.validatesConfirmationOf(properties = "password")
+				expect(user.valid()).toBeFalse()
+				expect(user.allErrors()).toHaveLength(1)
+			})
+
+			// ConfirmProperty doesn't exist. No other checks are made. - INVALID (check errors array length is 1)
+			it("validatesConfirmationOf_missing_property_confirmation_invalid", () => {
+				user.password = "hamsterjelly"
+				user.validatesConfirmationOf(properties = "password")
+				expect(user.valid()).toBeFalse()
+				expect(user.allErrors()).toHaveLength(1)
+			})
+
+			// ConfirmProperty and Property exist. CaseSensitive is ON. Both match including case - VALID
+			it("validatesConfirmationOf_valid_case", () => {
+				user.password = "HamsterJelly"
+				user.passwordConfirmation = "HamsterJelly"
+				user.validatesConfirmationOf(properties = "password", caseSensitive = true)
+				expect(user.valid()).toBeTrue()
+				expect(user.allErrors()).toHaveLength(0)
+			})
+
+			// ConfirmProperty and Property exist. CaseSensitive is ON. Both match except case - INVALID
+			it("validatesConfirmationOf_invalid_case", () => {
+				user.password = "HamsterJelly"
+				user.passwordConfirmation = "hamsterjelly"
+				user.validatesConfirmationOf(properties = "password", caseSensitive = true)
+				expect(user.valid()).toBeFalse()
+				expect(user.allErrors()).toHaveLength(1)
+			})
+
+			// ConfirmProperty and Property exist. CaseSensitive is ON.  They don't match - INVALID
+			it("validatesConfirmationOf_invalid_no_matchcase", () => {
+				user.password = "HamsterJelly"
+				user.passwordConfirmation = "duckjelly"
+				user.validatesConfirmationOf(properties = "password", caseSensitive = true)
+				expect(user.valid()).toBeFalse()
+				expect(user.allErrors()).toHaveLength(1)
+			})
+
+			// check content of message when ConfirmProperty doesn't exist
+			// nb, this validation method only has a single error message returned and
+			// can be overridden by the developer
+			it("validatesConfirmationOf_missing_property_confirmation_msg", () => {
+				user.password = "hamsterjelly"
+				user.validatesConfirmationOf(properties = "password")
+				expect(user.valid()).toBeFalse()
+				expect(user.allErrors()[1]["property"]).toBe("passwordConfirmation")
+				expect(user.allErrors()[1]["message"]).toBe("Password should match confirmation")
+			})
+
+			/* validatesExclusionOf */
+			it("validatesExclusionOf_valid", () => {
+				user.firstname = "tony"
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesExclusionOf_invalid", () => {
+				user.firstname = "tony"
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris, tony")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesExclusionOf_missing_property_invalid", () => {
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris, tony")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesExclusionOf_missing_property_valid", () => {
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris, tony", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesExclusionOf_allowblank_valid", () => {
+				user.firstname = ""
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesExclusionOf_allowblank_invalid", () => {
+				user.firstname = ""
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris", allowblank = "false")
+				expect(user.valid()).toBeFalse()
+			})
+
+			/* validatesFormatOf */
+			it("validatesFormatOf_valid", () => {
+				user.phone = "954-555-1212"
+				user.validatesFormatOf(properties = "phone", regex = "(\d{3,3}-){2,2}\d{4,4}")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesFormatOf_invalid", () => {
+				user.phone = "(954) 555-1212"
+				user.validatesFormatOf(properties = "phone", regex = "(\d{3,3}-){2,2}\d{4,4}")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesFormatOf_missing_property_invalid", () => {
+				user.validatesFormatOf(properties = "phone", regex = "(\d{3,3}-){2,2}\d{4,4}")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesFormatOf_missing_property_valid", () => {
+				user.validatesFormatOf(properties = "phone", regex = "(\d{3,3}-){2,2}\d{4,4}", allowBlank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesFormatOf_allowblank_valid", () => {
+				user.phone = ""
+				user.validatesFormatOf(properties = "phone", regex = "(\d{3,3}-){2,2}\d{4,4}", allowBlank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesFormatOf_allowblank_invalid", () => {
+				user.phone = ""
+				user.validatesFormatOf(properties = "phone", regex = "(\d{3,3}-){2,2}\d{4,4}", allowBlank = "false")
+				expect(user.valid()).toBeFalse()
+			})
+
+			/* validatesInclusionOf */
+			it("validatesInclusionOf_invalid", () => {
+				user.firstname = "tony"
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesInclusionOf_valid", () => {
+				user.firstname = "tony"
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris, tony")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesInclusionOf_missing_property_invalid", () => {
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris, tony")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesInclusionOf_missing_property_valid", () => {
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris, tony", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesInclusionOf_allowblank_valid", () => {
+				user.firstname = ""
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesInclusionOf_allowblank_invalid", () => {
+				user.firstname = ""
+				user.validatesExclusionOf(properties = "firstname", list = "per, raul, chris", allowblank = "false")
+				expect(user.valid()).toBeFalse()
+			})
+
+			/* validatesLengthOf */
+			it("validatesLengthOf_maximum_minimum_invalid", () => {
+				user.firstname = "thi"
+				user.validatesLengthOf(properties = "firstname", minimum = "5", maximum = "20")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesLengthOf_maximum_valid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", maximum = "20")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesLengthOf_maximum_invalid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", maximum = "15")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesLengthOf_missing_property_invalid", () => {
+				user.validatesLengthOf(properties = "firstname", maximum = "15")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesLengthOf_missing_property_valid", () => {
+				user.validatesLengthOf(properties = "firstname", maximum = "15", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesLengthOf_minimum_valid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", minimum = "15")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesLengthOf_minimum_invalid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", minimum = "20")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesLengthOf_within_valid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", within = "15,20")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesLengthOf_within_invalid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", within = "10,15")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesLengthOf_exactly_valid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", exactly = "16")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesLengthOf_exactly_invalid", () => {
+				user.firstname = "thisisatestagain"
+				user.validatesLengthOf(properties = "firstname", exactly = "20")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesLengthOf_allowblank_valid", () => {
+				user.firstname = ""
+				user.validatesLengthOf(properties = "firstname", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesLengthOf_allowblank_invalid", () => {
+				user.firstname = ""
+				user.validatesLengthOf(properties = "firstname", allowblank = "false")
+				expect(user.valid()).toBeFalse()
+			})
+
+			/* validatesNumericalityOf */
+			it("validatesNumericalityOf_valid", () => {
+				user.birthdaymonth = "10"
+				user.validatesNumericalityOf(properties = "birthdaymonth")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_invalid", () => {
+				user.birthdaymonth = "1,000.00"
+				user.validatesNumericalityOf(properties = "birthdaymonth")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_missing_property_invalid", () => {
+				user.validatesNumericalityOf(properties = "birthdaymonth", onlyInteger = "true")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_missing_property_valid", () => {
+				user.validatesNumericalityOf(properties = "birthdaymonth", onlyInteger = "true", allowblank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_onlyInteger_valid", () => {
+				user.birthdaymonth = "1000"
+				user.validatesNumericalityOf(properties = "birthdaymonth", onlyInteger = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_onlyInteger_invalid", () => {
+				user.birthdaymonth = "1000.25"
+				user.validatesNumericalityOf(properties = "birthdaymonth", onlyInteger = "true")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_allowBlank_valid", () => {
+				user.birthdaymonth = ""
+				user.validatesNumericalityOf(properties = "birthdaymonth", allowBlank = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_allowBlank_invalid", () => {
+				user.birthdaymonth = ""
+				user.validatesNumericalityOf(properties = "birthdaymonth", allowBlank = "false")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_greaterThan_valid", () => {
+				user.birthdaymonth = "11"
+				user.validatesNumericalityOf(properties = "birthdaymonth", greaterThan = "10")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_greaterThan_invalid", () => {
+				user.birthdaymonth = "10"
+				user.validatesNumericalityOf(properties = "birthdaymonth", greaterThan = "10")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_greaterThanOrEqualTo_valid", () => {
+				user.birthdaymonth = "10"
+				user.validatesNumericalityOf(properties = "birthdaymonth", greaterThanOrEqualTo = "10")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_greaterThanOrEqualTo_invalid", () => {
+				user.birthdaymonth = "9"
+				user.validatesNumericalityOf(properties = "birthdaymonth", greaterThanOrEqualTo = "10")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_greaterThanOrEqualTo_invalid_float", () => {
+				user.birthdaymonth = "11.25"
+				user.validatesNumericalityOf(properties = "birthdaymonth", greaterThanOrEqualTo = "11.30")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_equalTo_valid", () => {
+				user.birthdaymonth = "10"
+				user.validatesNumericalityOf(properties = "birthdaymonth", equalTo = "10")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_equalTo_invalid", () => {
+				user.birthdaymonth = "9"
+				user.validatesNumericalityOf(properties = "birthdaymonth", equalTo = "10")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_lessThan_valid", () => {
+				user.birthdaymonth = "9"
+				user.validatesNumericalityOf(properties = "birthdaymonth", lessThan = "10")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_lessThan_invalid", () => {
+				user.birthdaymonth = "10"
+				user.validatesNumericalityOf(properties = "birthdaymonth", lessThan = "10")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_lessThanOrEqualTo_valid", () => {
+				user.birthdaymonth = "10"
+				user.validatesNumericalityOf(properties = "birthdaymonth", lessThanOrEqualTo = "10")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_lessThanOrEqualTo_invalid", () => {
+				user.birthdaymonth = "11"
+				user.validatesNumericalityOf(properties = "birthdaymonth", lessThanOrEqualTo = "10")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_odd_valid", () => {
+				user.birthdaymonth = "13"
+				user.validatesNumericalityOf(properties = "birthdaymonth", odd = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_odd_invalid", () => {
+				user.birthdaymonth = "14"
+				user.validatesNumericalityOf(properties = "birthdaymonth", odd = "true")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesNumericalityOf_even_valid", () => {
+				user.birthdaymonth = "14"
+				user.validatesNumericalityOf(properties = "birthdaymonth", even = "true")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesNumericalityOf_even_invalid", () => {
+				user.birthdaymonth = "13"
+				user.validatesNumericalityOf(properties = "birthdaymonth", even = "true")
+				expect(user.valid()).toBeFalse()
+			})
+
+			/* validatesPresenceOf */
+			it("validatesPresenceOf_valid", () => {
+				user.firstname = "tony"
+				user.validatesPresenceOf(properties = "firstname")
+				expect(user.valid()).toBeTrue()
+			})
+
+			it("validatesPresenceOf_invalid", () => {
+				user.validatesPresenceOf(properties = "firstname")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesPresenceOf_invalid_when_blank", () => {
+				user.firstname = ""
+				user.validatesPresenceOf(properties = "firstname")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesPresenceOf_does_not_trim_properties", () => {
+				user.firstname = " "
+				user.validatesPresenceOf(properties = "firstname")
+				expect(user.valid()).toBeTrue()
+			})
+
+			/* validatesUniquenessOf */
+			it("validatesUniquenessOf_valid", () => {
+				user.firstname = "Tony"
+				user.validatesUniquenessOf(properties = "firstname")
+				if (!IsBoolean(user.tableName()) OR user.tableName()) {
+					expect(user.valid()).toBeFalse()
+				} else {
+					expect(user.valid()).toBeTrue()
+				}
+			})
+
+			it("validatesUniquenessOf_valids_when_updating_existing_record", () => {
+				user = g.model("user").findOne(where = "firstName = 'Tony'")
+				user.validatesUniquenessOf(properties = "firstName")
+				expect(user.valid()).toBeTrue()
+				// Special case for testing when we already have duplicates in the database:
+				// https://github.com/wheels-dev/wheels/issues/480
+				transaction action="begin" {
+					user.create(firstName = "Tony", username = "xxxx", password = "xxxx", lastname = "xxxx", validate = false)
+					firstUser = g.model("user").findOne(where = "firstName = 'Tony'", order = "id ASC")
+					lastUser = g.model("user").findOne(where = "firstName = 'Tony'", order = "id DESC")
+					expect(firstUser.valid()).toBeFalse()
+					expect(lastUser.valid()).toBeFalse()
+					transaction action="rollback";
+				}
+			})
+
+			it("validatesUniquenessOf_excludes_softdeletes_by_default", () => {
+				transaction action="begin" {
+					org_post = g.model('post').findOne()
+					properties = org_post.properties()
+					new_post = g.model('post').new(properties)
+					org_post.delete()
+					valid = new_post.valid()
+					expect(valid).toBeTrue()
+					transaction action="rollback";
+				}
+			})
+
+			it("validatesUniquenessOf_with_blank_integer_values", () => {
+				combiKey = g.model("combiKey").new(id1 = "", id2 = "")
+				expect(combiKey.valid()).toBeFalse()
+			})
+
+			// Issue #3350: a property named in `scope=` that was never assigned is ABSENT
+			// from the object, not present-and-empty — `$setDefaultValues()` only seeds
+			// properties with an explicit `property()` mapping. The scope dereference had no
+			// existence guard, so building the uniqueness WHERE clause threw
+			// "Component [X] has no accessible Member with name [Y]" out of a method whose
+			// entire job is to return a validation result. The validated property itself
+			// cannot hit this — `$shouldInvokeValidation()` skips the validation when it is
+			// absent — so only `scope=` was exposed.
+			it("validatesUniquenessOf_with_absent_scope_property", () => {
+				combiKey = g.model("combiKey").new(id1 = 1, id2 = 1)
+				StructDelete(combiKey, "id2")
+
+				// must return a validation result rather than throwing
+				expect(combiKey.valid()).toBeFalse()
+			})
+
+			// An absent scope property must behave exactly like a present-but-empty one —
+			// the split between the two was the defect, not the value itself.
+			it("validatesUniquenessOf_absent_scope_matches_blank_scope", () => {
+				absent = g.model("combiKey").new(id1 = 1, id2 = "")
+				StructDelete(absent, "id2")
+				blank = g.model("combiKey").new(id1 = 1, id2 = "")
+
+				expect(absent.$buildWhereClausePart("id2")).toBe(blank.$buildWhereClausePart("id2"))
+			})
+
+			it("validatesUniquenessOf_with_blank_property_value", () => {
+				user.blank = ""
+				user.validatesUniquenessOf(properties = "blank")
+				expect(user.valid()).toBeFalse()
+			})
+
+			it("validatesUniquenessOf_with_blank_property_value_with_allowBlank", () => {
+				user.blank = ""
+				user.validatesUniquenessOf(properties = "blank", allowBlank = true)
+				expect(user.valid()).toBeTrue()
+			})
+
+			/* validate */
+			it("validate_registering_methods", () => {
+				user.firstname = "tony"
+				user.validate(methods = "fakemethod")
+				user.validate(methods = "fakemethod2", when = "onCreate")
+				v = user.$classData().validations
+				onsave = v["onsave"]
+				oncreate = v["oncreate"]
+				expect(onsave).toHaveLength(1)
+				expect(onsave[1].method).toBe("fakemethod")
+				expect(oncreate).toHaveLength(1)
+				expect(oncreate[1].method).toBe("fakemethod2")
+			})			
+		})
+
+		describe("Tests validation error messages", () => {
+
+			beforeEach(() => {
+				StructDelete(application.wheels.models, "c_o_r_e_users", false)
+				user = g.model("c_o_r_e_users").new()
+				user.username = "TheLongestNameInTheWorld"
+				args = {}
+				args.property = "username"
+				args.minimum = "5"
+				args.maximum = "20"
+				args.message = "Please shorten your [property] please. [maximum] characters is the maximum length allowed."
+			})
+
+			it("replaces bracketed argument markers", () => {
+				user.validatesLengthOf(argumentCollection = args)
+				user.valid()
+				asset_test(user, "Please shorten your username please. 20 characters is the maximum length allowed.")
+			})
+
+			it("capitalizes bracketed property argument marker at beginning", () => {
+				args.message = "[property] must be between [minimum] and [maximum] characters."
+				user.validatesLengthOf(argumentCollection = args)
+				user.valid()
+				asset_test(user, "Username must be between 5 and 20 characters.")
+			})
+
+			it("escapes bracketed argument markers", () => {
+				args.message = "[property] must be between [[minimum]] and [maximum] characters."
+				user.validatesLengthOf(argumentCollection = args)
+				user.valid()
+				asset_test(user, "Username must be between [minimum] and 20 characters.")
+			})
+		})
+	}
+
+	function assert_test(required any obj, required boolean expected) {
+		e = arguments.obj.valid()
+
+		expect(e).toBe(arguments.expected)
+	}
+
+	function stupid_mixin(required numeric a, required numeric b) {
+		return a + b
+	}
+
+	function asset_test(required any obj, required string expected) {
+		e = arguments.obj.errorsOn("username")
+		e = e[1].message
+		r = arguments.expected
+
+		expect(e).toBe(r)
+	}
+}

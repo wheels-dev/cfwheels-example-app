@@ -24,6 +24,17 @@ component {
 	 * [category: Routing]
 	 */
 	public struct function end() {
+		// Guard against unbalanced end() calls: once the scope stack is empty there
+		// is no open block left to close, so fail with a clear DSL error instead of
+		// a raw array-index engine error.
+		if (ArrayIsEmpty(variables.scopeStack)) {
+			Throw(
+				type = "Wheels.InvalidRoute",
+				message = "Unbalanced `end()` call in the route configuration.",
+				detail = "Each `end()` closes one block opened by `mapper()`, `scope()`, `namespace()`, `package()`, `group()`, `resource()`, or `resources()`. This `end()` has no matching open block, so remove the extra `end()`."
+			);
+		}
+
 		local.formatPattern = "";
 
 		if (StructKeyExists(variables.scopeStack[1], "mapFormat") && variables.scopeStack[1].mapFormat) {
@@ -50,21 +61,7 @@ component {
 			}
 
 			member();
-
-			if (ListFind(variables.scopeStack[1].actions, "edit")) {
-				get(pattern = "edit#local.formatPattern#", action = "edit", name = "edit");
-			}
-			if (ListFind(variables.scopeStack[1].actions, "show")) {
-				get(pattern = local.formatPattern, action = "show");
-			}
-			if (ListFind(variables.scopeStack[1].actions, "update")) {
-				patch(pattern = local.formatPattern, action = "update");
-				put(pattern = local.formatPattern, action = "update");
-			}
-			if (ListFind(variables.scopeStack[1].actions, "delete")) {
-				delete(pattern = local.formatPattern, action = "delete");
-			}
-
+			$addMemberRoutes(local.formatPattern);
 			end();
 			// If last action was a singular resource, set up its RESTful routes.
 		} else if (variables.scopeStack[1].$call == "resource") {
@@ -81,21 +78,7 @@ component {
 			}
 
 			member();
-
-			if (ListFind(variables.scopeStack[1].actions, "edit")) {
-				get(pattern = "edit#local.formatPattern#", action = "edit", name = "edit");
-			}
-			if (ListFind(variables.scopeStack[1].actions, "show")) {
-				get(pattern = local.formatPattern, action = "show");
-			}
-			if (ListFind(variables.scopeStack[1].actions, "update")) {
-				patch(pattern = local.formatPattern, action = "update");
-				put(pattern = local.formatPattern, action = "update");
-			}
-			if (ListFind(variables.scopeStack[1].actions, "delete")) {
-				delete(pattern = local.formatPattern, action = "delete");
-			}
-
+			$addMemberRoutes(local.formatPattern);
 			end();
 		}
 
@@ -103,5 +86,25 @@ component {
 		ArrayDeleteAt(variables.scopeStack, 1);
 
 		return this;
+	}
+
+	/**
+	 * Internal function.
+	 * Generate the edit/show/update/delete member routes shared by both singular and plural resources.
+	 */
+	public void function $addMemberRoutes(required string formatPattern) {
+		if (ListFind(variables.scopeStack[1].actions, "edit")) {
+			get(pattern = "edit#arguments.formatPattern#", action = "edit", name = "edit");
+		}
+		if (ListFind(variables.scopeStack[1].actions, "show")) {
+			get(pattern = arguments.formatPattern, action = "show");
+		}
+		if (ListFind(variables.scopeStack[1].actions, "update")) {
+			patch(pattern = arguments.formatPattern, action = "update");
+			put(pattern = arguments.formatPattern, action = "update");
+		}
+		if (ListFind(variables.scopeStack[1].actions, "delete")) {
+			delete(pattern = arguments.formatPattern, action = "delete");
+		}
 	}
 }

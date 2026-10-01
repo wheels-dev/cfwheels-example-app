@@ -6,7 +6,9 @@ component output="false" displayName="MCP Server" {
 	public any function init() {
 		variables.serverInfo = {
 			"name": "wheels-mcp-server",
-			"version": "1.0.0"
+			"version": "1.0.0",
+			"deprecated": true,
+			"deprecationNotice": "The in-dev-server MCP endpoint at /wheels/mcp is deprecated as of Wheels 4.0. Use the LuCLI stdio MCP server instead: configure your AI IDE with {command: 'wheels', args: ['mcp', 'wheels']} and see https://guides.wheels.dev/v4-0-0/command-line-tools/mcp-integration for details."
 		};
 
 		variables.capabilities = {
@@ -16,6 +18,40 @@ component output="false" displayName="MCP Server" {
 		};
 
 		return this;
+	}
+
+	/** Rejects shell metacharacters (; | & $ ` ( ) { } < > ' " \ ~ ! * ? [ ] ^ % newlines) */
+	private boolean function $isSafeArgument(required string value) {
+		return reFind("[;\|&\$`\(\)\{\}<>\n\r'""\~\\!\*\?\[\]\^%]", arguments.value) == 0;
+	}
+
+	/** Allowlist: letters + digits, must start with a letter */
+	private boolean function $isValidType(required string value) {
+		return reFind("^[a-zA-Z][a-zA-Z0-9]*$", arguments.value) > 0;
+	}
+
+	/** Allowlist: letters, digits, underscores, dots; must start with letter or underscore */
+	private boolean function $isValidName(required string value) {
+		return reFind("^[a-zA-Z_][a-zA-Z0-9_\.]*$", arguments.value) > 0;
+	}
+
+	/** Allowlist: letters, digits, underscores, dots, hyphens, slashes */
+	private boolean function $isValidTarget(required string value) {
+		return reFind("^[a-zA-Z0-9_\.\-\/]*$", arguments.value) > 0;
+	}
+
+	/** Returns a validated local port from cgi.server_port (never trusts client headers) */
+	private numeric function $getLocalPort() {
+		local.port = cgi.server_port;
+		if (isNumeric(local.port) && local.port > 0 && local.port <= 65535) {
+			return int(local.port);
+		}
+		return StructKeyExists(server, "lucee") ? 60000 : 8500;
+	}
+
+	/** Validates that a URL targets localhost only */
+	private boolean function $isLocalUrl(required string url) {
+		return reFindNoCase("^https?://localhost:\d+", arguments.url) > 0;
 	}
 
 	public any function handleRequest(required any request, required string sessionId) {
@@ -254,8 +290,8 @@ component output="false" displayName="MCP Server" {
 			},
 			{
 				"uri": "wheels://guides/all",
-				"name": "Wheels Guides",
-				"description": "All Wheels framework guides and tutorials",
+				"name": "Wheels Guides Index",
+				"description": "Section index for Wheels guides with links to guides.wheels.dev (full guide content is not served in-app as of v4.0)",
 				"mimeType": "application/json"
 			},
 			// .ai folder documentation
@@ -330,91 +366,11 @@ component output="false" displayName="MCP Server" {
 		}
 
 		local.uri = arguments.params.uri;
-		local.content = "";
 
 		try {
-			switch (local.uri) {
-				// Documentation chunks
-				case "wheels://docs/manifest":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=manifest");
-					break;
-				case "wheels://docs/models":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=models");
-					break;
-				case "wheels://docs/controllers":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=controllers");
-					break;
-				case "wheels://docs/views":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=views");
-					break;
-				case "wheels://docs/migrations":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=migrations");
-					break;
-				case "wheels://docs/routing":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=routing");
-					break;
-				case "wheels://docs/testing":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=testing");
-					break;
-				case "wheels://docs/cli":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=cli");
-					break;
-				case "wheels://docs/patterns":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=chunk&id=patterns");
-					break;
-				// Project analysis
-				case "wheels://project/context":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=project");
-					break;
-				case "wheels://project/routes":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=routes");
-					break;
-				case "wheels://project/migrations":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=migrations");
-					break;
-				case "wheels://project/plugins":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=plugins");
-					break;
-				case "wheels://project/info":
-					local.content = fetchFromAIEndpoint("/wheels/ai?mode=info");
-					break;
-				// Full documentation
-				case "wheels://api/full":
-					local.content = fetchFromAIEndpoint("/wheels/api?format=json");
-					break;
-				case "wheels://guides/all":
-					local.content = fetchFromAIEndpoint("/wheels/guides?format=json");
-					break;
-				// .ai folder documentation
-				case "wheels://.ai/overview":
-					local.content = readAIDocumentation("README.md");
-					break;
-				case "wheels://.ai/cfml/syntax":
-					local.content = aggregateAIDocumentation(".ai/cfml/syntax/");
-					break;
-				case "wheels://.ai/cfml/best-practices":
-					local.content = aggregateAIDocumentation(".ai/cfml/best-practices/");
-					break;
-				case "wheels://.ai/wheels/models":
-					local.content = aggregateAIDocumentation(".ai/wheels/database/");
-					break;
-				case "wheels://.ai/wheels/controllers":
-					local.content = aggregateAIDocumentation(".ai/wheels/controllers/");
-					break;
-				case "wheels://.ai/wheels/views":
-					local.content = aggregateAIDocumentation(".ai/wheels/views/");
-					break;
-				case "wheels://.ai/wheels/patterns":
-					local.content = aggregateAIDocumentation(".ai/wheels/patterns/");
-					break;
-				case "wheels://.ai/wheels/snippets":
-					local.content = aggregateAIDocumentation(".ai/wheels/snippets/");
-					break;
-				case "wheels://.ai/wheels/security":
-					local.content = aggregateAIDocumentation(".ai/wheels/security/");
-					break;
-				default:
-					return createErrorResponse({"id": arguments.id}, -32602, "Invalid params", "Unknown resource URI: #local.uri#");
+			local.content = $fetchResourceContent(local.uri);
+			if (isNull(local.content)) {
+				return createErrorResponse({"id": arguments.id}, -32602, "Invalid params", "Unknown resource URI: #local.uri#");
 			}
 
 			// Determine correct mime type based on URI
@@ -436,6 +392,67 @@ component output="false" displayName="MCP Server" {
 		} catch (any e) {
 			return createErrorResponse({"id": arguments.id}, -32603, "Internal error", "Failed to read resource: #e.message#");
 		}
+	}
+
+	/**
+	 * Resolve a `wheels://` resource URI to its content. Returns javaCast("null", "")
+	 * for an unknown URI so the caller can emit the -32602 "Unknown resource URI"
+	 * error without tripping the -32603 internal-error catch above.
+	 */
+	private any function $fetchResourceContent(required string uri) {
+		local.handlers = $resourceHandlers();
+		if (!structKeyExists(local.handlers, arguments.uri)) {
+			return javaCast("null", "");
+		}
+
+		local.handler = local.handlers[arguments.uri];
+		if (local.handler.kind == "fetch") {
+			return fetchFromAIEndpoint(local.handler.target);
+		}
+		if (local.handler.kind == "read") {
+			return readAIDocumentation(local.handler.target);
+		}
+		return aggregateAIDocumentation(local.handler.target);
+	}
+
+	/**
+	 * URI → {kind, target} dispatch table for resources/read. Data, not code:
+	 * kind selects the fetch helper (fetch = fetchFromAIEndpoint, read =
+	 * readAIDocumentation, aggregate = aggregateAIDocumentation) so the read
+	 * handler stays decision-light.
+	 */
+	private struct function $resourceHandlers() {
+		return {
+			// Documentation chunks
+			"wheels://docs/manifest": {kind: "fetch", target: "/wheels/ai?mode=manifest"},
+			"wheels://docs/models": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=models"},
+			"wheels://docs/controllers": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=controllers"},
+			"wheels://docs/views": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=views"},
+			"wheels://docs/migrations": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=migrations"},
+			"wheels://docs/routing": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=routing"},
+			"wheels://docs/testing": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=testing"},
+			"wheels://docs/cli": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=cli"},
+			"wheels://docs/patterns": {kind: "fetch", target: "/wheels/ai?mode=chunk&id=patterns"},
+			// Project analysis
+			"wheels://project/context": {kind: "fetch", target: "/wheels/ai?mode=project"},
+			"wheels://project/routes": {kind: "fetch", target: "/wheels/ai?mode=routes"},
+			"wheels://project/migrations": {kind: "fetch", target: "/wheels/ai?mode=migrations"},
+			"wheels://project/plugins": {kind: "fetch", target: "/wheels/ai?mode=plugins"},
+			"wheels://project/info": {kind: "fetch", target: "/wheels/ai?mode=info"},
+			// Full documentation
+			"wheels://api/full": {kind: "fetch", target: "/wheels/api?format=json"},
+			"wheels://guides/all": {kind: "fetch", target: "/wheels/guides?format=json"},
+			// .ai folder documentation
+			"wheels://.ai/overview": {kind: "read", target: "README.md"},
+			"wheels://.ai/cfml/syntax": {kind: "aggregate", target: ".ai/cfml/syntax/"},
+			"wheels://.ai/cfml/best-practices": {kind: "aggregate", target: ".ai/cfml/best-practices/"},
+			"wheels://.ai/wheels/models": {kind: "aggregate", target: ".ai/wheels/database/"},
+			"wheels://.ai/wheels/controllers": {kind: "aggregate", target: ".ai/wheels/controllers/"},
+			"wheels://.ai/wheels/views": {kind: "aggregate", target: ".ai/wheels/views/"},
+			"wheels://.ai/wheels/patterns": {kind: "aggregate", target: ".ai/wheels/patterns/"},
+			"wheels://.ai/wheels/snippets": {kind: "aggregate", target: ".ai/wheels/snippets/"},
+			"wheels://.ai/wheels/security": {kind: "aggregate", target: ".ai/wheels/security/"}
+		};
 	}
 
 	private any function handleToolsList(required struct params, required string sessionId, required any id) {
@@ -588,9 +605,31 @@ component output="false" displayName="MCP Server" {
 			}
 		];
 
+		// The deprecated HTTP surface is read-only — advertise only the read-only
+		// tools so the listing matches what tools/call will actually permit.
+		local.readOnlyTools = $httpReadOnlyTools();
+		local.filteredTools = [];
+		for (local.tool in local.tools) {
+			if (ListFindNoCase(local.readOnlyTools, local.tool.name)) {
+				ArrayAppend(local.filteredTools, local.tool);
+			}
+		}
+
 		return createSuccessResponse(arguments.id, {
-			"tools": local.tools
+			"tools": local.filteredTools
 		});
+	}
+
+	/**
+	 * The read-only tools that may be called over the DEPRECATED HTTP MCP surface
+	 * (this component backs only /wheels/mcp; the canonical MCP is the stdio
+	 * server, `wheels mcp wheels`). Everything else — generate, migrate, test,
+	 * validate, server, reload, develop — writes files, changes state, or runs
+	 * commands, so it is refused here and available only over stdio. Fail-closed:
+	 * a tool not named here is treated as mutating.
+	 */
+	private string function $httpReadOnlyTools() {
+		return "analyze";
 	}
 
 	private any function handleToolsCall(required struct params, required string sessionId, required any id) {
@@ -604,6 +643,18 @@ component output="false" displayName="MCP Server" {
 
 		local.toolName = arguments.params.name;
 		local.args = structKeyExists(arguments.params, "arguments") ? arguments.params.arguments : {};
+
+		// The HTTP MCP surface is deprecated and read-only. Refuse any tool that is
+		// not on the read-only allow-list before it can execute, so an unauthenticated
+		// request to this endpoint cannot write files, migrate, or run commands.
+		if (!ListFindNoCase($httpReadOnlyTools(), local.toolName)) {
+			return createErrorResponse(
+				{"id": arguments.id},
+				-32002,
+				"Tool '#local.toolName#' is not available over the deprecated HTTP MCP endpoint",
+				"Use the stdio MCP server instead: wheels mcp wheels"
+			);
+		}
 
 		try {
 			local.result = "";
@@ -710,7 +761,7 @@ component output="false" displayName="MCP Server" {
 				"arguments": [
 					{
 						"name": "action",
-						"description": "Migration action (latest, up, down, reset, info)",
+						"description": "Migration action (latest, up, down, reset, info, diff)",
 						"required": true
 					}
 				]
@@ -957,15 +1008,13 @@ Provide migration code following Wheels conventions."
 
 	private string function fetchFromAIEndpoint(required string endpoint) {
 		// Use the existing AI endpoint infrastructure
-		// Try to use the same port as the current request
-		local.currentPort = cgi.server_port;
-		if (local.currentPort == 0 || !len(local.currentPort)) {
-			// Fallback to default ports
-			local.currentPort = StructKeyExists(server, "lucee") ? "60000" : "8500";
-		}
+		local.currentPort = $getLocalPort();
 		local.url = "http://localhost:" & local.currentPort & arguments.endpoint;
 
 		try {
+			if (!$isLocalUrl(local.url)) {
+				return "Error: Internal request URL validation failed.";
+			}
 			cfhttp(url=local.url, method="GET", timeout="10", result="local.httpResult");
 
 			if (local.httpResult.status_code == 200) {
@@ -989,6 +1038,22 @@ Provide migration code following Wheels conventions."
 	private string function executeWheelsGenerate(required struct args) {
 		if (!structKeyExists(arguments.args, "type") || !structKeyExists(arguments.args, "name")) {
 			return "Error: Missing required parameters 'type' and 'name'";
+		}
+
+		if (!$isValidType(arguments.args.type)) {
+			return "Error: Invalid 'type' parameter. Must be alphanumeric (e.g., model, controller, scaffold).";
+		}
+
+		if (!$isValidName(arguments.args.name)) {
+			return "Error: Invalid 'name' parameter. Must be alphanumeric with optional underscores and dots.";
+		}
+
+		if (structKeyExists(arguments.args, "attributes") && len(arguments.args.attributes) && !$isSafeArgument(arguments.args.attributes)) {
+			return "Error: Invalid 'attributes' parameter. Contains disallowed characters.";
+		}
+
+		if (structKeyExists(arguments.args, "actions") && len(arguments.args.actions) && !$isSafeArgument(arguments.args.actions)) {
+			return "Error: Invalid 'actions' parameter. Contains disallowed characters.";
 		}
 
 		// Handle test generation to ensure proper directory structure
@@ -1017,6 +1082,12 @@ Provide migration code following Wheels conventions."
 		try {
 			// Determine test type and target directory
 			local.testName = arguments.args.name;
+
+			// Validate test name: only letters, digits, underscores; must start with a letter
+			if (!ReFind("^[a-zA-Z][a-zA-Z0-9_]*$", local.testName)) {
+				return "Error: Invalid test name. Use only letters, numbers, and underscores, starting with a letter.";
+			}
+
 			local.testType = "model"; // default
 			local.targetDir = "";
 
@@ -1049,19 +1120,28 @@ Provide migration code following Wheels conventions."
 			local.appRoot = getDirectoryFromPath(local.publicDirClean) & "/";
 			local.fullTargetDir = local.appRoot & local.targetDir;
 
-			// Debug logging removed - path resolution working correctly
-
 			// Clean up path separators
 			local.fullTargetDir = replace(local.fullTargetDir, "\\", "/", "all");
 			local.fullTargetDir = replace(local.fullTargetDir, "//", "/", "all");
 
 			if (!directoryExists(local.fullTargetDir)) {
-				directoryCreate(local.fullTargetDir, true);
+				// Adobe CF rejects directoryCreate(path, true) — see #2614. Use mkdirs() instead.
+				local.created = createObject("java", "java.io.File").init(local.fullTargetDir).mkdirs();
+				if (!local.created && !directoryExists(local.fullTargetDir)) {
+					throw(type="Wheels.Mcp.TestDir", message="Could not create test directory '#local.fullTargetDir#'.");
+				}
 			}
 
 			// Generate test file content
 			local.testFileName = local.testName & "Test.cfc";
 			local.testFilePath = local.fullTargetDir & local.testFileName;
+
+			// Defense-in-depth: verify resolved path stays within the target directory
+			local.canonicalTarget = CreateObject("java", "java.io.File").init(local.testFilePath).getCanonicalPath();
+			local.canonicalBase = CreateObject("java", "java.io.File").init(local.fullTargetDir).getCanonicalPath();
+			if (!local.canonicalTarget.startsWith(local.canonicalBase)) {
+				return "Error: Invalid test file path - path traversal detected.";
+			}
 
 			// Create test file with proper TestBox structure
 			local.testContent = createTestFileContent(local.testName, local.testType);
@@ -1086,7 +1166,7 @@ Provide migration code following Wheels conventions."
 			local.cleanName = local.className;
 		}
 
-		local.content = 'component extends="wheels.Testbox" {' & chr(10) & chr(10);
+		local.content = 'component extends="wheels.WheelsTest" {' & chr(10) & chr(10);
 		local.content &= '	function beforeAll() {' & chr(10);
 		local.content &= '		// Setup for all tests in this spec' & chr(10);
 		local.content &= '	}' & chr(10) & chr(10);
@@ -1143,11 +1223,12 @@ Provide migration code following Wheels conventions."
 			return "Error: Missing required parameter 'action'";
 		}
 
+		if (!$isValidType(arguments.args.action)) {
+			return "Error: Invalid 'action' parameter. Must be alphanumeric (e.g., info, latest, up, down, reset).";
+		}
+
 		try {
-			local.currentPort = cgi.server_port;
-			if (local.currentPort == 0 || !len(local.currentPort)) {
-				local.currentPort = StructKeyExists(server, "lucee") ? "60000" : "8500";
-			}
+			local.currentPort = $getLocalPort();
 			local.baseUrl = "http://localhost:" & local.currentPort & "/wheels/migrator";
 
 			switch (arguments.args.action) {
@@ -1161,8 +1242,10 @@ Provide migration code following Wheels conventions."
 					return executeMigrationDown(local.baseUrl);
 				case "reset":
 					return executeMigrationCommand(local.baseUrl, "migrateTo", "0");
+				case "diff":
+					return $executeMigrationDiff(arguments.args);
 				default:
-					return "Error: Unknown migration action '" & arguments.args.action & "'. Supported actions: info, latest, up, down, reset";
+					return "Error: Unknown migration action '" & arguments.args.action & "'. Supported actions: info, latest, up, down, reset, diff";
 			}
 
 		} catch (any e) {
@@ -1174,6 +1257,9 @@ Provide migration code following Wheels conventions."
 		local.command = "wheels test run";
 
 		if (structKeyExists(arguments.args, "target") && len(arguments.args.target)) {
+			if (!$isValidTarget(arguments.args.target)) {
+				return "Error: Invalid 'target' parameter. Must be alphanumeric with optional dots, hyphens, underscores, or slashes.";
+			}
 			local.command &= " " & arguments.args.target;
 		}
 
@@ -1189,95 +1275,40 @@ Provide migration code following Wheels conventions."
 			return "Error: Missing required parameter 'action'";
 		}
 
+		// Whitelist allowed server actions to prevent command injection
+		local.allowedActions = "start,stop,restart,status,log,env,info,list";
+		if (!ListFindNoCase(local.allowedActions, arguments.args.action)) {
+			return "Error: Invalid action '#EncodeForHTML(arguments.args.action)#'. Allowed: #local.allowedActions#";
+		}
+
 		local.command = "wheels server " & arguments.args.action;
 		return executeCommand(local.command);
 	}
 
 	private string function executeCommand(required string command) {
-		try {
-			// Get the application root directory using Application.cfc mappings
-			// The /app mapping points to the application's app directory (e.g., /project/app/)
-			// So /app/../ gives us the project root directory
-			local.appPath = expandPath("/app/../");
-
-			// Fallback: If /app mapping doesn't exist or doesn't point to a valid location,
-			// use the traditional detection method
-			if (!directoryExists(local.appPath) || (!fileExists(local.appPath & "box.json") && !fileExists(local.appPath & "public/Application.cfc"))) {
-				// Fallback to manual path detection from webroot
-				local.appPath = expandPath("/");
-
-				// Check if we're in a vendor/wheels/public directory and adjust path accordingly
-				if (findNoCase("vendor/wheels/public", local.appPath) || findNoCase("wheels/public", local.appPath)) {
-					// We're in the vendor wheels directory, go up to find the application root
-					local.appPath = expandPath("/../../../");
-
-					// If that doesn't work, try going up more levels to find box.json or Application.cfc
-					if (!fileExists(local.appPath & "box.json") && !fileExists(local.appPath & "Application.cfc")) {
-						local.appPath = expandPath("/../../../../");
-					}
-				} else {
-					// We're in the webroot (public/), go up one level to project root
-					local.appPath = expandPath("/../");
-				}
-			}
-
-			// Execute the command
-			cfexecute(
-				name = "wheels",
-				arguments = mid(arguments.command, 7), // Remove "wheels " prefix
-				timeout = "30",
-				variable = "local.result",
-				errorVariable = "local.error",
-				directory = local.appPath
-			);
-
-			// Return the result
-			if (len(local.error)) {
-				return "Error: " & local.error & (len(local.result) ? chr(10) & "Output: " & local.result : "");
-			} else {
-				return len(local.result) ? local.result : "Command executed successfully";
-			}
-
-		} catch (any e) {
-			// If wheels command is not available, try using box (CommandBox)
-			try {
-				cfexecute(
-					name = "box",
-					arguments = arguments.command,
-					timeout = "30",
-					variable = "local.result",
-					errorVariable = "local.error",
-					directory = local.appPath
-				);
-
-				if (len(local.error)) {
-					return "Error: " & local.error & (len(local.result) ? chr(10) & "Output: " & local.result : "");
-				} else {
-					return len(local.result) ? local.result : "Command executed successfully";
-				}
-
-			} catch (any e2) {
-				return "Error: Unable to execute command. Neither 'wheels' nor 'box' command found. Error: " & e.message;
-			}
-		}
+		// SEC-6 (2026-06-09 framework review): the deprecated HTTP MCP transport
+		// no longer shells out to the CLI. The cfexecute-backed execution path
+		// gave any request that reached this endpoint a command-execution
+		// primitive inside the servlet engine, gated only by environment and a
+		// localhost check — unlike consoleeval.cfm, which also requires the
+		// reload password. CLI-backed tools remain available on the canonical
+		// stdio MCP server, which runs under the developer's own shell account:
+		//
+		//     wheels mcp wheels
+		//
+		// Returning an explanatory error (instead of removing the tools from
+		// tools/list) keeps the JSON-RPC surface of this deprecated transport
+		// intact for existing clients.
+		return "Error: CLI-backed tools are disabled on the deprecated /wheels/mcp HTTP endpoint. "
+			& "Use the stdio MCP server instead ('wheels mcp wheels'; see "
+			& "https://guides.wheels.dev/v4-0-0/command-line-tools/mcp-integration). "
+			& "Requested command: " & arguments.command;
 	}
 
 	private string function executeWheelsReload(required struct args) {
 		// Use the proper Wheels reload endpoint via HTTP request
 		try {
-			// Get the current port from HTTP_HOST header (most reliable)
-			local.currentPort = cgi.server_port;
-
-			// Try HTTP_HOST if server_port is not available
-			if (!len(local.currentPort) || local.currentPort == 0) {
-				if (structKeyExists(cgi, "http_host") && find(":", cgi.http_host)) {
-					local.currentPort = listLast(cgi.http_host, ":");
-				} else if (structKeyExists(cgi, "http_host")) {
-					local.currentPort = "80"; // Default HTTP port
-				} else {
-					local.currentPort = "8080"; // Default dev port
-				}
-			}
+			local.currentPort = $getLocalPort();
 
 			// Use the MCP endpoint itself with ?reload=true parameter - much simpler!
 			local.reloadUrl = "http://localhost:" & local.currentPort & "/wheels/mcp?reload=true";
@@ -1292,6 +1323,9 @@ Provide migration code following Wheels conventions."
 
 			// Method 1: HTTP request to /wheels/mcp?reload=true (cleanest approach)
 			try {
+				if (!$isLocalUrl(local.reloadUrl)) {
+					return "Error: Internal request URL validation failed.";
+				}
 				cfhttp(url=local.reloadUrl, method="GET", timeout="10", result="local.httpResult");
 
 				if (structKeyExists(local.httpResult, "status_code") &&
@@ -1360,11 +1394,12 @@ Provide migration code following Wheels conventions."
 			return "Error: Missing required parameter 'target'";
 		}
 
+		if (!$isValidTarget(arguments.args.target)) {
+			return "Error: Invalid 'target' parameter. Must be alphanumeric (e.g., models, controllers, routes, all).";
+		}
+
 		try {
-			local.currentPort = cgi.server_port;
-			if (local.currentPort == 0 || !len(local.currentPort)) {
-				local.currentPort = StructKeyExists(server, "lucee") ? "60000" : "8500";
-			}
+			local.currentPort = $getLocalPort();
 			local.analysisUrl = "http://localhost:" & local.currentPort;
 
 			switch(arguments.args.target) {
@@ -1382,6 +1417,9 @@ Provide migration code following Wheels conventions."
 					return "Error: Invalid target '" & arguments.args.target & "'";
 			}
 
+			if (!$isLocalUrl(local.analysisUrl)) {
+				return "Error: Internal request URL validation failed.";
+			}
 			cfhttp(url=local.analysisUrl, method="GET", timeout="10", result="local.httpResult");
 
 			if (local.httpResult.status_code == 200) {
@@ -1421,6 +1459,9 @@ Provide migration code following Wheels conventions."
 
 			if (structKeyExists(arguments.args, "model") && len(arguments.args.model)) {
 				if (arguments.args.model != "all") {
+					if (!$isValidName(arguments.args.model)) {
+						return "Error: Invalid 'model' parameter. Must be alphanumeric with optional underscores and dots.";
+					}
 					local.command &= " models/" & arguments.args.model;
 				}
 			}
@@ -1434,6 +1475,9 @@ Provide migration code following Wheels conventions."
 	// Helper functions for migration operations
 
 	private string function getMigrationInfo(required string baseUrl) {
+		if (!$isLocalUrl(arguments.baseUrl)) {
+			return "Error: Internal request URL validation failed.";
+		}
 		cfhttp(url=arguments.baseUrl & "?format=json", method="GET", timeout="15", result="local.httpResult");
 
 		if (local.httpResult.status_code == 200) {
@@ -1480,6 +1524,9 @@ Provide migration code following Wheels conventions."
 	private string function executeMigrationCommand(required string baseUrl, required string command, required string version) {
 		local.url = arguments.baseUrl & "/" & arguments.command & "/" & arguments.version & "?confirm=1";
 
+		if (!$isLocalUrl(local.url)) {
+			return "Error: Internal request URL validation failed.";
+		}
 		cfhttp(url=local.url, method="POST", timeout="30", result="local.httpResult");
 
 		if (local.httpResult.status_code == 200) {
@@ -1525,6 +1572,9 @@ Provide migration code following Wheels conventions."
 		}
 
 		// Get full migration data to find next pending migration
+		if (!$isLocalUrl(arguments.baseUrl)) {
+			return "Error: Internal request URL validation failed.";
+		}
 		cfhttp(url=arguments.baseUrl & "?format=json", method="GET", timeout="15", result="local.httpResult");
 
 		if (local.httpResult.status_code == 200) {
@@ -1550,6 +1600,9 @@ Provide migration code following Wheels conventions."
 
 	private string function executeMigrationDown(required string baseUrl) {
 		// Get current migration info to determine previous version
+		if (!$isLocalUrl(arguments.baseUrl)) {
+			return "Error: Internal request URL validation failed.";
+		}
 		cfhttp(url=arguments.baseUrl & "?format=json", method="GET", timeout="15", result="local.httpResult");
 
 		if (local.httpResult.status_code == 200) {
@@ -1584,17 +1637,102 @@ Provide migration code following Wheels conventions."
 		}
 	}
 
+	/**
+	 * Calls the CLI bridge to run auto-migration diff (single model or all models).
+	 * Returns the JSON envelope produced by cli.cfm's "diff" command handler.
+	 */
+	private string function $executeMigrationDiff(required struct args) {
+		try {
+			local.qs = "&command=diff";
+
+			if (StructKeyExists(arguments.args, "modelName") && Len(arguments.args.modelName)) {
+				if (!$isValidType(arguments.args.modelName)) {
+					return SerializeJSON({success: false, error: "InvalidInput", message: "Invalid modelName"});
+				}
+				local.qs &= "&modelName=" & URLEncodedFormat(arguments.args.modelName);
+			}
+
+			if (StructKeyExists(arguments.args, "hints") && IsStruct(arguments.args.hints)) {
+				// For diffAll (no modelName), the input hints is model-keyed:
+				//   {"User": {"renames": {...}}}
+				// AutoMigrator.diffAll reads options.hints, so we must wrap.
+				// For single-model, the input hints is {"renames": {...}} and
+				// AutoMigrator.diff reads options.renames directly.
+				if (!StructKeyExists(arguments.args, "modelName") || !Len(arguments.args.modelName)) {
+					local.wrappedHints = {hints: arguments.args.hints};
+					local.qs &= "&hints=" & URLEncodedFormat(SerializeJSON(local.wrappedHints));
+				} else {
+					local.qs &= "&hints=" & URLEncodedFormat(SerializeJSON(arguments.args.hints));
+				}
+			}
+
+			if (StructKeyExists(arguments.args, "heuristicThreshold") && IsNumeric(arguments.args.heuristicThreshold)) {
+				local.qs &= "&threshold=" & URLEncodedFormat(arguments.args.heuristicThreshold);
+			}
+
+			if (StructKeyExists(arguments.args, "write") && IsBoolean(arguments.args.write) && arguments.args.write) {
+				local.qs &= "&write=true";
+			}
+
+			local.currentPort = $getLocalPort();
+			local.baseUrl = "http://localhost:" & local.currentPort
+				& "/?controller=wheels&action=wheels&view=cli" & local.qs;
+
+			if (!$isLocalUrl(local.baseUrl)) {
+				return SerializeJSON({success: false, error: "SecurityError", message: "Internal request URL validation failed"});
+			}
+
+			cfhttp(url=local.baseUrl, method="GET", timeout="30", result="local.httpResult");
+
+			if (!IsJSON(local.httpResult.fileContent)) {
+				return SerializeJSON({success: false, error: "BridgeError", message: "Non-JSON response from bridge"});
+			}
+
+			// Passthrough — bridge already returns the envelope we want.
+			return local.httpResult.fileContent;
+
+		} catch (any e) {
+			return SerializeJSON({success: false, error: e.type, message: e.message});
+		}
+	}
+
 	// Helper functions for .ai documentation
+
+	/**
+	 * Validates a path segment is safe (no traversal or null bytes) and returns
+	 * the cleaned absolute path constrained within the application root.
+	 * Returns empty string if validation fails.
+	 */
+	private string function $validateDocumentationPath(required string relativePath) {
+		// Reject path traversal sequences and null bytes early
+		if (Find("..", arguments.relativePath) || Find(Chr(0), arguments.relativePath)) {
+			return "";
+		}
+
+		local.basePath = expandPath("/");
+		local.fullPath = local.basePath & arguments.relativePath;
+
+		// Clean up path separators
+		local.fullPath = replace(local.fullPath, "\\", "/", "all");
+		local.fullPath = replace(local.fullPath, "//", "/", "all");
+
+		// Canonical path containment check to prevent traversal
+		local.canonicalBase = CreateObject("java", "java.io.File").init(local.basePath).getCanonicalPath();
+		local.canonicalTarget = CreateObject("java", "java.io.File").init(local.fullPath).getCanonicalPath();
+
+		if (!local.canonicalTarget.startsWith(local.canonicalBase)) {
+			return "";
+		}
+
+		return local.fullPath;
+	}
 
 	private string function readAIDocumentation(required string filename) {
 		try {
-			// Ensure path is relative to application root
-			local.basePath = expandPath("/");
-			local.filePath = local.basePath & ".ai/" & arguments.filename;
-
-			// Clean up path separators
-			local.filePath = replace(local.filePath, "\\", "/", "all");
-			local.filePath = replace(local.filePath, "//", "/", "all");
+			local.filePath = $validateDocumentationPath(".ai/" & arguments.filename);
+			if (!len(local.filePath)) {
+				return "Error: Invalid filename";
+			}
 
 			if (fileExists(local.filePath)) {
 				return fileRead(local.filePath);
@@ -1608,13 +1746,10 @@ Provide migration code following Wheels conventions."
 
 	private string function aggregateAIDocumentation(required string folderPath) {
 		try {
-			// Ensure path is relative to application root
-			local.basePath = expandPath("/");
-			local.fullPath = local.basePath & arguments.folderPath;
-
-			// Clean up path separators
-			local.fullPath = replace(local.fullPath, "\\", "/", "all");
-			local.fullPath = replace(local.fullPath, "//", "/", "all");
+			local.fullPath = $validateDocumentationPath(arguments.folderPath);
+			if (!len(local.fullPath)) {
+				return "Error: Invalid folder path";
+			}
 
 			local.aggregatedContent = "";
 
@@ -1661,6 +1796,10 @@ Provide migration code following Wheels conventions."
 	private string function executeWheelsDevelop(required struct args) {
 		if (!structKeyExists(arguments.args, "task")) {
 			return "Error: Missing required parameter 'task'";
+		}
+
+		if (!$isSafeArgument(arguments.args.task)) {
+			return "Error: Invalid 'task' parameter. Contains disallowed characters.";
 		}
 
 		local.task = arguments.args.task;
@@ -2156,22 +2295,9 @@ Provide migration code following Wheels conventions."
 
 	private string function performBrowserTesting(required struct plan) {
 		local.result = "";
-		local.currentPort = cgi.server_port;
 
 		try {
-			// Get current port (same logic as reload function)
-			if (local.currentPort == 0 || !len(local.currentPort)) {
-				if (structKeyExists(cgi, "http_host") && find(":", cgi.http_host)) {
-					local.hostParts = listToArray(cgi.http_host, ":");
-					if (arrayLen(local.hostParts) >= 2) {
-						local.currentPort = local.hostParts[2];
-					}
-				}
-				if (local.currentPort == 0 || !len(local.currentPort)) {
-					local.currentPort = StructKeyExists(server, "lucee") ? "60000" : "8500";
-				}
-			}
-
+			local.currentPort = $getLocalPort();
 			local.baseUrl = "http://localhost:" & local.currentPort;
 
 			local.result &= "• Testing homepage..." & chr(10);

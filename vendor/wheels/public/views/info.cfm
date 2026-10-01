@@ -20,7 +20,7 @@ paths = [
 	'assetPaths'
 ];
 
-components = ['enablePluginsComponent', 'enableMigratorComponent', 'enablePublicComponent'];
+components = ['enablePackagesComponent', 'enablePluginsComponent', 'enableMigratorComponent', 'enablePublicComponent'];
 environment = [
 	'hostName',
 	'environment',
@@ -94,6 +94,7 @@ settings = [
 		values = [
 			'autoMigrateDatabase',
 			'migratorTableName',
+			'levelsTableName',
 			'createMigratorTable',
 			'writeMigratorSQLFiles',
 			'migratorObjectCase',
@@ -150,7 +151,9 @@ if (request.wheels.params.format == "json") {
 		"timestamp": now(),
 		"application": {
 			"name": application.applicationName,
-			"metadata": applicationMeta
+			// Whitelisted subset only: the full getApplicationMetadata() struct
+			// carries datasource definitions and arbitrary app config (issue #2974).
+			"metadata": $safeApplicationMetadata(applicationMeta)
 		},
 		"server": {
 			"cfmlEngine": get("serverName") & " " & get("serverVersion"),
@@ -166,40 +169,39 @@ if (request.wheels.params.format == "json") {
 		"settings": {}
 	};
 
-	// Collect path settings
+	// Collect path settings (secret-shaped names are omitted via the shared
+	// $isProtectedSetting() predicate, same as the HTML branch's redaction)
 	for (local.path in paths) {
-		if (isDefined("application.wheels." & local.path)) {
+		if (isDefined("application.wheels." & local.path) && !$isProtectedSetting(local.path)) {
 			local.infoData.paths[local.path] = $get(local.path);
 		}
 	}
 
 	// Collect component settings
 	for (local.comp in components) {
-		if (isDefined("application.wheels." & local.comp)) {
+		if (isDefined("application.wheels." & local.comp) && !$isProtectedSetting(local.comp)) {
 			local.infoData.components[local.comp] = $get(local.comp);
 		}
 	}
 
 	// Collect environment settings
 	for (local.env in environment) {
-		if (isDefined("application.wheels." & local.env)) {
+		if (isDefined("application.wheels." & local.env) && !$isProtectedSetting(local.env)) {
 			local.infoData.environment[local.env] = $get(local.env);
 		}
 	}
 
-	// Collect CSRF settings
+	// Collect CSRF settings (secret-shaped names are omitted via the shared
+	// $isProtectedSetting() predicate, same as the HTML branch's redaction)
 	for (local.csrfSetting in csrf) {
-		if (isDefined("application.wheels." & local.csrfSetting)) {
-			// Don't expose secret keys in JSON
-			if (local.csrfSetting != "csrfCookieEncryptionSecretKey") {
-				local.infoData.csrf[local.csrfSetting] = $get(local.csrfSetting);
-			}
+		if (isDefined("application.wheels." & local.csrfSetting) && !$isProtectedSetting(local.csrfSetting)) {
+			local.infoData.csrf[local.csrfSetting] = $get(local.csrfSetting);
 		}
 	}
 
 	// Collect CORS settings
 	for (local.corsSetting in cors) {
-		if (isDefined("application.wheels." & local.corsSetting)) {
+		if (isDefined("application.wheels." & local.corsSetting) && !$isProtectedSetting(local.corsSetting)) {
 			local.infoData.cors[local.corsSetting] = $get(local.corsSetting);
 		}
 	}
@@ -209,7 +211,7 @@ if (request.wheels.params.format == "json") {
 		local.groupName = local.settingGroup.name;
 		local.infoData.settings[local.groupName] = {};
 		for (local.settingName in local.settingGroup.values) {
-			if (isDefined("application.wheels." & local.settingName)) {
+			if (isDefined("application.wheels." & local.settingName) && !$isProtectedSetting(local.settingName)) {
 				local.infoData.settings[local.groupName][local.settingName] = $get(local.settingName);
 			}
 		}
@@ -218,12 +220,18 @@ if (request.wheels.params.format == "json") {
 	// Get database info
 	try {
 		local.db = $$getAllDatabaseInformation();
+		// Keys mirror the HTML branch below. $$getAllDatabaseInformation()
+		// returns {info, adapterName} — there is no `datasource` key, so the
+		// previous local.db.datasource.* reads threw and this payload always
+		// came back as {"error": "key [DATASOURCE] doesn't exist"}.
 		local.infoData.database = {
-			"datasourceName": local.db.datasource.name,
-			"database": local.db.datasource.database_productname,
-			"version": local.db.datasource.database_version,
-			"driver": local.db.datasource.driver_name,
-			"driverVersion": local.db.datasource.driver_version
+			"datasourceName": get("dataSourceName"),
+			"adapterName": local.db.adapterName,
+			"productName": local.db.info.database_productname,
+			"version": local.db.info.database_version,
+			"driver": local.db.info.driver_name,
+			"driverVersion": local.db.info.driver_version,
+			"jdbcVersion": local.db.info.jdbc_major_version & "." & local.db.info.jdbc_minor_version
 		};
 	} catch (any e) {
 		local.infoData.database = {"error": e.message};
@@ -387,8 +395,8 @@ if (request.wheels.params.format == "json") {
 						<div class="header">Documentation</div>
 						<div class="description">
 							<p>Download generated documentation as JSON</p>
-							<a href="#urlFor(route = "wheelsApiDocs", params = "format=json")#" target="_blank" ,>
-								<svg xmlns="http://www.w3.org/2000/svg" height="16" width="16" viewBox="0 0 512 512"><path d="M216 0h80c13.3 0 24 10.7 24 24v168h87.7c17.8 0 26.7 21.5 14.1 34.1L269.7 378.3c-7.5 7.5-19.8 7.5-27.3 0L90.1 226.1c-12.6-12.6-3.7-34.1 14.1-34.1H192V24c0-13.3 10.7-24 24-24zm296 376v112c0 13.3-10.7 24-24 24H24c-13.3 0-24-10.7-24-24V376c0-13.3 10.7-24 24-24h146.7l49 49c20.1 20.1 52.5 20.1 72.6 0l49-49H488c13.3 0 24 10.7 24 24zm-124 88c0-11-9-20-20-20s-20 9-20 20 9 20 20 20 20-9 20-20zm64 0c0-11-9-20-20-20s-20 9-20 20 9 20 20 20 20-9 20-20z"/></svg>
+							<a href="#urlFor(route = "wheelsApiDocs", params = "format=json")#" target="_blank">
+								<svg xmlns="http://www.w3.org/2000/svg" height="16" width="16" viewBox="0 0 512 512"><path fill="currentColor" d="M216 0h80c13.3 0 24 10.7 24 24v168h87.7c17.8 0 26.7 21.5 14.1 34.1L269.7 378.3c-7.5 7.5-19.8 7.5-27.3 0L90.1 226.1c-12.6-12.6-3.7-34.1 14.1-34.1H192V24c0-13.3 10.7-24 24-24zm296 376v112c0 13.3-10.7 24-24 24H24c-13.3 0-24-10.7-24-24V376c0-13.3 10.7-24 24-24h146.7l49 49c20.1 20.1 52.5 20.1 72.6 0l49-49H488c13.3 0 24 10.7 24 24zm-124 88c0-11-9-20-20-20s-20 9-20 20 9 20 20 20 20-9 20-20zm64 0c0-11-9-20-20-20s-20 9-20 20 9 20 20 20 20-9 20-20z"/></svg>
 								Export Docs as JSON
 							</a>
 						</div>
@@ -402,7 +410,7 @@ if (request.wheels.params.format == "json") {
 						<div class="description">
 							<p>Build a zip for production distribution</p>
 							<a href="#urlFor(route = "wheelsBuild")#" target="_blank">
-								<svg xmlns="http://www.w3.org/2000/svg" height="16" width="16" viewBox="0 0 512 512"><path d="M32 32H480c17.7 0 32 14.3 32 32V96c0 17.7-14.3 32-32 32H32C14.3 128 0 113.7 0 96V64C0 46.3 14.3 32 32 32zm0 128H480V416c0 35.3-28.7 64-64 64H96c-35.3 0-64-28.7-64-64V160zm128 80c0 8.8 7.2 16 16 16H336c8.8 0 16-7.2 16-16s-7.2-16-16-16H176c-8.8 0-16 7.2-16 16z"/></svg>
+								<svg xmlns="http://www.w3.org/2000/svg" height="16" width="16" viewBox="0 0 512 512"><path fill="currentColor" d="M32 32H480c17.7 0 32 14.3 32 32V96c0 17.7-14.3 32-32 32H32C14.3 128 0 113.7 0 96V64C0 46.3 14.3 32 32 32zm0 128H480V416c0 35.3-28.7 64-64 64H96c-35.3 0-64-28.7-64-64V160zm128 80c0 8.8 7.2 16 16 16H336c8.8 0 16-7.2 16-16s-7.2-16-16-16H176c-8.8 0-16 7.2-16 16z"/></svg>
 								Create Zip
 							</a>
 						</div>

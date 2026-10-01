@@ -1,0 +1,460 @@
+/**
+ * TestBox base class for browser-driven specs. Wraps BrowserLauncher
+ * lifecycle so individual specs can focus on describe/it blocks:
+ *
+ *     component extends="wheels.wheelstest.BrowserTest" {
+ *         this.browserEngine = "chromium";  // optional (default chromium)
+ *
+ *         function run() {
+ *             describe("signup flow", () => {
+ *                 it("lands on the form", () => {
+ *                     this.browser.visitUrl("data:text/html,<h1>Hi</h1>")
+ *                                 .assertSee("Hi");
+ *                 });
+ *             });
+ *         }
+ *     }
+ *
+ * Lifecycle:
+ *   - beforeAll:  ensure an application-scoped BrowserLauncher is initialized,
+ *                 acquire the shared Browser handle for the requested engine
+ *   - beforeEach: fresh BrowserContext + Page, wrapped in a new BrowserClient,
+ *                 exposed as `this.browser`
+ *   - afterEach:  close the context (cookies, localStorage, etc. reset)
+ *   - afterAll:   drop our handle to the Browser — process-scoped Launcher
+ *                 keeps it alive for the next spec in the run
+ *
+ * Specs that use this base can assume this.browser is populated and
+ * well-isolated without managing Playwright plumbing themselves.
+ *
+ * Deferred (per the browser testing foundation PR scope):
+ *   - keepSignedInAs / storageState replay — require building additional
+ *     Playwright option objects through the URLClassLoader.
+ *     Specs needing these can drop down to the raw Playwright objects via
+ *     getBrowserLauncher() / this.browser.getContext() / getPage().
+ */
+component extends="wheels.WheelsTest" {
+
+    this.browserEngine = "chromium";
+    this.browserViewport = "";  // empty = Playwright default; "mobile"/"tablet"/"desktop" or {width:N, height:N}
+    this.browserScreenshotOnFailure = true;
+    // Sentinel: any method call on this.browser before browserDescribe() wires
+    // a real BrowserClient throws Wheels.BrowserTest.NotWired with a helpful
+    // message naming browserDescribe(), instead of the misleading
+    // "function [X] does not exist in the String".
+    this.browser = new wheels.wheelstest.UnwiredBrowserGuard();
+    this.browserTestSkipped = false;
+    // Per-spec base-URL override (issue #2779). Highest-precedence layer in
+    // $resolveBaseUrl(). Set in the component pseudo-constructor (the
+    // `this.baseUrl = "..."` line outside any function in the subclass),
+    // NOT inside beforeAll() — super.beforeAll() calls $resolveBaseUrl() and
+    // caches the resolved URL before any beforeAll-level assignment can take
+    // effect, so a late override is silently ignored.
+    this.baseUrl = "";
+
+    variables.$launcher = "";
+    variables.$browser = "";
+    variables.$context = "";
+    variables.$page = "";
+    variables.$baseUrl = "";
+
+    function beforeAll() {
+        // Opt-in gate for CI: browser fixture infrastructure (routes, dialogs,
+        // createDynamicProxy) is not yet reliable under LuCLI Express, so CI
+        // defaults to skipping browser specs. Set WHEELS_BROWSER_CI_ENABLE=true
+        // to force execution once the fixture server is verified in CI.
+        if ($isCiSkipEnabled()) {
+            this.browserTestSkipped = true;
+            return;
+        }
+
+        try {
+            variables.$launcher = $ensureLauncher();
+        } catch (Wheels.BrowserNotInstalled e) {
+            this.browserTestSkipped = true;
+            return;
+        } catch (Wheels.BrowserJvmUnavailable e) {
+            // Engine has no JVM class loading (e.g. RustCFML) — same clean
+            // skip path as "Playwright not installed".
+            this.browserTestSkipped = true;
+            return;
+        }
+        try {
+            variables.$browser = variables.$launcher.acquireBrowser(engine=this.browserEngine);
+        } catch (Wheels.BrowserLaunchTimedOut e) {
+            // Watchdog trip: the Playwright driver stalled (broken node
+            // runtime / stuck install step). Skipping beats wedging the whole
+            // suite for as long as the driver hangs — previously this blocked
+            // the test-runner lock indefinitely and every later test request
+            // queued behind it.
+            this.browserTestSkipped = true;
+            debug(e.message);
+            return;
+        } catch (Wheels.BrowserLaunchFailed e) {
+            // Playwright installed but unusable (missing browser binary,
+            // corrupt driver). Skip browser coverage rather than failing the
+            // run for a local environment issue; `wheels browser setup`
+            // repairs it.
+            this.browserTestSkipped = true;
+            debug(e.message);
+            return;
+        }
+        variables.$baseUrl = $resolveBaseUrl();
+    }
+
+    /**
+     * True when CI is detected and browser specs are not explicitly opted in.
+     * Checks WHEELS_CI (set by the CI workflow) and WHEELS_BROWSER_CI_ENABLE
+     * (opt-in override).
+     */
+    private boolean function $isCiSkipEnabled() {
+        try {
+            var sys = createObject("java", "java.lang.System");
+            var ci = sys.getenv("WHEELS_CI") ?: "";
+            if (!len(ci)) return false;
+            var enable = sys.getenv("WHEELS_BROWSER_CI_ENABLE") ?: "";
+            return !listFindNoCase("true,1,yes", enable);
+        } catch (any e) {
+            return false;
+        }
+    }
+
+    function afterAll() {
+        // Launcher + Browser are application-scoped and shared across spec
+        // CFCs in the run. CFML has no destructors, so scope-clear alone
+        // would leak them — Application.cfc's onApplicationEnd (which fires
+        // on applicationStop() reloads and app timeout) calls
+        // BrowserLauncher.release() to close browsers, the node driver
+        // process, and the URLClassLoader. Here we just drop our local handle.
+        variables.$browser = "";
+    }
+
+    /**
+     * Wraps TestBox's describe() with beforeEach/afterEach closures that
+     * set up and tear down a fresh BrowserContext + Page per `it` block.
+     * TestBox BDD only treats `beforeAll`/`afterAll` as class-level hooks;
+     * beforeEach/afterEach must be registered from INSIDE a describe body.
+     *
+     *     function run() {
+     *         browserDescribe("my feature", () => {
+     *             it("does the thing", () => {
+     *                 this.browser.visit("/").assertSee("...");
+     *             });
+     *         });
+     *     }
+     *
+     * Specs can mix plain describe() (no browser wiring) with
+     * browserDescribe() (browser wiring) freely in the same run().
+     */
+    public void function browserDescribe(
+        required string title,
+        required any body
+    ) {
+        // Capture this + body so the inline closures can reach them.
+        // (CFML `arguments` is per-function; inline closures can't see outer
+        // function's arguments scope directly.)
+        var me = this;
+        var innerBody = arguments.body;
+
+        describe(arguments.title, function() {
+            beforeEach(function() { me.$startBrowserContext(); });
+
+            aroundEach(function(spec, suite) {
+                // Skip path: do NOT execute the spec body. Specs don't need
+                // hand-written `if (this.browserTestSkipped) return;` guards —
+                // a forgotten guard used to hit the UnwiredBrowserGuard
+                // sentinel and fail in CI instead of skipping.
+                if (me.browserTestSkipped) {
+                    return;
+                }
+                try {
+                    arguments.spec.body();
+                } catch (any e) {
+                    me.$captureFailureArtifacts(arguments.spec);
+                    rethrow;
+                }
+            });
+
+            afterEach(function() { me.$endBrowserContext(); });
+            innerBody();
+        });
+    }
+
+    /**
+     * Exposed for custom lifecycle patterns — callers who want to write
+     * `describe(..., () => { beforeEach(() => { $startBrowserContext(); }); ...})`
+     * manually instead of using browserDescribe().
+     */
+    public void function $startBrowserContext() {
+        if (this.browserTestSkipped) return;
+
+        // A spec that overrides beforeAll() without calling super.beforeAll()
+        // leaves $browser unwired (empty string); calling newContext() on it
+        // would produce a cryptic string-method error.
+        if (!isObject(variables.$browser)) {
+            throw(
+                type="Wheels.BrowserTest.NotWired",
+                message="No Browser has been acquired for this spec. If your spec overrides beforeAll(), call super.beforeAll() first so the launcher and Browser are wired."
+            );
+        }
+
+        var contextOpts = $buildContextOptions();
+
+        // extraHTTPHeaders (Map) is the primary isolation marker so the first
+        // navigation binds the test application (issue #3374 / B6). Fall back
+        // to a bare context if the Java Map interop fails on an engine.
+        try {
+            if (IsObject(contextOpts)) {
+                variables.$context = variables.$browser.newContext(contextOpts);
+            } else {
+                variables.$context = variables.$browser.newContext();
+            }
+        } catch (any e) {
+            variables.$context = variables.$browser.newContext();
+        }
+        variables.$page = variables.$context.newPage();
+        this.browser = new wheels.wheelstest.BrowserClient()
+            .init(
+                page=variables.$page,
+                context=variables.$context,
+                baseUrl=variables.$baseUrl,
+                launcher=variables.$launcher
+            );
+        // Cookie backup so follow-on navigations / form posts stay isolated
+        // even if extraHTTPHeaders was dropped by the fallback above.
+        if (Len(variables.$baseUrl ?: "")) {
+            try {
+                var ctx = new wheels.events.TestContext();
+                this.browser.setCookie(name = ctx.cookieName(), value = "1", url = variables.$baseUrl);
+            } catch (any cookieErr) {
+                // Best-effort: header may already be on the context.
+            }
+        }
+    }
+
+    public void function $endBrowserContext() {
+        if (this.browserTestSkipped) return;
+        if (isObject(variables.$context)) {
+            try {
+                variables.$context.close();
+            } catch (any e) {
+                // Best-effort: context.close() can fail if the page crashed
+                // (bad data: URL, JS unhandled error). Test assertions ran
+                // before this, so swallowing here doesn't hide test results.
+                // Continuing to clear refs prevents leaked Page/Context
+                // references between `it` blocks.
+            }
+            variables.$context = "";
+            variables.$page = "";
+            this.browser = new wheels.wheelstest.UnwiredBrowserGuard();
+        }
+    }
+
+    /** Accessor for specs that need to reach Playwright directly. */
+    public any function getBrowserLauncher() {
+        return variables.$launcher;
+    }
+
+    /**
+     * Lazily initialize a process-wide BrowserLauncher in application scope.
+     * A single Playwright instance + Browser handle serves all BrowserTest
+     * subclasses in the run — avoids paying ~1.7s per spec-file startup.
+     *
+     * Throws Wheels.BrowserNotInstalled if any classpath JAR is missing —
+     * callers catch this and skip browser tests gracefully.
+     *
+     * Wrapped in cflock to guard the check-then-act on application scope
+     * against parallel beforeAll invocations (relevant if ParallelRunner or
+     * multi-bundle parallelism is ever used; sequential TestBox makes this
+     * a no-op today).
+     */
+    private any function $ensureLauncher() {
+        if (structKeyExists(application, "$wheelsBrowserLauncher")) {
+            return application.$wheelsBrowserLauncher;
+        }
+        lock name="wheelsBrowserLauncherInit" type="exclusive" timeout="60" {
+            // Re-check inside the lock — another thread may have initialized
+            // while we were waiting.
+            if (structKeyExists(application, "$wheelsBrowserLauncher")) {
+                return application.$wheelsBrowserLauncher;
+            }
+            var l = new wheels.wheelstest.BrowserLauncher();
+            var paths = l.$classpathJarPaths(installDir=l.resolveInstallDir());
+            for (var p in paths) {
+                if (!fileExists(p)) {
+                    throw(
+                        type="Wheels.BrowserNotInstalled",
+                        message="Playwright JAR missing: " & p
+                            & ". Run `wheels browser setup` to set up browser testing."
+                    );
+                }
+            }
+            l.$loadJars(jarPaths=paths);
+            application.$wheelsBrowserLauncher = l;
+        }
+        return application.$wheelsBrowserLauncher;
+    }
+
+    /**
+     * Base URL for `client.visit("/path")`. Resolved through a layered lookup
+     * at instance time so post-launch overrides take effect (the JVM caches
+     * env vars at process start, so `export`-ing after `wheels start` is too
+     * late for the bare-env-var approach). Precedence, highest first:
+     *
+     *   1. this.baseUrl                       — per-spec override
+     *   2. get("browserTestBaseUrl")          — Wheels setting
+     *   3. -Dwheels.browserTest.baseUrl=...   — JVM system property
+     *   4. WHEELS_BROWSER_TEST_BASE_URL env   — CI / shell
+     *   5. $detectBaseUrlFromCgi(cgi)         — derived from the in-flight
+     *                                            test-runner request
+     *   6. "http://localhost:8080" default    — bare LuCLI port
+     *
+     * For specs that use only `visitUrl(absolute)` (e.g. data:/file:), the
+     * baseUrl is effectively unused.
+     */
+    public string function $resolveBaseUrl() {
+        if (len(this.baseUrl ?: "")) return this.baseUrl;
+
+        try {
+            var setting = get(name="browserTestBaseUrl");
+            if (len(setting ?: "")) return setting;
+        } catch (any e) {
+            // Setting not registered — fall through to next layer.
+        }
+
+        try {
+            var sys = createObject("java", "java.lang.System");
+            var prop = sys.getProperty("wheels.browserTest.baseUrl");
+            if (!isNull(prop) && len(prop)) return prop;
+            var env = sys.getenv("WHEELS_BROWSER_TEST_BASE_URL");
+            if (!isNull(env) && len(env)) return env;
+        } catch (any e) {
+            // Best-effort: a SecurityManager could deny system access.
+            // Falling through to CGI detection / default is correct.
+        }
+
+        try {
+            var detected = $detectBaseUrlFromCgi(cgi);
+            if (len(detected)) return detected;
+        } catch (any e) {
+            // cgi scope unavailable (rare; e.g. background thread) — fall
+            // through to the hardcoded default.
+        }
+
+        return "http://localhost:8080";
+    }
+
+    /**
+     * Derive base URL from the in-flight test-runner request. The core test
+     * suite runs over HTTP at /wheels/core/tests, so the cgi scope already
+     * names the correct host:port for the running server. Returns "" when
+     * cgi looks like the bare LuCLI default (localhost:8080) so downstream
+     * layers can supply the real value.
+     */
+    public string function $detectBaseUrlFromCgi(required any cgiScope) {
+        if (!structKeyExists(arguments.cgiScope, "server_port") || !val(arguments.cgiScope.server_port ?: 0)) {
+            return "";
+        }
+        var port = val(arguments.cgiScope.server_port);
+        var host = len(arguments.cgiScope.server_name ?: "") ? arguments.cgiScope.server_name : "localhost";
+        var scheme = (arguments.cgiScope.https ?: "off") == "on" ? "https" : "http";
+        if (host == "localhost" && port == 8080) return "";
+        var isCanonicalPort = (scheme == "http" && port == 80) || (scheme == "https" && port == 443);
+        return scheme & "://" & host & (isCanonicalPort ? "" : ":" & port);
+    }
+
+    /**
+     * Best-effort capture of screenshot + HTML on test failure.
+     * Called from aroundEach catch block. Swallows all errors to avoid
+     * masking the real test failure.
+     */
+    public void function $captureFailureArtifacts(required any spec) {
+        if (!(this.browserScreenshotOnFailure ?: true)) return;
+        if (!isObject(this.browser) || this.browserTestSkipped) return;
+        if (structKeyExists(this.browser, "$isUnwiredBrowserGuard")) return;
+
+        try {
+            var artifactDir = this.browserArtifactPath
+                ?: expandPath("/tests/_output/browser");
+
+            $ensureArtifactDir(artifactDir);
+
+            var rawName = arguments.spec.name ?: "unknown_spec";
+            var safeName = reReplace(rawName, "[^a-zA-Z0-9_\-]", "_", "all");
+            if (len(safeName) > 80) safeName = left(safeName, 80);
+            var ts = dateFormat(now(), "yyyymmdd") & "_" & timeFormat(now(), "HHmmss");
+            var baseName = safeName & "-" & ts;
+
+            this.browser.screenshot(path=artifactDir & "/" & baseName & ".png");
+            fileWrite(artifactDir & "/" & baseName & ".html", this.browser.pageSource());
+        } catch (any e) {
+            // Best-effort: page may have crashed, context may be closed.
+            // Swallow to avoid masking the real test failure.
+        }
+    }
+
+    // Adobe CF rejects directoryCreate(path, true) — see #2614. Use mkdirs() instead.
+    public void function $ensureArtifactDir(required string path) {
+        if (directoryExists(arguments.path)) {
+            return;
+        }
+        var created = createObject("java", "java.io.File").init(arguments.path).mkdirs();
+        if (!created && !directoryExists(arguments.path)) {
+            throw(type="Wheels.BrowserTest.ArtifactDir", message="Could not create artifact directory '#arguments.path#'.");
+        }
+    }
+
+    /**
+     * Builds Browser$NewContextOptions. Always sets extraHTTPHeaders so
+     * Playwright requests bind the isolated test application (issue #3374).
+     * Viewport is applied on top when configured.
+     */
+    private any function $buildContextOptions() {
+        var ctx = new wheels.events.TestContext();
+        var headerMap = CreateObject("java", "java.util.LinkedHashMap").init();
+        headerMap.put(ctx.headerName(), "1");
+        var setterMap = {setExtraHTTPHeaders: headerMap};
+
+        if (StructKeyExists(this, "browserViewport") && Len(this.browserViewport ?: "")) {
+            var dims = $resolveViewportDims(this.browserViewport);
+
+            var viewport = variables.$launcher.$buildOption(
+                className="com.microsoft.playwright.options.ViewportSize",
+                constructorArgs=[dims.width, dims.height]
+            );
+            setterMap.setViewportSize = viewport;
+        }
+
+        return variables.$launcher.$buildOption(
+            className="com.microsoft.playwright.Browser$NewContextOptions",
+            setterMap=setterMap
+        );
+    }
+
+    /**
+     * Resolve viewport config to {width, height} struct.
+     */
+    private struct function $resolveViewportDims(required any viewport) {
+        if (isSimpleValue(arguments.viewport)) {
+            switch (lCase(arguments.viewport)) {
+                case "mobile":
+                    return {width: 375, height: 667};
+                case "tablet":
+                    return {width: 768, height: 1024};
+                case "desktop":
+                    return {width: 1440, height: 900};
+                default:
+                    throw(
+                        type="Wheels.BrowserViewportInvalid",
+                        message="Unknown viewport preset: " & arguments.viewport
+                            & ". Valid: mobile, tablet, desktop"
+                    );
+            }
+        }
+        return {
+            width: arguments.viewport.width ?: 1440,
+            height: arguments.viewport.height ?: 900
+        };
+    }
+
+}

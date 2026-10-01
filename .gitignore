@@ -15,5 +15,3 @@ cfwheels.*.zip
 settings.json
 .vscode
 /plugins/**/
-/vendor/wirebox/
-/vendor/testbox/

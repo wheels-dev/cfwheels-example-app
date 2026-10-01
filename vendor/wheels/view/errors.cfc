@@ -84,23 +84,15 @@ component {
 		local.error = local.object.errorsOn(arguments.property);
 		local.rv = "";
 		if (!ArrayIsEmpty(local.error)) {
-			// Encode all prepend / append type arguments if specified.
-			if (arguments.encode && $get("encodeHtmlTags")) {
-				if (Len(arguments.prependText)) {
-					arguments.prependText = EncodeForHTML($canonicalize(arguments.prependText));
-				}
-				if (Len(arguments.appendText)) {
-					arguments.appendText = EncodeForHTML($canonicalize(arguments.appendText));
-				}
-			}
-
+			// Do not pre-encode prepend/append: $element encodes the concatenated
+			// content once when encode=true (S18). Encoding here first produced &amp;lt;.
 			local.prepend = Len(arguments.prependText) ? arguments.prependText & (Right(arguments.prependText, 1) != " " ? " " : "") : "";
 			local.append  = Len(arguments.appendText)  ? (Left(arguments.appendText, 1) != " " ? " " : "") & arguments.appendText : "";
 			local.content = local.prepend & local.error[1].message & local.append;
 			local.rv = $element(
 				attributes = arguments,
 				content = local.content,
-				name = arguments.wrapperElement,
+				name = $sanitizeHtmlTagName(arguments.wrapperElement),
 				skip = "objectName,property,prependText,appendText,wrapperElement,encode",
 				encode = arguments.encode
 			);

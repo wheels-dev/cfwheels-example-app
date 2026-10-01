@@ -7,23 +7,24 @@
 
     EXAMPLE:
       t = changeTable(name='employees');
-      t.string(columnNames="fullName", default="", allowNull=true, limit="255");
+      t.string(columnNames="fullName", allowNull=true, limit="255");
       t.change();
 */
 component extends="[extends]" hint="[description]" {
 
 	function up() {
+		var state = {};
 		transaction {
 			try {
 				t = changeTable('tableName');
 				t.change();
 			} catch (any e) {
-				local.exception = e;
+				state.exception = e;
 			}
 
-			if (StructKeyExists(local, "exception")) {
+			if (StructKeyExists(state, "exception")) {
 				transaction action="rollback";
-				Throw(errorCode = "1", detail = local.exception.detail, message = local.exception.message, type = "any");
+				Throw(errorCode = "1", detail = state.exception.detail, message = state.exception.message, type = "any");
 			} else {
 				transaction action="commit";
 			}
@@ -31,16 +32,17 @@ component extends="[extends]" hint="[description]" {
 	}
 
 	function down() {
+		var state = {};
 		transaction {
 			try {
 				removeColumn(table = 'tableName', columnName = 'columnName');
 			} catch (any e) {
-				local.exception = e;
+				state.exception = e;
 			}
 
-			if (StructKeyExists(local, "exception")) {
+			if (StructKeyExists(state, "exception")) {
 				transaction action="rollback";
-				Throw(errorCode = "1", detail = local.exception.detail, message = local.exception.message, type = "any");
+				Throw(errorCode = "1", detail = state.exception.detail, message = state.exception.message, type = "any");
 			} else {
 				transaction action="commit";
 			}

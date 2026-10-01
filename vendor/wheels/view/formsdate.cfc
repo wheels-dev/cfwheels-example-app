@@ -104,28 +104,40 @@ component {
 	) {
 		local.combine = arguments.combine;
 		StructDelete(arguments, "combine");
-		local.name = $tagName(arguments.objectName, arguments.property);
 		arguments.$id = $tagId(arguments.objectName, arguments.property);
+		// Mirror $applyAutoId's object-bound check here: the child helpers (year/month/etc.)
+		// receive the derived ids like `user-birthday-month`; only emit companion data-auto-id
+		// when the root was object-bound. The $autoIdBound flag propagates that decision.
+		arguments.$autoIdBound = IsSimpleValue(arguments.objectName) && Len(arguments.objectName);
 
-		// in order to support 12-hour format, we have to enforce some rules
-		// if arguments.twelveHour is true, then order MUST contain ampm
-		// if the order contains ampm, then arguments.twelveHour MUST be true
-		if (ListFindNoCase(arguments.order, "hour") && arguments.twelveHour && !ListFindNoCase(arguments.order, "ampm")) {
+		// In order to support the 12-hour format we have to enforce two rules:
+		// 1. if the order contains `ampm`, then `twelveHour` MUST be true
+		// 2. if `twelveHour` is true and the order contains `hour`, then the order MUST also contain `ampm`
+		if (ListFindNoCase(arguments.order, "ampm")) {
 			arguments.twelveHour = true;
-			if (!ListFindNoCase(arguments.order, "ampm")) {
-				arguments.order = ListAppend(arguments.order, "ampm");
-			}
+		} else if (arguments.twelveHour && ListFindNoCase(arguments.order, "hour")) {
+			arguments.order = ListAppend(arguments.order, "ampm");
 		}
 
-		local.value = $formValue(argumentCollection = arguments);
+		local.value = $dateOrTimeSelectNormalizeValue($formValue(argumentCollection = arguments));
+		return $dateOrTimeSelectRender(attrs = arguments, value = local.value, combine = local.combine);
+	}
+
+	/**
+	 * Internal function. Normalize a bound date/time value for
+	 * $dateOrTimeSelect: unwrap java.time.LocalDateTime and Oracle TIMESTAMP
+	 * objects, and repair BoxLang's string date parsing quirks.
+	 */
+	public any function $dateOrTimeSelectNormalizeValue(required any value) {
+		local.value = arguments.value;
 		// Added this section for Adobe Coldfusion as it returns a "java.time.LocalDateTime" object for datetime data
 		if(isInstanceOf(local.value,"java.time.LocalDateTime")){
 			local.value = createDateTime(local.value.getYear(),local.value.getMonthValue(),local.value.getDayOfMonth(),local.value.getHour(),local.value.getMinute(),local.value.getSecond());
 		} else if (isInstanceOf(local.value, "oracle.sql.TIMESTAMP")){
 			local.value = local.value.timestampValue();
 		}
-		if (structKeyExists(server, "boxlang") && IsSimpleValue(local.value) && Len(local.value)) {
-			// BoxLang compatibility: Fix date parsing issues
+		if ($engineAdapter().isBoxLang() && IsSimpleValue(local.value) && Len(local.value)) {
+			// Engine compatibility: Fix date parsing issues
 			// Handle SQL Server format YYYY-MM-DD HH:MM:SS
 			if (ReFindNoCase("^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", local.value)) {
 				local.parts = ListToArray(Left(local.value, 10), "-");
@@ -173,46 +185,54 @@ component {
 				}
 			}
 		}
+		return local.value;
+	}
+
+	/**
+	 * Internal function. Render the order segments of $dateOrTimeSelect,
+	 * dispatching each segment to its child select-tag helper.
+	 */
+	public string function $dateOrTimeSelectRender(required struct attrs, required any value, required boolean combine) {
 		local.rv = "";
 		local.firstDone = false;
-		local.orderArray = ListToArray(arguments.order);
+		local.functionMap = {
+			year: "$yearSelectTag",
+			month: "$monthSelectTag",
+			day: "$daySelectTag",
+			hour: "$hourSelectTag",
+			minute: "$minuteSelectTag",
+			second: "$secondSelectTag",
+			yearMonthHourMinuteSecond: "$yearMonthHourMinuteSecondSelectTag",
+			ampm: "$ampmSelectTag"
+		};
+		local.name = $tagName(arguments.attrs.objectName, arguments.attrs.property);
+		local.orderArray = ListToArray(arguments.attrs.order);
 		local.iEnd = ArrayLen(local.orderArray);
 		for (local.i = 1; local.i <= local.iEnd; local.i++) {
 			local.item = local.orderArray[local.i];
 			local.marker = "($" & local.item & ")";
-			if (!local.combine) {
-				local.name = $tagName(arguments.objectName, "#arguments.property#-#local.item#");
+			if (!arguments.combine) {
+				local.name = $tagName(arguments.attrs.objectName, "#arguments.attrs.property#-#local.item#");
 				local.marker = "";
 			}
-			arguments.name = local.name & local.marker;
-			arguments.value = local.value;
-			if (IsDate(local.value)) {
-				if (arguments.twelveHour && ListFind("hour,ampm", local.item)) {
+			arguments.attrs.name = local.name & local.marker;
+			arguments.attrs.value = arguments.value;
+			if (IsDate(arguments.value)) {
+				if (arguments.attrs.twelveHour && ListFind("hour,ampm", local.item)) {
 					if (local.item == "hour") {
-						arguments.value = TimeFormat(local.value, 'h');
+						arguments.attrs.value = TimeFormat(arguments.value, 'h');
 					} else if (local.item == "ampm") {
-						arguments.value = TimeFormat(local.value, 'tt');
+						arguments.attrs.value = TimeFormat(arguments.value, 'tt');
 					}
 				} else {
-					arguments.value = $resolveDateTime(local.item, local.value);
+					arguments.attrs.value = $resolveDateTime(local.item, arguments.value);
 				}
 			}
 			if (local.firstDone) {
-				local.rv &= arguments.separator;
+				local.rv &= arguments.attrs.separator;
 			}
-			local.functionMap = {
-				year: "$yearSelectTag",
-				month: "$monthSelectTag",
-				day: "$daySelectTag",
-				hour: "$hourSelectTag",
-				minute: "$minuteSelectTag",
-				second: "$secondSelectTag",
-				yearMonthHourMinuteSecond: "$yearMonthHourMinuteSecondSelectTag",
-				ampm: "$ampmSelectTag"
-			};
-
-			if (structKeyExists(functionMap, local.item)) {
-				local.rv &= invoke(this, local.functionMap[local.item], arguments);
+			if (structKeyExists(local.functionMap, local.item)) {
+				local.rv &= invoke(this, local.functionMap[local.item], arguments.attrs);
 			} else {
 				throw("Invalid item value: " & local.item);
 			}
@@ -274,6 +294,13 @@ component {
 		}
 		if (!StructKeyExists(arguments, "id")) {
 			arguments.id = arguments.$id & "-" & arguments.$type;
+			if (
+				$get("formHelperDataAutoId")
+				&& StructKeyExists(arguments, "$autoIdBound")
+				&& arguments.$autoIdBound
+			) {
+				arguments["dataAutoId"] = Replace(arguments.id, "-", "_", "all");
+			}
 		}
 		local.before = $formBeforeElement(argumentCollection = arguments);
 		local.after = $formAfterElement(argumentCollection = arguments);
@@ -294,22 +321,24 @@ component {
 				encode = arguments.encode
 			);
 		}
+		// Copy the argument struct once and only mutate the per-iteration counter key (a deep
+		// Duplicate of the full struct previously ran for every single <option> rendered).
+		local.args = Duplicate(arguments);
+		local.args.optionContent = local.optionContent;
 		if (arguments.$loopFrom < arguments.$loopTo) {
 			for (local.i = arguments.$loopFrom; local.i <= arguments.$loopTo; local.i = local.i + arguments.$step) {
-				local.args = Duplicate(arguments);
 				local.args.counter = local.i;
-				local.args.optionContent = local.optionContent;
 				local.content &= $yearMonthHourMinuteSecondSelectTagContent(argumentCollection = local.args);
 			}
 		} else {
 			for (local.i = arguments.$loopFrom; local.i >= arguments.$loopTo; local.i = local.i - arguments.$step) {
-				local.args = Duplicate(arguments);
 				local.args.counter = local.i;
-				local.args.optionContent = local.optionContent;
 				local.content &= $yearMonthHourMinuteSecondSelectTagContent(argumentCollection = local.args);
 			}
 		}
-		local.encode = IsBoolean(arguments.encode) && arguments.encode ? "attributes" : false;
+		// Match select(): encode="attributes" (non-boolean) must still encode
+		// attribute values. `IsBoolean && encode` coerced that string to false.
+		local.encode = $coerceEncode(arguments.encode, "attributes");
 		return local.before & $element(
 			name = "select",
 			skip = "objectName,property,label,labelPlacement,prepend,append,prependToLabel,appendToLabel,errorElement,errorClass,value,includeBlank,order,separator,startYear,endYear,monthDisplay,monthNames,monthAbbreviations,dateSeparator,dateOrder,timeSeparator,timeOrder,minuteStep,secondStep,association,position,twelveHour,encode",
@@ -323,7 +352,7 @@ component {
 	/**
 	 * Internal function.
 	 */
-	public string function $yearMonthHourMinuteSecondSelectTagContent() {
+	public string function $yearMonthHourMinuteSecondSelectTagContent(any encode = false) {
 		local.args = {};
 		local.args.value = arguments.counter;
 		if (arguments.value == arguments.counter) {
@@ -337,7 +366,9 @@ component {
 		if (arguments.$type == "minute" || arguments.$type == "second") {
 			arguments.optionContent = NumberFormat(arguments.optionContent, "09");
 		}
-		return $element(name = "option", content = arguments.optionContent, attributes = local.args, encode = false);
+		// Default false keeps the existing unit tests (they omit encode).
+		// monthSelectTag etc. pass encode through argumentCollection (S1).
+		return $element(name = "option", content = arguments.optionContent, attributes = local.args, encode = arguments.encode);
 	}
 
 	/**
@@ -356,6 +387,13 @@ component {
 		}
 		if (!StructKeyExists(arguments, "id")) {
 			arguments.id = arguments.$id & "-ampm";
+			if (
+				$get("formHelperDataAutoId")
+				&& StructKeyExists(arguments, "$autoIdBound")
+				&& arguments.$autoIdBound
+			) {
+				arguments["dataAutoId"] = Replace(arguments.id, "-", "_", "all");
+			}
 		}
 		local.content = "";
 		local.optionsArray = ListToArray(local.options);

@@ -1,113 +1,110 @@
 component extends="wheels.databaseAdapters.Base" output=false {
 
 	/**
+	 * H2 reports unquoted identifiers in uppercase, so lowercase auto-derived
+	 * property names — otherwise models expose `FIRSTNAME` instead of
+	 * `firstname`. See Base.$lowerCaseColumnNames().
+	 */
+	public boolean function $lowerCaseColumnNames() {
+		return true;
+	}
+
+	/**
+	 * H2 1.3.172 (the driver Lucee bundles) returns rows in the wrong order once
+	 * LIMIT + OFFSET exceeds the 32-bit maximum (#3684), and the query builder's
+	 * offset() without limit() passes exactly that maximum as "no limit" (#3665).
+	 * Clamp the limit so the sum stays at 2147483647: still effectively
+	 * unlimited, and correct on H2 1.3.172 and 2.x alike. There is no
+	 * version-independent sentinel: 1.3.172 has no OFFSET-only form, and H2 2.x
+	 * rejects LIMIT -1 and LIMIT NULL.
+	 */
+	public string function $limitOffsetClause(required numeric limit, required numeric offset) {
+		local.maxInt = 2147483647;
+		local.limit = arguments.limit;
+		if (arguments.offset > 0 && arguments.offset < local.maxInt && local.limit + arguments.offset > local.maxInt) {
+			// NumberFormat keeps a large computed value out of scientific notation.
+			local.limit = NumberFormat(local.maxInt - arguments.offset, "0");
+		}
+		return super.$limitOffsetClause(limit = local.limit, offset = arguments.offset);
+	}
+
+	variables.h2TypeMap = {
+		"bigint": "cf_sql_bigint",
+		"int8": "cf_sql_bigint",
+		"binary": "cf_sql_binary",
+		"bytea": "cf_sql_binary",
+		"raw": "cf_sql_binary",
+		"binary varying": "cf_sql_binary",
+		"bit": "cf_sql_bit",
+		"bool": "cf_sql_bit",
+		"boolean": "cf_sql_bit",
+		"binary large object": "cf_sql_blob",
+		"blob": "cf_sql_blob",
+		"tinyblob": "cf_sql_blob",
+		"mediumblob": "cf_sql_blob",
+		"longblob": "cf_sql_blob",
+		"image": "cf_sql_blob",
+		"oid": "cf_sql_blob",
+		"char": "cf_sql_char",
+		"character": "cf_sql_char",
+		"nchar": "cf_sql_char",
+		"uuid": "cf_sql_char",
+		"date": "cf_sql_date",
+		"dec": "cf_sql_decimal",
+		"decimal": "cf_sql_decimal",
+		"number": "cf_sql_decimal",
+		"numeric": "cf_sql_decimal",
+		"double": "cf_sql_double",
+		"double precision": "cf_sql_double",
+		"float": "cf_sql_float",
+		"float4": "cf_sql_float",
+		"float8": "cf_sql_float",
+		"real": "cf_sql_float",
+		"int": "cf_sql_integer",
+		"int4": "cf_sql_integer",
+		"integer": "cf_sql_integer",
+		"mediumint": "cf_sql_integer",
+		"signed": "cf_sql_integer",
+		"identity": "cf_sql_integer",
+		"int2": "cf_sql_smallint",
+		"smallint": "cf_sql_smallint",
+		"year": "cf_sql_smallint",
+		"time": "cf_sql_time",
+		"datetime": "cf_sql_timestamp",
+		"smalldatetime": "cf_sql_timestamp",
+		"timestamp": "cf_sql_timestamp",
+		"tinyint": "cf_sql_tinyint",
+		"varbinary": "cf_sql_varbinary",
+		"longvarbinary": "cf_sql_varbinary",
+		"varchar": "cf_sql_varchar",
+		"varchar2": "cf_sql_varchar",
+		"longvarchar": "cf_sql_varchar",
+		"varchar_ignorecase": "cf_sql_varchar",
+		"nvarchar": "cf_sql_varchar",
+		"nvarchar2": "cf_sql_varchar",
+		"clob": "cf_sql_varchar",
+		"nclob": "cf_sql_varchar",
+		"text": "cf_sql_varchar",
+		"tinytext": "cf_sql_varchar",
+		"mediumtext": "cf_sql_varchar",
+		"longtext": "cf_sql_varchar",
+		"ntext": "cf_sql_varchar",
+		"enum": "cf_sql_varchar",
+		"character varying": "cf_sql_varchar",
+		"character large object": "cf_sql_varchar",
+		"nvarchar_casesensitive": "cf_sql_nvarchar",
+		"json": "cf_sql_longvarchar"
+	};
+
+	/**
 	 * Map database types to the ones used in CFML.
 	 */
 	public string function $getType(required string type, string scale, string details) {
-		switch (arguments.type) {
-			case "bigint":
-			case "int8":
-				local.rv = "cf_sql_bigint";
-				break;
-			case "binary":
-			case "bytea":
-			case "raw":
-			case "binary varying":
-				local.rv = "cf_sql_binary";
-				break;
-			case "bit":
-			case "bool":
-			case "boolean":
-				local.rv = "cf_sql_bit";
-				break;
-			case "binary large object":
-			case "blob":
-			case "tinyblob":
-			case "mediumblob":
-			case "longblob":
-			case "image":
-			case "oid":
-				local.rv = "cf_sql_blob";
-				break;
-			case "char":
-			case "character":
-			case "nchar":
-			case "UUID":
-				local.rv = "cf_sql_char";
-				break;
-			case "date":
-				local.rv = "cf_sql_date";
-				break;
-			case "dec":
-			case "decimal":
-			case "number":
-			case "numeric":
-				local.rv = "cf_sql_decimal";
-				break;
-			case "double":
-			case "double precision":
-				local.rv = "cf_sql_double";
-				break;
-			case "float":
-			case "float4":
-			case "float8":
-			case "real":
-				local.rv = "cf_sql_float";
-				break;
-			case "int":
-			case "int4":
-			case "integer":
-			case "mediumint":
-			case "signed":
-			case "identity":
-				local.rv = "cf_sql_integer";
-				break;
-			case "int2":
-			case "smallint":
-			case "year":
-				local.rv = "cf_sql_smallint";
-				break;
-			case "time":
-				local.rv = "cf_sql_time";
-				break;
-			case "datetime":
-			case "smalldatetime":
-			case "timestamp":
-				local.rv = "cf_sql_timestamp";
-				break;
-			case "tinyint":
-				local.rv = "cf_sql_tinyint";
-				break;
-			case "varbinary":
-			case "longvarbinary":
-				local.rv = "cf_sql_varbinary";
-				break;
-			case "varchar":
-			case "varchar2":
-			case "longvarchar":
-			case "varchar_ignorecase":
-			case "nvarchar":
-			case "nvarchar2":
-			case "clob":
-			case "nclob":
-			case "text":
-			case "tinytext":
-			case "mediumtext":
-			case "longtext":
-			case "ntext":
-			case "enum":
-			case "character varying":
-			case "character large object":
-				local.rv = "cf_sql_varchar";
-				break;
-			case "nvarchar_casesensitive":
-				local.rv = "cf_sql_nvarchar";
-				break;
-			case "json":
-				local.rv = "cf_sql_longvarchar";
-				break;
+		local.key = LCase(arguments.type);
+		if (StructKeyExists(variables.h2TypeMap, local.key)) {
+			return variables.h2TypeMap[local.key];
 		}
-		return local.rv;
+		$throwUnknownColumnType(arguments.type);
 	}
 
 	/**
@@ -125,6 +122,28 @@ component extends="wheels.databaseAdapters.Base" output=false {
 		$addColumnsToSelectAndGroupBy(args = arguments);
 		$moveAggregateToHaving(args = arguments);
 		return $performQuery(argumentCollection = arguments);
+	}
+
+	/**
+	 * H2 does not support advisory locks.
+	 */
+	public void function $acquireAdvisoryLock(required string name, numeric timeout = 10) {
+		Throw(
+			type = "Wheels.AdvisoryLockNotSupported",
+			message = "H2 does not support advisory locks.",
+			extendedInfo = "Advisory locks are not available in H2. Consider using a different database for features that require advisory locking."
+		);
+	}
+
+	/**
+	 * H2 does not support advisory locks.
+	 */
+	public void function $releaseAdvisoryLock(required string name) {
+		Throw(
+			type = "Wheels.AdvisoryLockNotSupported",
+			message = "H2 does not support advisory locks.",
+			extendedInfo = "Advisory locks are not available in H2."
+		);
 	}
 
 	/**
@@ -163,22 +182,72 @@ component extends="wheels.databaseAdapters.Base" output=false {
 	) {
 		arguments.type = "index";
 		local.index = $dbinfo(argumentCollection = arguments);
-		pkList = "";
-		for (row in local.index) {
-			if (Find('primary_key', row.INDEX_NAME)) {
-				pkList = ListAppend(pkList, row.COLUMN_NAME);
+		local.pkList = "";
+		for (local.row in local.index) {
+			if (Find('primary_key', local.row.INDEX_NAME)) {
+				local.pkList = ListAppend(local.pkList, local.row.COLUMN_NAME);
 			}
 		}
 		arguments.type = "columns";
 		local.columns = $dbinfo(argumentCollection = arguments);
-		for (local.i = 1; i <= local.columns.recordCount; i++) {
-			if (ListFind(pkList, local.columns["COLUMN_NAME"][i])) {
-				QuerySetCell(local.columns, "IS_PRIMARYKEY", "YES", i);
+		for (local.i = 1; local.i <= local.columns.recordCount; local.i++) {
+			if (ListFind(local.pkList, local.columns["COLUMN_NAME"][local.i])) {
+				QuerySetCell(local.columns, "IS_PRIMARYKEY", "YES", local.i);
 			}
 		}
 
 		return local.columns;
 	}
 
+	/**
+	 * H2 upsert using single MERGE INTO with multi-row VALUES.
+	 * H2 syntax: MERGE INTO t (cols) KEY (uniqueBy) VALUES (row1), (row2), ...
+	 */
+	public array function $upsertSQL(
+		required string tableName,
+		required array columns,
+		required array uniqueBy,
+		required array updateColumns,
+		required array validProperties,
+		required array records,
+		required numeric batchStart,
+		required numeric batchEnd,
+		required struct propertyInfo
+	) {
+		local.sql = [];
+
+		// Build column list.
+		local.colList = "";
+		for (local.col in arguments.columns) {
+			if (Len(local.colList)) local.colList &= ", ";
+			local.colList &= $quoteIdentifier(local.col);
+		}
+
+		// Build KEY clause.
+		local.keyList = "";
+		for (local.u in arguments.uniqueBy) {
+			if (Len(local.keyList)) local.keyList &= ", ";
+			local.keyList &= $quoteIdentifier(local.u);
+		}
+
+		ArrayAppend(local.sql, "MERGE INTO #arguments.tableName# (#local.colList#) KEY (#local.keyList#) VALUES ");
+
+		// Build value rows.
+		for (local.r = arguments.batchStart; local.r <= arguments.batchEnd; local.r++) {
+			if (local.r > arguments.batchStart) {
+				ArrayAppend(local.sql, ", ");
+			}
+			ArrayAppend(local.sql, "(");
+			for (local.p = 1; local.p <= ArrayLen(arguments.validProperties); local.p++) {
+				if (local.p > 1) ArrayAppend(local.sql, ", ");
+				local.propName = arguments.validProperties[local.p];
+				local.val = StructKeyExists(arguments.records[local.r], local.propName) ? arguments.records[local.r][local.propName] : "";
+				ArrayAppend(local.sql, $buildBulkParam(value=local.val, propName=local.propName, propertyInfo=arguments.propertyInfo));
+			}
+			ArrayAppend(local.sql, ")");
+		}
+
+		return local.sql;
+	}
 
 }

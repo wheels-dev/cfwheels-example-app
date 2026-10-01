@@ -140,7 +140,7 @@ component {
 	}
 
 	/**
-	 * Create a route that matches the root of its current context. This mapper can be used for the application's web root (or home page), or it can generate a route for the root of a namespace or other path scoping mapper.
+	 * Create a route that matches the root of its current context. This mapper can be used for the application's web root (or home page), or it can generate a route for the root of a namespace or other path scoping mapper. The route only responds to the `GET` verb unless you explicitly pass a `method` (or `methods`) argument.
 	 *
 	 * [section: Configuration]
 	 * [category: Routing]
@@ -166,17 +166,21 @@ component {
 			local.pattern = "/";
 		}
 
-	  // If arguments.to is not passed in, we check for the existence of app/views/home/index.cfm if found we set that as the root
-	  // else we set wheels##wheels as the root.
-	  if (!structKeyExists(arguments, "to")) {
-	    if (fileExists(application.AppDir & "views/home/index.cfm")) {
-	      arguments.to = "home##index";
-	      arguments.method = "get";
-	    } else {
-	      arguments.to = "wheels##wheels";
-	      arguments.method = "get";
-	    }
-	  }
+		// Restrict the root route to GET unless the caller explicitly passed method/methods.
+		// Without this, a route registered with no methods key matches every HTTP verb.
+		if (!StructKeyExists(arguments, "method") && !StructKeyExists(arguments, "methods")) {
+			arguments.method = "get";
+		}
+
+		// If arguments.to is not passed in, we check for the existence of app/views/home/index.cfm if found we set that as the root
+		// else we set wheels##wheels as the root.
+		if (!structKeyExists(arguments, "to")) {
+			if (fileExists(application.AppDir & "views/home/index.cfm")) {
+				arguments.to = "home##index";
+			} else {
+				arguments.to = "wheels##wheels";
+			}
+		}
 
 		return $match(name = "root", pattern = local.pattern, argumentCollection = arguments);
 
@@ -188,7 +192,8 @@ component {
 	 * [section: Configuration]
 	 * [category: Routing]
 	 *
-	 * @method List of HTTP methods (verbs) to generate the wildcard routes for. We strongly recommend leaving the default value of `get` and using other routing mappers if you need to `POST` to a URL endpoint. For better readability, you can also pass this argument as `methods` if you're listing multiple methods.
+	 * @method List of HTTP methods (verbs) to generate the wildcard routes for. We strongly recommend leaving the default value of `get` and using other routing mappers if you need to `POST` to a URL endpoint. Pass an empty string to generate the wildcard routes for all verbs (`get`, `post`, `put`, `patch`, and `delete`).
+	 * @methods Alias for `method`, provided for better readability when listing multiple methods. Takes precedence over `method` when both are passed.
 	 * @action Default action to specify if the value for the `[action]` placeholder is not provided.
 	 * @mapKey Whether or not to enable a `[key]` matcher, enabling a `[controller]/[action]/[key]` pattern.
 	 * @mapFormat Whether or not to add an optional `.[format]` pattern to the end of the generated routes. This is useful for providing formats via URL like `json`, `xml`, `pdf`, etc.
@@ -197,12 +202,18 @@ component {
 		string method = "get",
 		string action = "index",
 		boolean mapKey = false,
-		boolean mapFormat = false
+		boolean mapFormat = false,
+		string methods
 	) {
-		if (StructKeyExists(arguments, "methods") && Len(arguments.methods)) {
-			local.methods = arguments.methods;
-		} else if (Len(arguments.method)) {
-			local.methods = ListToArray(arguments.method);
+		// Accept either `method` or `methods` (mirroring $match's aliasing), with `methods`
+		// taking precedence. An empty string generates the wildcard routes for all verbs.
+		if (StructKeyExists(arguments, "methods")) {
+			local.methodList = arguments.methods;
+		} else {
+			local.methodList = arguments.method;
+		}
+		if (Len(local.methodList)) {
+			local.methods = ListToArray(local.methodList);
 		} else {
 			local.methods = ["get", "post", "put", "patch", "delete"];
 		}
@@ -296,17 +307,57 @@ component {
 		// Use scoped package if found.
 		if (StructKeyExists(variables.scopeStack[1], "package")) {
 			if (StructKeyExists(arguments, "package")) {
-				arguments.package &= "." & variables.scopeStack[1].package;
+				arguments.package = variables.scopeStack[1].package & "." & arguments.package;
 			} else {
 				arguments.package = variables.scopeStack[1].package;
 			}
 		}
 
 		// Interpret "to" as "controller##action".
+		local.fromTo = false;
+		local.originalTo = "";
 		if (StructKeyExists(arguments, "to")) {
+			local.fromTo = true;
+			local.originalTo = arguments.to;
 			arguments.controller = ListFirst(arguments.to, "##");
 			arguments.action = ListLast(arguments.to, "##");
 			StructDelete(arguments, "to");
+		}
+
+		// Guard: reject redundant namespace prefix in to=/controller= (#2791).
+		if (
+			StructKeyExists(arguments, "package")
+			&& Len(arguments.package) > 0
+			&& StructKeyExists(arguments, "controller")
+			&& Find("/", arguments.controller)
+		) {
+			local.packageAsPath = Replace(arguments.package, ".", "/", "all");
+			local.prefix = local.packageAsPath & "/";
+			if (Len(arguments.controller) > Len(local.prefix) && Left(arguments.controller, Len(local.prefix)) == local.prefix) {
+				local.stripped = Mid(arguments.controller, Len(local.prefix) + 1, Len(arguments.controller) - Len(local.prefix));
+				local.actionForMsg = StructKeyExists(arguments, "action") ? arguments.action : "action";
+				local.hh = "####";
+				if (local.fromTo) {
+					local.detail = "Got controller=""" & arguments.controller & """ (from to=""" & local.originalTo & """). The namespace prefix is added automatically — use to=""" & local.stripped & local.hh & local.actionForMsg & """ instead.";
+				} else {
+					local.detail = "Got controller=""" & arguments.controller & """ (passed as controller=). The namespace prefix is added automatically — use controller=""" & local.stripped & """ (or to=""" & local.stripped & local.hh & local.actionForMsg & """) instead.";
+				}
+				Throw(
+					type = "Wheels.MapperArgumentInvalid",
+					message = "Route inside `.namespace('#arguments.package#')` (or equivalent `.scope()` / `.package()`) uses a redundant namespace prefix in its controller path.",
+					detail = local.detail
+				);
+			}
+		}
+
+		// On BoxLang an unpassed optional `pattern` argument surfaces as a
+		// present-but-null key (Lucee/Adobe treat it as absent). Strip it so the
+		// name->pattern derivation below runs identically on every engine — deriving
+		// `hyphenize(name)` for a named route, and letting the "pattern or name
+		// required" guard fire when neither is supplied — instead of a present-null
+		// key skipping derivation and leaving a null/empty pattern on BoxLang.
+		if (StructKeyExists(arguments, "pattern") && IsNull(arguments.pattern)) {
+			StructDelete(arguments, "pattern");
 		}
 
 		// Pull route name from arguments if it exists.
@@ -335,22 +386,19 @@ component {
 		}
 
 		// Remove 'methods' argument if settings disable it.
+		// Keep the drawn verb for the static index so restful=false get()
+		// cannot register POST:/ (S4). Ordered matching still sees no methods.
 		if (!variables.methods && StructKeyExists(arguments, "methods")) {
+			arguments.$staticIndexMethods = arguments.methods;
 			StructDelete(arguments, "methods");
 		}
 
 		// See if we have any globing in the pattern and if so add a constraint for each glob.
-		// BoxLang compatibility: Use different regex pattern to match globs
-		local.globRegex = StructKeyExists(server, "boxlang") ? "\*\[([^\]]+)\]" : "\*([^\/]+)";
+		local.globRegex = $engineAdapter().globRegex();
 		if (ReFindNoCase(local.globRegex, arguments.pattern)) {
 			local.globs = ReMatch(local.globRegex, arguments.pattern);
 			for (local.glob in local.globs) {
-				// For BoxLang: extract variable name from *[varname] pattern
-				if (StructKeyExists(server, "boxlang")) {
-					local.var = ReReplace(local.glob, "\*\[([^\]]+)\]", "\1");
-				} else {
-					local.var = ReplaceList(local.glob, "*,[,]", "");
-				}
+				local.var = $engineAdapter().extractGlobVariable(local.glob);
 				arguments.pattern = Replace(arguments.pattern, local.glob, "[#local.var#]");
 				arguments.constraints[local.var] = ".*";
 			}
@@ -359,6 +407,21 @@ component {
 		// Use constraints from stack.
 		if (StructKeyExists(variables.scopeStack[1], "constraints")) {
 			StructAppend(arguments.constraints, variables.scopeStack[1].constraints, false);
+		}
+
+		// Inherit middleware from scope stack.
+		if (!StructKeyExists(arguments, "middleware") && StructKeyExists(variables.scopeStack[1], "middleware")) {
+			arguments.middleware = variables.scopeStack[1].middleware;
+		}
+
+		// Inherit binding from scope stack.
+		if (!StructKeyExists(arguments, "binding") && StructKeyExists(variables.scopeStack[1], "binding")) {
+			arguments.binding = variables.scopeStack[1].binding;
+		}
+
+		// Inherit bindBy from scope stack.
+		if (!StructKeyExists(arguments, "bindBy") && StructKeyExists(variables.scopeStack[1], "bindBy")) {
+			arguments.bindBy = variables.scopeStack[1].bindBy;
 		}
 
 		// Add shallow path to pattern.
@@ -401,6 +464,12 @@ component {
 			arguments.name = local.name;
 		}
 
+		// Remember where this call's routes start so typed constraint helpers
+		// (whereNumber() etc.) can reach every optional-segment variant registered
+		// below — including unnamed ones, which cannot be grouped by name. Kept on
+		// the mapper, not the route struct, so nothing leaks into route listings.
+		variables.lastMatchFirstRouteIndex = ArrayLen(variables.routes) + 1;
+
 		// Handle optional pattern segments.
 		if (Find("(", arguments.pattern)) {
 			// Confirm nesting of optional segments.
@@ -425,5 +494,226 @@ component {
 		}
 
 		return this;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Typed Constraint Helpers
+	// ---------------------------------------------------------------------------
+	// These methods apply regex constraints to the most recently registered route's
+	// variables, similar to Laravel's whereNumber(), whereAlpha(), etc.
+	// They operate on the last route added to application.wheels.routes.
+
+	/**
+	 * Constrain a route variable to only match numeric values (digits). Similar to Laravel's `whereNumber()` or ASP.NET's `:int` constraint.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain (e.g., `"id"`). Can also be a comma-delimited list to constrain multiple variables.
+	 */
+	public struct function whereNumber(required string variableName) {
+		return $applyConstraintToLastRoute(arguments.variableName, "\d+");
+	}
+
+	/**
+	 * Constrain a route variable to only match alphabetic characters (a-zA-Z). Similar to Laravel's `whereAlpha()` or ASP.NET's `:alpha` constraint.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain. Can also be a comma-delimited list.
+	 */
+	public struct function whereAlpha(required string variableName) {
+		return $applyConstraintToLastRoute(arguments.variableName, "[a-zA-Z]+");
+	}
+
+	/**
+	 * Constrain a route variable to only match alphanumeric characters (a-zA-Z0-9). Similar to Laravel's `whereAlphaNumeric()`.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain. Can also be a comma-delimited list.
+	 */
+	public struct function whereAlphaNumeric(required string variableName) {
+		return $applyConstraintToLastRoute(arguments.variableName, "[a-zA-Z0-9]+");
+	}
+
+	/**
+	 * Constrain a route variable to only match UUID values. Similar to ASP.NET's `:guid` constraint.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain. Can also be a comma-delimited list.
+	 */
+	public struct function whereUuid(required string variableName) {
+		return $applyConstraintToLastRoute(arguments.variableName, "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
+	}
+
+	/**
+	 * Constrain a route variable to only match URL-friendly slug values (lowercase alphanumeric and hyphens).
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain. Can also be a comma-delimited list.
+	 */
+	public struct function whereSlug(required string variableName) {
+		return $applyConstraintToLastRoute(arguments.variableName, "[a-z0-9]+(?:-[a-z0-9]+)*");
+	}
+
+	/**
+	 * Constrain a route variable to only match one of a set of allowed values. Similar to an enum constraint.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain.
+	 * @values A comma-delimited list of allowed values (e.g., `"active,inactive,pending"`).
+	 */
+	public struct function whereIn(required string variableName, required string values) {
+		// The values are literal strings, not regex source: trim each item and escape regex
+		// metacharacters so values like "readme.txt" match exactly instead of widening the
+		// constraint (an unescaped "." would match any character). The escaping is done with
+		// a character scan rather than ReReplace because backslash handling in regex
+		// replacement strings differs across CFML engines (Lucee 7 turns a `\\` replacement
+		// into two literal backslashes, producing a constraint that never matches).
+		local.metaChars = "\^$.|?*+()[]{}";
+		local.escaped = [];
+		for (local.item in ListToArray(arguments.values)) {
+			local.item = Trim(local.item);
+			if (Len(local.item)) {
+				local.escapedItem = "";
+				local.itemLength = Len(local.item);
+				for (local.i = 1; local.i <= local.itemLength; local.i++) {
+					local.char = Mid(local.item, local.i, 1);
+					if (Find(local.char, local.metaChars)) {
+						local.escapedItem &= "\";
+					}
+					local.escapedItem &= local.char;
+				}
+				ArrayAppend(local.escaped, local.escapedItem);
+			}
+		}
+		return $applyConstraintToLastRoute(arguments.variableName, "(?:#ArrayToList(local.escaped, "|")#)");
+	}
+
+	/**
+	 * Constrain a route variable with a custom regex pattern.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @variableName The route variable name to constrain.
+	 * @pattern The regex pattern the variable must match.
+	 */
+	public struct function whereMatch(required string variableName, required string pattern) {
+		return $applyConstraintToLastRoute(arguments.variableName, arguments.pattern);
+	}
+
+	/**
+	 * Internal function.
+	 * Applies a regex constraint to the specified variable(s) on the most recently added route(s).
+	 * Supports comma-delimited variable names to constrain multiple variables at once.
+	 */
+	public struct function $applyConstraintToLastRoute(required string variableName, required string pattern) {
+		// getRoutes() returns the Mapper's variables.routes array by reference, so the
+		// constraint updates below apply to the live route registrations.
+		local.routes = this.getRoutes();
+		local.routeCount = ArrayLen(local.routes);
+		if (local.routeCount == 0) {
+			Throw(
+				type = "Wheels.NoRouteToConstrain",
+				message = "Cannot apply constraint: no routes have been defined yet."
+			);
+		}
+
+		// Apply constraint to the last route (and its optional-segment variants).
+		// When optional segments are used, $match adds multiple routes. We apply the
+		// constraint to all routes that share the same name as the last one.
+		// Unnamed routes cannot be grouped by name, so they use the first index of the
+		// most recent $match() call instead (falling back to just the last route).
+		local.lastRoute = local.routes[local.routeCount];
+		local.lastRouteName = StructKeyExists(local.lastRoute, "name") ? local.lastRoute.name : "";
+		local.firstGroupIndex = local.routeCount;
+		if (
+			StructKeyExists(variables, "lastMatchFirstRouteIndex")
+			&& variables.lastMatchFirstRouteIndex >= 1
+			&& variables.lastMatchFirstRouteIndex <= local.routeCount
+		) {
+			local.firstGroupIndex = variables.lastMatchFirstRouteIndex;
+		}
+
+		local.variableNames = ListToArray(arguments.variableName);
+		for (local.varName in local.variableNames) {
+			local.varName = Trim(local.varName);
+
+			// Walk backward through routes to find all variants of the same named route.
+			for (local.i = local.routeCount; local.i >= 1; local.i--) {
+				local.route = local.routes[local.i];
+				local.routeName = StructKeyExists(local.route, "name") ? local.route.name : "";
+
+				// Stop if we've gone past the related routes.
+				if (Len(local.lastRouteName) && local.routeName != local.lastRouteName && local.i < local.routeCount) {
+					break;
+				}
+
+				// Only update if this variable exists in the route's pattern.
+				if (Find("[#local.varName#]", local.route.pattern)) {
+					local.newConstraints = StructKeyExists(local.route, "constraints") ? StructCopy(local.route.constraints) : {};
+					local.newConstraints[local.varName] = arguments.pattern;
+
+					// Recompile the regex with the new constraint and validate it before
+					// touching the route, so an invalid constraint pattern fails here at
+					// draw time with Wheels.InvalidRegex instead of throwing a raw
+					// PatternSyntaxException on every request that scans this route.
+					local.newRegex = $patternToRegex(local.route.pattern, local.newConstraints);
+					$compileRegex(regex = local.newRegex, pattern = local.route.pattern, name = local.routeName);
+
+					local.route.constraints = local.newConstraints;
+					local.route.regex = local.newRegex;
+
+					// Write modified route back to the local array reference.
+					local.routes[local.i] = local.route;
+				}
+
+				// If no name, only update the routes added by the last $match() call.
+				if (!Len(local.lastRouteName) && local.i <= local.firstGroupIndex) {
+					break;
+				}
+			}
+		}
+
+		// Sync routes back to application scope. On Lucee/BoxLang, routes
+		// are pass-by-reference so this is redundant but harmless. On Adobe CF,
+		// this ensures the application-scoped copy reflects the modifications.
+		application[$appKey()].routes = local.routes;
+
+		return this;
+	}
+
+	// ---------------------------------------------------------------------------
+	// Health Check Route
+	// ---------------------------------------------------------------------------
+
+	/**
+	 * Register a health check route at `/health` (or a custom path). Returns a JSON response with status and timestamp by default, or delegates to a custom controller action.
+	 *
+	 * This is useful for container orchestration (Kubernetes liveness/readiness probes), load balancer health checks, and monitoring tools.
+	 *
+	 * [section: Configuration]
+	 * [category: Routing]
+	 *
+	 * @to Set `controller##action` combination for a custom health check handler. If not provided, a default handler returns `{"status":"ok","timestamp":"..."}`.
+	 * @path Override the URL path. Defaults to `"health"`.
+	 * @name Override the route name. Defaults to `"health"`.
+	 */
+	public struct function health(
+		string to = "wheels##health",
+		string path = "health",
+		string name = "health"
+	) {
+		return get(name = arguments.name, pattern = arguments.path, to = arguments.to);
 	}
 }

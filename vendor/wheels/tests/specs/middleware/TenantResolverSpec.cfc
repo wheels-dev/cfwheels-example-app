@@ -1,0 +1,346 @@
+component extends="wheels.WheelsTest" {
+
+	function run() {
+
+		describe("TenantResolver Middleware", function() {
+
+			afterEach(function() {
+				// Only clean up the tenant key, never wipe request.wheels
+				if (IsDefined("request.wheels.tenant")) {
+					StructDelete(request.wheels, "tenant");
+				}
+			});
+
+			describe("Custom strategy", function() {
+
+				it("sets request.wheels.tenant from resolver closure", function() {
+					var fn = function(req) {
+						return {id = "t1", dataSource = "tenant_one_ds", config = {showDebugInformation = false}};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {server_name = "example.com"}};
+					var result = {called = false, tenant = {}};
+
+					var handler = function(required struct request) {
+						result.called = true;
+						if (IsDefined("request.wheels.tenant")) {
+							result.tenant = StructCopy(request.wheels.tenant);
+						}
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.called).toBeTrue();
+					expect(result.tenant.id).toBe("t1");
+					expect(result.tenant.dataSource).toBe("tenant_one_ds");
+					expect(result.tenant["$locked"]).toBeTrue();
+				});
+
+				it("does not set tenant when resolver returns empty struct", function() {
+					var fn = function(req) {
+						return {};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+					var result = {hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.hasTenant).toBeFalse();
+				});
+
+				it("treats false from the resolver as not-resolved", function() {
+					// Pins the false sentinel handling so all three strategies stay consistent.
+					var fn = function(req) {
+						return false;
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+					var result = {hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.hasTenant).toBeFalse();
+				});
+
+				it("does not set tenant when resolver returns struct without dataSource", function() {
+					var fn = function(req) {
+						return {id = "t1"};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+					var result = {hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.hasTenant).toBeFalse();
+				});
+
+				it("provides default id and config when not returned by resolver", function() {
+					var fn = function(req) {
+						return {dataSource = "my_ds"};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+					var result = {tenant = {}};
+
+					var handler = function(required struct request) {
+						if (IsDefined("request.wheels.tenant")) {
+							result.tenant = StructCopy(request.wheels.tenant);
+						}
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.tenant.id).toBe("");
+					expect(result.tenant.config).toBeStruct();
+					expect(StructIsEmpty(result.tenant.config)).toBeTrue();
+				});
+			});
+
+			describe("Header strategy", function() {
+
+				it("passes request to resolver when header is present", function() {
+					var fn = function(req) {
+						return {id = "from_header", dataSource = "header_ds"};
+					};
+					var mw = new wheels.middleware.TenantResolver(
+						strategy = "header",
+						headerName = "X-Tenant-ID",
+						resolver = fn
+					);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {http_x_tenant_id = "acme"}};
+					var result = {tenant = {}};
+
+					var handler = function(required struct request) {
+						if (IsDefined("request.wheels.tenant")) {
+							result.tenant = StructCopy(request.wheels.tenant);
+						}
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.tenant.id).toBe("from_header");
+					expect(result.tenant.dataSource).toBe("header_ds");
+				});
+
+				it("treats false from the resolver as not-resolved (consistent with the custom strategy)", function() {
+					var fn = function(req) {
+						return false;
+					};
+					var mw = new wheels.middleware.TenantResolver(
+						strategy = "header",
+						resolver = fn
+					);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {http_x_tenant_id = "tenant-42"}};
+					var result = {called = false, hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.called = true;
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.called).toBeTrue();
+					expect(result.hasTenant).toBeFalse();
+				});
+
+				it("returns empty when header is missing", function() {
+					var fn = function(req) {
+						return {id = "t1", dataSource = "ds1"};
+					};
+					var mw = new wheels.middleware.TenantResolver(
+						strategy = "header",
+						headerName = "X-Tenant-ID",
+						resolver = fn
+					);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+					var result = {hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.hasTenant).toBeFalse();
+				});
+			});
+
+			describe("Subdomain strategy", function() {
+
+				it("passes request to resolver when subdomain exists", function() {
+					var fn = function(req) {
+						return {id = "acme", dataSource = "acme_ds"};
+					};
+					var mw = new wheels.middleware.TenantResolver(
+						strategy = "subdomain",
+						resolver = fn
+					);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {server_name = "acme.example.com"}};
+					var result = {tenant = {}};
+
+					var handler = function(required struct request) {
+						if (IsDefined("request.wheels.tenant")) {
+							result.tenant = StructCopy(request.wheels.tenant);
+						}
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.tenant.id).toBe("acme");
+				});
+
+				it("treats false from the resolver as not-resolved (consistent with the custom strategy)", function() {
+					// Regression: $resolveFromSubdomain returned the resolver result
+					// directly from a struct-typed function, so a resolver returning
+					// false (the not-resolved sentinel, accepted by the custom
+					// strategy) threw a cast error instead of skipping the tenant.
+					var fn = function(req) {
+						return false;
+					};
+					var mw = new wheels.middleware.TenantResolver(
+						strategy = "subdomain",
+						resolver = fn
+					);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {server_name = "acme.example.com"}};
+					var result = {called = false, hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.called = true;
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.called).toBeTrue();
+					expect(result.hasTenant).toBeFalse();
+				});
+
+				it("returns empty when hostname has no subdomain", function() {
+					var fn = function(req) {
+						return {id = "t1", dataSource = "ds1"};
+					};
+					var mw = new wheels.middleware.TenantResolver(
+						strategy = "subdomain",
+						resolver = fn
+					);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {server_name = "example.com"}};
+					var result = {hasTenant = false};
+
+					var handler = function(required struct request) {
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.hasTenant).toBeFalse();
+				});
+			});
+
+			describe("Cleanup", function() {
+
+				it("cleans up request.wheels.tenant after next() completes", function() {
+					var fn = function(req) {
+						return {id = "t1", dataSource = "ds1"};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+
+					var handler = function(required struct request) {
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(IsDefined("request.wheels.tenant")).toBeFalse();
+				});
+
+				// #3336 hardening: an unresolved request must look unresolved for its whole
+				// duration, not just after the finally block runs.
+				it("drops a pre-existing request.wheels.tenant when the resolver finds no match", function() {
+					var fn = function(req) {
+						return {};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					request.wheels.tenant = {id = "stale", dataSource = "stale_ds", config = {}};
+
+					var reqData = {cgi = {}};
+					var result = {hasTenant = true};
+
+					var handler = function(required struct request) {
+						result.hasTenant = IsDefined("request.wheels.tenant");
+						return "ok";
+					};
+					pipeline.run(request = reqData, coreHandler = handler);
+
+					expect(result.hasTenant).toBeFalse();
+				});
+
+				it("cleans up request.wheels.tenant even when next() throws", function() {
+					var fn = function(req) {
+						return {id = "t1", dataSource = "ds1"};
+					};
+					var mw = new wheels.middleware.TenantResolver(resolver = fn);
+					var pipeline = new wheels.middleware.Pipeline(middleware = [mw]);
+
+					var reqData = {cgi = {}};
+					var result = {threw = false};
+
+					var handler = function(required struct request) {
+						throw(type="TestException", message="boom");
+					};
+
+					try {
+						pipeline.run(request = reqData, coreHandler = handler);
+					} catch (TestException e) {
+						result.threw = true;
+					}
+
+					expect(result.threw).toBeTrue();
+					expect(IsDefined("request.wheels.tenant")).toBeFalse();
+				});
+			});
+
+		});
+	}
+
+}

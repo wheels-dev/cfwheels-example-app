@@ -297,24 +297,62 @@ function getQuickReference() {
 	};
 }
 
-// Get guides summary
+// Get guides summary — reads the Starlight sidebar JSON (monorepo checkout
+// only) and flattens sections + one level of items into a title/path/url list
+// pointing at guides.wheels.dev. Returns [] in installed apps where the
+// sidebar isn't present; callers should hit guides.wheels.dev directly.
 function getGuidesSummary() {
-	local.summaryPath = "/wheels/docs/src/SUMMARY.md";
 	local.guides = [];
+	local.base = "https://guides.wheels.dev";
 
-	if (fileExists(expandPath(summaryPath))) {
-		local.summaryContent = fileRead(expandPath(summaryPath));
-		local.lines = listToArray(local.summaryContent, chr(10));
+	// Discover the latest sidebar in the monorepo sidebars dir (snapshot
+	// or GA — whichever sorts highest). Sidebar basenames like
+	// "v4-0-1-snapshot.json" / "v4-0-0.json" sort sensibly in descending
+	// lexicographic order because the version segment (e.g. "4-0-1")
+	// dominates — the snapshot is always named at the NEXT minor version
+	// while GA files carry the released version. Note: at an identical
+	// version prefix, "-snapshot" sorts LOWER than ".json" (ASCII "." >
+	// "-"), so if "v4-0-1.json" and "v4-0-1-snapshot.json" ever coexist
+	// the GA wins; in practice only one exists at a time. See
+	// vendor/wheels/public/docs/guides.cfm — the same logic lives there.
+	// Hardcoding a single version slug broke this endpoint the moment
+	// v4.0.0 went GA and the snapshot file was renamed (issue ##2647).
+	local.sidebarDir = expandPath("/wheels/../../web/sites/guides/src/sidebars");
+	local.sidebarPath = "";
+	if (directoryExists(local.sidebarDir)) {
+		local.candidates = directoryList(local.sidebarDir, false, "name", "*.json");
+		if (arrayLen(local.candidates)) {
+			arraySort(local.candidates, "textnocase", "desc");
+			local.sidebarPath = local.sidebarDir & "/" & local.candidates[1];
+		}
+	}
 
-		for (local.line in local.lines) {
-			if (reFind("\[([^\]]+)\]\(([^\)]+)\)", local.line)) {
-				local.title = reReplace(local.line, ".*\[([^\]]+)\].*", "\1");
-				local.path = reReplace(local.line, ".*\(([^\)]+)\).*", "\1");
+	if (!len(local.sidebarPath) || !fileExists(local.sidebarPath)) {
+		return local.guides;
+	}
 
+	try {
+		local.sidebar = deserializeJSON(fileRead(local.sidebarPath));
+	} catch (any e) {
+		return local.guides;
+	}
+
+	for (local.section in local.sidebar) {
+		if (structKeyExists(local.section, "link")) {
+			arrayAppend(local.guides, {
+				"title": local.section.label,
+				"path": local.section.link,
+				"url": local.base & local.section.link
+			});
+		}
+		if (structKeyExists(local.section, "items")) {
+			for (local.item in local.section.items) {
+				// Skip sub-group headers (label + nested items, no link)
+				if (!structKeyExists(local.item, "link")) continue;
 				arrayAppend(local.guides, {
-					"title": local.title,
-					"path": local.path,
-					"endpoint": "/wheels/guides?path=" & reReplace(local.path, "\.md$", "") & "&format=json"
+					"title": local.section.label & " — " & local.item.label,
+					"path": local.item.link,
+					"url": local.base & local.item.link
 				});
 			}
 		}
@@ -515,80 +553,70 @@ function handleProjectContext() {
 			"files": local.migrations
 		};
 
-		// Get detailed routes from routes endpoint
+		// Get detailed routes in-process from the application scope. This used
+		// to be a loopback HTTP self-request to /wheels/routes?format=json,
+		// which dispatched a full second framework request, tied up another
+		// servlet thread, and broke under https-only or a non-root context
+		// path. The split below mirrors the routes view's JSON branch.
 		try {
-			local.http = new http();
-			local.http.setMethod("GET");
-			local.http.setUrl("http://localhost:#cgi.server_port#/wheels/routes?format=json");
-			local.result = local.http.send().getPrefix();
-
-			if (local.result.statusCode == "200 OK") {
-				local.routesData = deserializeJSON(local.result.fileContent);
-				local.projectContext.project.routes = local.routesData.routes;
-			} else {
-				// Fallback to basic routes info
-				if (structKeyExists(application.wheels, "routes")) {
-					local.projectContext.project.routes = {
-						"count": arrayLen(application.wheels.routes),
-						"namedRoutes": []
-					};
-
-					// Extract named routes
-					for (local.route in application.wheels.routes) {
-						if (structKeyExists(local.route, "name") && len(local.route.name)) {
-							arrayAppend(local.projectContext.project.routes.namedRoutes, {
-								"name": local.route.name,
-								"pattern": structKeyExists(local.route, "pattern") ? local.route.pattern : "",
-								"method": structKeyExists(local.route, "methods") ? local.route.methods : "GET"
-							});
-						}
-					}
+			local.internalRoutes = [];
+			local.appRoutes = [];
+			for (local.route in application.wheels.routes) {
+				if (
+					(structKeyExists(local.route, "controller") && local.route.controller == "wheels.public")
+					|| (structKeyExists(local.route, "pattern") && local.route.pattern == "/wheels/app/tests")
+					|| (structKeyExists(local.route, "pattern") && left(local.route.pattern, 9) == "/_browser")
+				) {
+					arrayAppend(local.internalRoutes, local.route);
+				} else {
+					arrayAppend(local.appRoutes, local.route);
 				}
 			}
+			local.projectContext.project.routes = {
+				"app": local.appRoutes,
+				"internal": local.internalRoutes,
+				"total": arrayLen(local.appRoutes) + arrayLen(local.internalRoutes)
+			};
 		} catch (any e) {
 			// Fallback on error
 			local.projectContext.project.routes = {"error": e.message};
 		}
 
-		// Get detailed plugins from plugins endpoint
+		// Get plugins in-process from the application scope (formerly a
+		// loopback HTTP self-request to /wheels/plugins?format=json). Shape
+		// matches the plugins view's JSON branch.
 		try {
-			local.http = new http();
-			local.http.setMethod("GET");
-			local.http.setUrl("http://localhost:#cgi.server_port#/wheels/plugins?format=json");
-			local.result = local.http.send().getPrefix();
-
-			if (local.result.statusCode == "200 OK") {
-				local.pluginsData = deserializeJSON(local.result.fileContent);
-				local.projectContext.project.plugins = local.pluginsData.plugins;
-			} else {
-				// Fallback to basic plugin list
-				local.projectContext.project.plugins = [];
-				if (structKeyExists(application.wheels, "plugins")) {
-					for (local.plugin in application.wheels.plugins) {
-						arrayAppend(local.projectContext.project.plugins, local.plugin);
-					}
-				}
-			}
+			local.loadedPlugins = structKeyExists(application.wheels, "plugins") ? application.wheels.plugins : {};
+			local.projectContext.project.plugins = {
+				"enabled": structKeyExists(application.wheels, "enablePluginsComponent") ? application.wheels.enablePluginsComponent : false,
+				"loaded": local.loadedPlugins,
+				"count": structCount(local.loadedPlugins)
+			};
 		} catch (any e) {
 			local.projectContext.project.plugins = {"error": e.message};
 		}
 
-		// Get detailed migration status from migrator endpoint
+		// Get detailed migration status in-process from the migrator (formerly
+		// a loopback HTTP self-request to /wheels/migrator?format=json). Shape
+		// matches the migrator view's JSON branch.
 		try {
-			local.http = new http();
-			local.http.setMethod("GET");
-			local.http.setUrl("http://localhost:#cgi.server_port#/wheels/migrator?format=json");
-			local.result = local.http.send().getPrefix();
-
-			if (local.result.statusCode == "200 OK") {
-				local.migratorData = deserializeJSON(local.result.fileContent);
-				local.projectContext.project.migrations = local.migratorData.migrator;
-			} else {
-				// Keep the basic migrations info
-				local.projectContext.project.migrations = {
-					"count": arrayLen(local.migrations),
-					"files": local.migrations
-				};
+			local.availableMigrations = application.wheels.migrator.getAvailableMigrations();
+			local.migratedCount = 0;
+			for (local.mig in local.availableMigrations) {
+				if (structKeyExists(local.mig, "status") && local.mig.status == "migrated") {
+					local.migratedCount++;
+				}
+			}
+			local.projectContext.project.migrations = {
+				"datasourceAvailable": true,
+				"currentVersion": application.wheels.migrator.getCurrentMigrationVersion(),
+				"migrations": local.availableMigrations,
+				"migrationsCount": arrayLen(local.availableMigrations),
+				"migratedCount": local.migratedCount,
+				"pendingCount": arrayLen(local.availableMigrations) - local.migratedCount
+			};
+			if (arrayLen(local.availableMigrations)) {
+				local.projectContext.project.migrations.latestVersion = local.availableMigrations[arrayLen(local.availableMigrations)]["version"];
 			}
 		} catch (any e) {
 			// Keep basic info on error
@@ -693,80 +721,33 @@ function analyzeProjectConventions(models, controllers) {
 	return local.conventions;
 }
 
-// Handler function for info mode
+// Handler function for info mode.
+// These mode handlers used to issue loopback HTTP self-requests to the
+// corresponding /wheels/* endpoints, dispatching a full second framework
+// request per call (two servlet threads, broken under https-only or a
+// non-root context path). Each target view already emits JSON and aborts
+// when format=json, so include it directly instead.
 function handleInfo() {
-	// Fetch system info from the info endpoint
-	local.http = new http();
-	local.http.setMethod("GET");
-	local.http.setUrl("http://localhost:#cgi.server_port#/wheels/info?format=json");
-	local.result = local.http.send().getPrefix();
-
-	if (local.result.statusCode == "200 OK") {
-		writeOutput(local.result.fileContent);
-	} else {
-		writeOutput(serializeJSON({
-			"error": true,
-			"message": "Failed to fetch system info",
-			"statusCode": local.result.statusCode
-		}));
-	}
+	request.wheels.params.format = "json";
+	include "/wheels/public/views/info.cfm";
 }
 
 // Handler function for routes mode
 function handleRoutes() {
-	// Fetch routes from the routes endpoint
-	local.http = new http();
-	local.http.setMethod("GET");
-	local.http.setUrl("http://localhost:#cgi.server_port#/wheels/routes?format=json");
-	local.result = local.http.send().getPrefix();
-
-	if (local.result.statusCode == "200 OK") {
-		writeOutput(local.result.fileContent);
-	} else {
-		writeOutput(serializeJSON({
-			"error": true,
-			"message": "Failed to fetch routes",
-			"statusCode": local.result.statusCode
-		}));
-	}
+	request.wheels.params.format = "json";
+	include "/wheels/public/views/routes.cfm";
 }
 
 // Handler function for migrations mode
 function handleMigrations() {
-	// Fetch migrations from the migrator endpoint
-	local.http = new http();
-	local.http.setMethod("GET");
-	local.http.setUrl("http://localhost:#cgi.server_port#/wheels/migrator?format=json");
-	local.result = local.http.send().getPrefix();
-
-	if (local.result.statusCode == "200 OK") {
-		writeOutput(local.result.fileContent);
-	} else {
-		writeOutput(serializeJSON({
-			"error": true,
-			"message": "Failed to fetch migrations",
-			"statusCode": local.result.statusCode
-		}));
-	}
+	request.wheels.params.format = "json";
+	include "/wheels/public/views/migrator.cfm";
 }
 
 // Handler function for plugins mode
 function handlePlugins() {
-	// Fetch plugins from the plugins endpoint
-	local.http = new http();
-	local.http.setMethod("GET");
-	local.http.setUrl("http://localhost:#cgi.server_port#/wheels/plugins?format=json");
-	local.result = local.http.send().getPrefix();
-
-	if (local.result.statusCode == "200 OK") {
-		writeOutput(local.result.fileContent);
-	} else {
-		writeOutput(serializeJSON({
-			"error": true,
-			"message": "Failed to fetch plugins",
-			"statusCode": local.result.statusCode
-		}));
-	}
+	request.wheels.params.format = "json";
+	include "/wheels/public/views/plugins.cfm";
 }
 
 // Security-focused documentation

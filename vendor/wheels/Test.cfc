@@ -1,6 +1,5 @@
 component output="false" displayName="Test" extends="wheels.Global"{
 
-	property name="Mixins" inject="id:Plugins";
 
 	function init(){
 		return this;
@@ -190,7 +189,7 @@ component output="false" displayName="Test" extends="wheels.Global"{
 			run() interprets exception with this errorcode as a "Failure".
 			All other errorcodes cause are interpreted as an "Error".
 		*/
-		Throw(errorcode = "__FAIL__", message = "#HtmlEditFormat(message)#");
+		Throw(errorcode = "__FAIL__", message = "#$encodeForDisplayText(message)#");
 	}
 
 	/**
@@ -332,7 +331,7 @@ component output="false" displayName="Test" extends="wheels.Global"{
 				} catch (any e) {
 					message = e.message;
 
-					if (e.ErrorCode eq "__FAIL__") {
+					if (StructKeyExists(e, "errorCode") && e.errorCode eq "__FAIL__") {
 						/*
 							fail() throws __FAIL__ exception
 						*/
@@ -342,34 +341,17 @@ component output="false" displayName="Test" extends="wheels.Global"{
 						numTestFailures = numTestFailures + 1;
 					} else {
 						/*
-							another exception thrown
+							another exception thrown. Message assembly lives in
+							$testErrorMessage so the catch body only ever reads
+							the exception object — on Lucee 7 the pre-existing
+							inline chain (which read `message`, `newline`, and an
+							undeclared `template` inside the catch) could throw
+							"variable [MESSAGE] doesn't exist" for some exception
+							shapes, masking the test error with a suite-wide 500
+							(#3458).
 						*/
 						status = "Error";
-						if (ArrayLen(e.tagContext)) {
-							template = "#ListLast(e.tagContext[1].template, "/")#:#e.tagContext[1].line#";
-							tagContext = "<ul>";
-							for (context in e.tagContext) {
-								tagContext = tagContext & '<li>#context.template#:#context.line#</li>';
-							};
-							tagContext = tagContext & "</ul>";
-						} else {
-							template = "";
-							tagContext = "[Unknown tagContext]";
-						}
-
-						if (Len(template)) {
-							message = message & newline & template;
-						}
-						if (StructKeyExists(e, "sql") and Len(e.sql)) {
-							message = message & newline & newline & e.sql;
-						}
-						if (Len(e.extendedInfo)) {
-							message = message & newline & newLine & e.extendedInfo;
-						}
-						message = message & newline & newline & tagContext;
-						if (Len(e.detail)) {
-							message = message & newline & newline & e.detail;
-						}
+						message = $testErrorMessage(e);
 						request[resultkey].ok = false;
 						request[resultkey].numErrors = request[resultkey].numErrors + 1;
 						numTestErrors = numTestErrors + 1;
@@ -418,6 +400,55 @@ component output="false" displayName="Test" extends="wheels.Global"{
 		request[resultkey].end = Now();
 
 		return numTestErrors eq 0;
+	}
+
+	/**
+	 * Builds the recorded message for a test error from a cfcatch object.
+	 * Kept as a separate public helper (cross-engine invariant #7) so the
+	 * catch block in $runTest never reads function-scoped locals — on Lucee 7
+	 * reading a var-declared local inside a catch can fail with
+	 * "variable [MESSAGE] doesn't exist" for certain exception shapes, which
+	 * turned a single failing test into a suite-wide 500 (#3458).
+	 *
+	 * Every field read is guarded with StructKeyExists: native (Java)
+	 * exceptions wrapped by the engine do not carry the full cfcatch shape.
+	 *
+	 * @e The cfcatch object describing the error.
+	 */
+	public string function $testErrorMessage(required any e) {
+		var newline = Chr(10) & Chr(13);
+		var rv = "";
+		if (StructKeyExists(arguments.e, "message") && !IsNull(arguments.e.message) && Len(arguments.e.message)) {
+			rv = arguments.e.message;
+		}
+
+		var template = "";
+		var tagContext = "";
+		if (StructKeyExists(arguments.e, "tagContext") && IsArray(arguments.e.tagContext) && ArrayLen(arguments.e.tagContext)) {
+			template = "#ListLast(arguments.e.tagContext[1].template, "/")#:#arguments.e.tagContext[1].line#";
+			tagContext = "<ul>";
+			for (var context in arguments.e.tagContext) {
+				tagContext = tagContext & '<li>#context.template#:#context.line#</li>';
+			}
+			tagContext = tagContext & "</ul>";
+		} else {
+			tagContext = "[Unknown tagContext]";
+		}
+
+		if (Len(template)) {
+			rv = rv & newline & template;
+		}
+		if (StructKeyExists(arguments.e, "sql") && Len(arguments.e.sql)) {
+			rv = rv & newline & newline & arguments.e.sql;
+		}
+		if (StructKeyExists(arguments.e, "extendedInfo") && Len(arguments.e.extendedInfo)) {
+			rv = rv & newline & newline & arguments.e.extendedInfo;
+		}
+		rv = rv & newline & newline & tagContext;
+		if (StructKeyExists(arguments.e, "detail") && Len(arguments.e.detail)) {
+			rv = rv & newline & newline & arguments.e.detail;
+		}
+		return rv;
 	}
 
 	/*
@@ -485,6 +516,11 @@ component output="false" displayName="Test" extends="wheels.Global"{
 		// the key in the request scope that will contain the test results
 		local.resultKey = "WheelsTests";
 
+		// Flag this request as a test harness run so framework internals
+		// (e.g. flash cookie writes) can short-circuit operations that are
+		// unsafe after the response buffer auto-commits mid-suite.
+		request.$wheelsTestRun = true;
+
 		// save the original environment for overloading
 		if (application.wheels.restoreTestRunnerApplicationScope) {
 			request.wheels.testRunnerApplicationScope = Duplicate(application.wheels);
@@ -507,7 +543,7 @@ component output="false" displayName="Test" extends="wheels.Global"{
 		local.i = 0;
 		for (local.row in local.packages) {
 			local.i++;
-			local.instance = application.wirebox.getInstance(name = "#local.row.package#");
+			local.instance = application.wheelsdi.getInstance(name = "#local.row.package#");
 			// is there a better way to check for existence of a function?
 			// if the beforeall method is present, run it once only per request
 			if (StructKeyExists(local.instance, "beforeAll") && local.i eq 1) {
@@ -700,6 +736,9 @@ component output="false" displayName="Test" extends="wheels.Global"{
 				if (StructKeyExists(arguments.options, "skip") && local.packageName contains arguments.options.skip) {
 					local.useTest = false;
 				}
+				if (StructKeyExists(arguments.options, "filter") && !FindNoCase(arguments.options.filter, local.packageName)) {
+					local.useTest = false;
+				}
 				if (local.useTest) {
 					QueryAddRow(local.rv);
 					QuerySetCell(local.rv, "package", local.packageName);
@@ -752,8 +791,19 @@ component output="false" displayName="Test" extends="wheels.Global"{
 						if(arrayLen(local.args) == 2){
 							return invoke(variables, local.functionName[1], variables[local.args[2]]);
 						} else {
-							// Use the Evaluate function to run Built-in functions
-							return Evaluate("expression");
+							// Built-in functions. No portable call exists here:
+							// BoxLang has no Evaluate() BIF at all (verified absent
+							// on 1.11.0 — "The method Evaluate does not exist"), and
+							// getBoxRuntime() exists only on BoxLang. executeStatement()
+							// is the faithful equivalent — like Evaluate it takes the
+							// whole expression string, so neither branch has to
+							// re-parse the argument list. Function calls resolve at
+							// runtime, so the BoxLang-only name never has to compile
+							// on Lucee or Adobe (#3302).
+							if (StructKeyExists(server, "boxlang")) {
+								return getBoxRuntime().executeStatement(arguments.expression);
+							}
+							return Evaluate(arguments.expression);
 						}
 					}
 				}
@@ -792,7 +842,15 @@ component output="false" displayName="Test" extends="wheels.Global"{
 		if (structKeyExists(server, "boxlang")) {
 			variables.this = this;
 		}
-		Mixins.$initializeMixins(variables);
+		new wheels.Plugins().$initializeMixins(variables);
+		// Legacy RocketUnit base — warn once per application instance (deduped
+		// per feature by $deprecated). Removal is planned for Wheels 5.0; see
+		// docs/releases/wheels-5-roadmap.md §5.4.
+		$deprecated(
+			feature = "rocketunit-test-base",
+			message = "wheels.Test (RocketUnit) is deprecated and will be removed in Wheels 5.0. Migrate test components to extend=""wheels.WheelsTest"" and use the BDD syntax (describe/it/expect).",
+			docUrl = "https://guides.wheels.dev/v4-0-0/testing/"
+		);
 	}
 
 }

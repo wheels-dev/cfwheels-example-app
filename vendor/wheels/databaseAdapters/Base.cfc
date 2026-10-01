@@ -17,21 +17,9 @@ component output=false extends="wheels.Global"{
 		local.sqlArray = args.sql;
 		local.sqlLen   = arrayLen(sqlArray);
 
-		// Detect datasource info once
-		local.ds = args.queryAttributes;
-		local.dsInfo = ( structKeyExists(ds, "DATASOURCE") && len(ds.DATASOURCE) )
-			? $dbinfo(type="version", datasource=ds.DATASOURCE)
-			: $dbinfo(
-				type     = "version",
-				datasource = application.wheels.dataSourceName,
-				username   = application.wheels.dataSourceUserName,
-				password   = application.wheels.dataSourcePassword
-			);
-
 		// Build query
 		cfquery(attributeCollection = args.queryAttributes) {
 			local.pos = 1;
-			local.prev = "";
 
 			for (; pos <= sqlLen; pos++) {
 				local.part = sqlArray[pos];
@@ -39,22 +27,30 @@ component output=false extends="wheels.Global"{
 				if (isStruct(part)) {
 					local.qp = $queryParams(part);
 
-					// Handle NULL for "IS NULL" or "IS NOT NULL"
-					if (
-						!isBinary(part.value) &&
-						part.value == "null" &&
-						pos > 1 &&
-						( right(prev, 2) == "IS" || right(prev, 6) == "IS NOT" )
-					) {
+					// A missing value (unquoted NULL keyword after IS / IS NOT,
+					// cfqueryparam null=true, or a CFML/Java null) renders as the
+					// inline SQL NULL literal — never as a bound parameter.
+					// PostgreSQL, CockroachDB, and SQL Server all reject a bound
+					// parameter in `IS $1` position ("syntax error at or near
+					// "$1""), and `= $1` with a NULL parameter silently matches
+					// nothing on most engines. The quoted literal 'null' is a
+					// different thing: it has qp.null=false and stays a bound
+					// string parameter in the normal branch below.
+					if (structKeyExists(qp, "null") && qp.null) {
 						writeOutput("NULL");
-					}
-					// Handle parameter lists "(?,?,?)"
-					else if (structKeyExists(qp, "list")) {
+					} else if (structKeyExists(qp, "list")) {
 						writeOutput("(");
 						if (args.parameterize) {
 							cfqueryParam(attributeCollection = qp);
 						} else {
-							writeOutput("(" & preserveSingleQuotes(part.value) & ")");
+							// No inner parentheses here — the outer pair above / below
+							// already wraps the list ("IN ((1,2,3))" is a row-constructor
+							// syntax error on every supported database).
+							// Adobe CF only accepts a simple variable as preserveSingleQuotes'
+							// argument ("Complex constructs are not supported"), so hoist the
+							// restored list into a local before passing it.
+							local.restoredList = $restoreMaskedInStatement(part.value);
+							writeOutput(preserveSingleQuotes(local.restoredList));
 						}
 						writeOutput(")");
 					}
@@ -74,23 +70,11 @@ component output=false extends="wheels.Global"{
 				}
 
 				writeOutput(newLine);
-				prev = part;
 			}
 
 			// LIMIT / OFFSET logic
 			if (args.limit) {
-				if (findNoCase("Oracle", dsInfo.database_productname)) {
-					if (args.offset) {
-						writeOutput("OFFSET " & args.offset & " ROWS" & newLine & "FETCH NEXT " & args.limit & " ROWS ONLY");
-					} else {
-						writeOutput("FETCH FIRST " & args.limit & " ROWS ONLY");
-					}
-				} else {
-					writeOutput("LIMIT " & args.limit);
-					if (args.offset) {
-						writeOutput(newLine & "OFFSET " & args.offset);
-					}
-				}
+				writeOutput($limitOffsetClause(limit = args.limit, offset = args.offset));
 			}
 
 			// Comment block
@@ -104,14 +88,27 @@ component output=false extends="wheels.Global"{
 			wheels.rv.query = local[args.debugName];
 		}
 
+		// No `result` attribute was requested ($performQuery's $captureResult=false,
+		// the bulk paths): there is no result metadata to return and no generated
+		// key to look up.
+		if (!structKeyExists(wheels, "result")) {
+			wheels.rv.result = {};
+			return wheels.rv;
+		}
+
 		// Manual identity retrieval for Lucee / ACF
+		// Pass the query result (if any) as returningIdentity — needed by adapters
+		// that use RETURNING clauses (e.g. CockroachDB) to retrieve generated keys.
 		wheels.id = $identitySelect(
-			primaryKey      = args.primaryKey,
-			queryAttributes = args.queryAttributes,
-			result          = wheels.result
+			primaryKey         = args.primaryKey,
+			queryAttributes    = args.queryAttributes,
+			result             = wheels.result,
+			returningIdentity  = structKeyExists(local, args.debugName) ? local[args.debugName] : ""
 		);
 
 		if (structKeyExists(wheels,"id") && isStruct(wheels.id) && !structIsEmpty(wheels.id)) {
+			// BoxLang-safe: ensure modifiable
+			wheels.result = duplicate(wheels.result);
 			structAppend(wheels.result, wheels.id);
 		}
 
@@ -126,7 +123,48 @@ component output=false extends="wheels.Global"{
 		variables.dataSource = arguments.dataSource;
 		variables.username = arguments.username;
 		variables.password = arguments.password;
+		variables.$sharedModel = false;
 		return this;
+	}
+
+	/**
+	 * Mark this adapter's model as shared (immune to tenant datasource overrides).
+	 * Shared models always use the default application datasource.
+	 *
+	 * [section: Model Configuration]
+	 * [category: Multi-Tenancy]
+	 */
+	public void function $setSharedModel(required boolean flag) {
+		variables.$sharedModel = arguments.flag;
+	}
+
+	/**
+	 * Internal function.
+	 *
+	 * The datasource a query with this `dataSource` argument actually runs against. Multi-tenant
+	 * override: when a tenant is active and this model is not shared, a query on the model's
+	 * default datasource is routed to the tenant's datasource. $performQuery() uses this, and the
+	 * per-request query cache keys on it, so both always agree on the datasource (#3844).
+	 */
+	public string function $effectiveDataSource(string dataSource = variables.dataSource) {
+		// Use IsDefined() for safe nested scope traversal — StructKeyExists on
+		// the request scope can throw during app startup when request.wheels is absent.
+		if (
+			!variables.$sharedModel
+			&& arguments.dataSource == variables.dataSource
+			&& IsDefined("request.wheels.tenant.dataSource")
+			&& Len(request.wheels.tenant.dataSource)
+		) {
+			return request.wheels.tenant.dataSource;
+		}
+		return arguments.dataSource;
+	}
+
+	/**
+	 * Returns whether this adapter's model is shared.
+	 */
+	public boolean function $isSharedModel() {
+		return variables.$sharedModel;
 	}
 
 	/**
@@ -138,34 +176,126 @@ component output=false extends="wheels.Global"{
 	}
 
 	/**
+	 * Reports whether the current CFML engine is BoxLang. Centralized here so
+	 * the adapters' engine-conditional branches (column-list parsing, identity
+	 * retrieval) share one probe — and so test doubles can override it without
+	 * application state ($engineAdapter() requires an initialized app).
+	 */
+	public boolean function $isBoxLangEngine() {
+		return StructKeyExists(server, "boxlang");
+	}
+
+	/**
+	 * Extract the column list from a rendered INSERT statement (the names
+	 * between the first parenthesis pair), normalized to a plain comma list:
+	 * whitespace and newlines removed, identifier quotes stripped.
+	 * Returns an empty string when no complete parenthesis pair is found.
+	 */
+	public string function $parseInsertColumnList(required string sql) {
+		local.startPar = Find("(", arguments.sql) + 1;
+		local.endPar = Find(")", arguments.sql);
+		local.columnList = "";
+		if (local.startPar > 1 && local.endPar > local.startPar) {
+			local.rawColumns = Mid(arguments.sql, local.startPar, (local.endPar - local.startPar));
+			// One implementation for every engine. This used to fork on
+			// $isBoxLangEngine(), with the ReplaceList form kept for Lucee/Adobe —
+			// but BoxLang's ReplaceList drops the comma delimiters themselves, so
+			// "id,name,age" came back as "idnameage" on any code path that reached
+			// that branch on BoxLang. BaseProbe hard-codes $isBoxLangEngine() to
+			// false, so the unit spec drove exactly that branch on the boxlang legs
+			// and failed on all five databases (#3302) while the sibling spec — which
+			// sets boxlangMode=true — passed. Collapsing the fork removes both the
+			// engine-dependent behaviour and the test-double trap.
+			//
+			// The regex form is also the more correct of the two: ReplaceList
+			// stripped every space, mangling quoted identifiers that legitimately
+			// contain one (e.g. `[order date]`), whereas \s*,\s* only collapses
+			// whitespace adjacent to the delimiters.
+			local.columnList = REReplace(local.rawColumns, "\s*,\s*", ",", "all");
+			local.columnList = REReplace(local.columnList, "[\r\n]", "", "all");
+			local.columnList = Trim(local.columnList);
+		}
+		// Strip identifier quotes from the column list for comparison.
+		return $stripIdentifierQuotes(local.columnList);
+	}
+
+	/**
 	 * Called after a query has executed.
 	 * If the query was an INSERT and the generated auto-incrementing primary key is not in the result we get it manually.
 	 * If the primary key was part of the INSERT (i.e. it wasn't auto-incrementing) we don't need to check it though.
 	 * This process is typically needed on non-supported databases (example: H2) and drivers (example: jTDS).
 	 * We return void or a struct containing the key name / value.
+	 *
+	 * Template method: the shared INSERT / already-present-key / bulk-path /
+	 * key-in-column-list guards live here; the engine-specific retrieval is
+	 * delegated to the $lastIdLookup hook each adapter overrides.
 	 */
 	public any function $identitySelect(
 		required struct queryAttributes,
 		required struct result,
-		required string primaryKey
+		required string primaryKey,
+		any returningIdentity = ""
 	) {
-		local.query = {};
 		local.sql = Trim(arguments.result.sql);
-		if (Left(local.sql, 11) == "INSERT INTO" && !StructKeyExists(arguments.result, $generatedKey())) {
-			local.startPar = Find("(", local.sql) + 1;
-			local.endPar = Find(")", local.sql);
-			local.columnList = ReplaceList(
-				Mid(local.sql, local.startPar, (local.endPar - local.startPar)),
-				"#Chr(10)#,#Chr(13)#, ",
-				",,"
-			);
-			if (!ListFindNoCase(local.columnList, ListFirst(arguments.primaryKey))) {
-				local.rv = {};
-				query = $query(sql = "SELECT LAST_INSERT_ID() AS lastId", argumentCollection = arguments.queryAttributes);
-				local.rv[$generatedKey()] = query.lastId;
-				return local.rv;
-			}
+		if (Left(local.sql, 11) != "INSERT INTO" || StructKeyExists(arguments.result, $generatedKey())) {
+			return;
 		}
+
+		// Bulk operations (insertAll / upsertAll) invoke the shared query path
+		// without a primary-key hint, because the caller does not consume a
+		// generated key. Skip the lookup entirely in that case — it would be a
+		// wasted round-trip at best, and on PostgreSQL it would emit
+		// `pg_get_serial_sequence(..., '')`, which Postgres rejects with
+		// `column "" of relation "..." does not exist`.
+		if (!Len(arguments.primaryKey)) {
+			return;
+		}
+
+		// If the primary key was part of the INSERT it wasn't auto-generated.
+		if (ListFindNoCase($parseInsertColumnList(local.sql), ListFirst(arguments.primaryKey))) {
+			return;
+		}
+
+		// Hook contract: return a simple value (possibly empty) to publish it
+		// under $generatedKey(); return nothing to publish nothing.
+		local.id = $lastIdLookup(
+			queryAttributes = arguments.queryAttributes,
+			result = arguments.result,
+			primaryKey = arguments.primaryKey,
+			returningIdentity = arguments.returningIdentity,
+			insertSql = local.sql
+		);
+		if (!StructKeyExists(local, "id")) {
+			return;
+		}
+		local.rv = {};
+		local.rv[$generatedKey()] = local.id;
+		return local.rv;
+	}
+
+	/**
+	 * Engine-specific hook used by the $identitySelect template to retrieve the
+	 * generated key after an INSERT. Adapters override this with their own
+	 * retrieval strategy (sequence CURRVAL, same-batch resultset, driver key…).
+	 *
+	 * Contract: return a simple value (possibly empty) to publish it under
+	 * $generatedKey(); return nothing (void) to publish nothing.
+	 *
+	 * @queryAttributes Struct of cfquery attributes (datasource etc.) for follow-up queries.
+	 * @result The cfquery result struct from the INSERT.
+	 * @primaryKey Primary key column name(s).
+	 * @returningIdentity Resultset produced by the INSERT's own batch, when one exists.
+	 * @insertSql The trimmed SQL of the executed INSERT statement.
+	 */
+	public any function $lastIdLookup(
+		required struct queryAttributes,
+		required struct result,
+		required string primaryKey,
+		any returningIdentity = "",
+		required string insertSql
+	) {
+		local.query = $query(sql = "SELECT LAST_INSERT_ID() AS lastId", argumentCollection = arguments.queryAttributes);
+		return local.query.lastId;
 	}
 
 	/**
@@ -182,6 +312,23 @@ component output=false extends="wheels.Global"{
 	 */
 	public string function $defaultValues() {
 		return " DEFAULT VALUES";
+	}
+
+	/**
+	 * Quote a database identifier (table or column name) using the adapter's quoting character.
+	 * Base implementation is a no-op; individual adapters override with their specific quoting.
+	 * This prevents reserved word conflicts across all supported databases.
+	 */
+	public string function $quoteIdentifier(required string name) {
+		return arguments.name;
+	}
+
+	/**
+	 * Strip all identifier quote characters from a string.
+	 * Used when parsing rendered SQL to compare column names without quoting artifacts.
+	 */
+	public string function $stripIdentifierQuotes(required string str) {
+		return ReReplace(arguments.str, '`|\[|\]|"', "", "all");
 	}
 
 	/**
@@ -311,6 +458,32 @@ component output=false extends="wheels.Global"{
 		local.args.username = variables.username;
 		local.args.password = variables.password;
 		local.args.table = arguments.tableName;
+
+		// Column metadata is a JDBC catalog round-trip (cfdbinfo type="columns")
+		// fetched once per model class. On remote / wide-schema databases that
+		// round-trip dominates first-request latency, and it is otherwise re-paid
+		// on every reload and for every model sharing a table. When
+		// cacheDatabaseSchema is on, memoize the result per datasource+table in
+		// application.wheels.schemaColumnCache. A reload rebuilds the application
+		// scope, so schema changes are still picked up on reload — the same
+		// contract as the model and controller config caches. The cache lives
+		// OUTSIDE application.wheels.cache.* on purpose: those categories hold
+		// {value, expiresAt} envelopes walked by the time-based cull, which would
+		// throw on a raw query. The read mirrors $getFromCache (try/catch +
+		// Duplicate) so a concurrent struct read can't surface a partial value and
+		// a caller can't mutate the cached query in place. (perf)
+		local.cacheSchema = $get("cacheDatabaseSchema");
+		if (local.cacheSchema) {
+			local.cacheKey = Hash(variables.dataSource & Chr(31) & arguments.tableName);
+			try {
+				if (StructKeyExists(application.wheels.schemaColumnCache, local.cacheKey)) {
+					return Duplicate(application.wheels.schemaColumnCache[local.cacheKey]);
+				}
+			} catch (any e) {
+				// fall through to a fresh catalog lookup on any concurrent-read hiccup
+			}
+		}
+
 		if ($get("showErrorInformation")) {
 			try {
 				local.rv = $getColumnInfo(argumentCollection = local.args);
@@ -323,6 +496,14 @@ component output=false extends="wheels.Global"{
 			}
 		} else {
 			local.rv = $getColumnInfo(argumentCollection = local.args);
+		}
+
+		if (local.cacheSchema) {
+			// Store an isolated copy so the cached entry can never be mutated via a
+			// reference handed to an earlier caller.
+			lock name="wheels.schemaColumnCache" type="exclusive" timeout="10" {
+				application.wheels.schemaColumnCache[local.cacheKey] = Duplicate(local.rv);
+			}
 		}
 		return local.rv;
 	}
@@ -370,6 +551,65 @@ component output=false extends="wheels.Global"{
 	}
 
 	/**
+	 * Decode a value that $maskWhereLiterals masked (GHSA-96rm). A masked
+	 * literal's content is a sentinel prefix plus the hex of the original
+	 * value; only a sentinel-prefixed value is decoded, so text that merely
+	 * looks like hex is never treated as a masked value. The sentinel must
+	 * match wheels.Model::$whereLiteralSentinel().
+	 */
+	public string function $unmaskParameterValue(required string value) {
+		local.sentinel = Chr(2) & "wmask" & Chr(2);
+		local.slen = Len(local.sentinel);
+		if (Len(arguments.value) >= local.slen && Left(arguments.value, local.slen) == local.sentinel) {
+			local.hex = Mid(arguments.value, local.slen + 1, Len(arguments.value) - local.slen);
+			if (!Len(local.hex)) {
+				return "";
+			}
+			return CharsetEncode(BinaryDecode(local.hex, "hex"), "utf-8");
+		}
+		return arguments.value;
+	}
+
+	/**
+	 * Restore every masked literal in a piece of SQL to an escaped SQL literal
+	 * (GHSA-96rm), for the parameterize=false path where a masked IN list would
+	 * otherwise be written to the SQL verbatim. Mirrors
+	 * wheels.Model::$restoreMaskedLiterals; the sentinel must match
+	 * $whereLiteralSentinel().
+	 */
+	public string function $restoreMaskedInStatement(required string statement) {
+		local.marker = "'" & Chr(2) & "wmask" & Chr(2);
+		if (Find(local.marker, arguments.statement) == 0) {
+			return arguments.statement;
+		}
+		local.mlen = Len(local.marker);
+		local.out = CreateObject("java", "java.lang.StringBuilder").init();
+		local.n = Len(arguments.statement);
+		local.pos = 1;
+		while (local.pos <= local.n) {
+			local.idx = Find(local.marker, arguments.statement, local.pos);
+			if (local.idx == 0) {
+				local.out.append(Mid(arguments.statement, local.pos, local.n - local.pos + 1));
+				break;
+			}
+			local.out.append(Mid(arguments.statement, local.pos, local.idx - local.pos));
+			local.hexStart = local.idx + local.mlen;
+			local.closeIdx = Find("'", arguments.statement, local.hexStart);
+			if (local.closeIdx == 0) {
+				local.out.append(Mid(arguments.statement, local.idx, local.n - local.idx + 1));
+				break;
+			}
+			local.hex = Mid(arguments.statement, local.hexStart, local.closeIdx - local.hexStart);
+			local.value = Len(local.hex) ? CharsetEncode(BinaryDecode(local.hex, "hex"), "utf-8") : "";
+			local.out.append("'");
+			local.out.append(Replace(local.value, "'", "''", "all"));
+			local.out.append("'");
+			local.pos = local.closeIdx + 1;
+		}
+		return local.out.toString();
+	}
+
+	/**
 	 * Internal function.
 	 */
 	public string function $cleanInStatementValue(required string statement) {
@@ -381,14 +621,29 @@ component output=false extends="wheels.Global"{
 			local.rv = Reverse(RemoveChars(Reverse(local.rv), 1, 1));
 			local.rv = Replace(local.rv, "''", "'", "all");
 		}
-		return ReplaceNoCase(local.rv, local.delim, Chr(7), "all");
+		local.joined = ReplaceNoCase(local.rv, local.delim, Chr(7), "all");
+		// Decode each masked element back to its original value (GHSA-96rm).
+		local.parts = ListToArray(local.joined, Chr(7), true);
+		local.iEnd = ArrayLen(local.parts);
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			local.parts[local.i] = $unmaskParameterValue(local.parts[local.i]);
+		}
+		return ArrayToList(local.parts, Chr(7));
 	}
 
 	/**
 	 * Internal function.
 	 */
 	public struct function $queryParams(required struct settings) {
-		if (!StructKeyExists(arguments.settings, "value")) {
+		local.hasValue = StructKeyExists(arguments.settings, "value");
+		// Adobe CF's IsNull() misreports dotted-path arguments that hold the
+		// string "Null" as null (value-dependent quirk — the same string via a
+		// plain variable, bracket access, ToString, or Duplicate reads NO).
+		// Guard with IsSimpleValue() first: a real CFML/Java null is never a
+		// simple value, and the string "Null" always is, so the short-circuit
+		// keeps the check form- and engine-independent.
+		local.valueIsNull = local.hasValue && !IsSimpleValue(arguments.settings.value) && IsNull(arguments.settings.value);
+		if (!local.hasValue && !(StructKeyExists(arguments.settings, "null") && arguments.settings.null)) {
 			Throw(
 				type = "Wheels.QueryParamValue",
 				message = "The value for `cfqueryparam` cannot be determined for property `#arguments.settings.property#`.<br>This usually happens due to a syntax error in the WHERE clause (e.g., using unquoted strings or invalid values).",
@@ -397,9 +652,17 @@ component output=false extends="wheels.Global"{
 		}
 		local.rv = {};
 		local.rv.cfsqltype = arguments.settings.type;
-		local.rv.value = arguments.settings.value;
-		if (StructKeyExists(arguments.settings, "null")) {
-			local.rv.null = arguments.settings.null;
+		if (local.valueIsNull || (StructKeyExists(arguments.settings, "null") && arguments.settings.null)) {
+			// CFML/Java null and an explicit SQL-NULL flag bind as SQL NULL.
+			// Do not pass the strings "null" / "[NULL]" as the typed value —
+			// integer cfqueryparam cannot cast them.
+			local.rv.null = true;
+			local.rv.value = "";
+		} else {
+			local.rv.value = arguments.settings.value;
+			if (StructKeyExists(arguments.settings, "null")) {
+				local.rv.null = arguments.settings.null;
+			}
 		}
 		if (StructKeyExists(arguments.settings, "scale") && arguments.settings.scale > 0) {
 			local.rv.scale = arguments.settings.scale;
@@ -428,17 +691,182 @@ component output=false extends="wheels.Global"{
 
 	/**
 	 * Internal function.
+	 *
+	 * For integer/float/boolean columns this returns the value unquoted so the
+	 * downstream WHERE-clause regex can re-extract bare numerics into
+	 * cfqueryparam placeholders. That contract is unsafe by itself — a string
+	 * like "0 OR 1=1" would land verbatim in the SQL — so we validate the value
+	 * shape here before passing it through. This closes SQL injection across
+	 * every caller (chainable QueryBuilder, $keyWhereString used by findByKey/
+	 * updateByKey/deleteByKey, dynamic finders findByX/findOneByX/findAllByX,
+	 * the uniqueness-check $buildWhereClausePart, and any future caller).
+	 *
+	 * String columns are unaffected — the adapter still wraps and escapes the
+	 * value, so classic single-quote payloads land harmlessly inside a literal.
 	 */
 	public string function $quoteValue(required string str, string sqlType = "CF_SQL_VARCHAR", string type) {
 		if (!StructKeyExists(arguments, "type")) {
 			arguments.type = $getValidationType(arguments.sqlType);
 		}
-		if (!ListFindNoCase("integer,float,boolean", arguments.type) || !Len(arguments.str)) {
-			local.rv = "'#arguments.str#'";
+		if (
+			!ListFindNoCase("integer,float,boolean", arguments.type)
+			|| !Len(arguments.str)
+			|| (arguments.type == "boolean" && (CompareNoCase(arguments.str, "yes") == 0 || CompareNoCase(arguments.str, "no") == 0))
+		) {
+			local.rv = "'#Replace(arguments.str, "'", "''", "all")#'";
 		} else {
+			$validateValueShape(arguments.str, arguments.type);
 			local.rv = arguments.str;
 		}
 		return local.rv;
+	}
+
+	/**
+	 * Validate that a value matches the shape this adapter expects for its
+	 * declared column type. Throws Wheels.InvalidValue when the shape doesn't
+	 * match — closing the SQL-injection vector through which strings like
+	 * "0 OR 1=1" would otherwise land in the unquoted numeric/boolean path.
+	 *
+	 * Intentionally narrow: only fires for integer/float/boolean columns,
+	 * which is exactly the set of types $quoteValue passes through unquoted.
+	 * String columns are wrapped + escaped above and don't need this check.
+	 */
+	public void function $validateValueShape(required string str, required string type) {
+		switch (arguments.type) {
+			case "integer":
+				if (!ReFind("^-?[0-9]+$", arguments.str) || ReFind("[^0-9-]", arguments.str)) {
+					$throwInvalidValue(arguments.str, "integer");
+				}
+				break;
+			case "float":
+				if (!ReFind("^-?[0-9]+(\.[0-9]+)?$", arguments.str) || ReFind("[^0-9.-]", arguments.str)) {
+					$throwInvalidValue(arguments.str, "float");
+				}
+				break;
+			case "boolean":
+				if (!ListFindNoCase("0,1,true,false,yes,no", arguments.str)) {
+					$throwInvalidValue(arguments.str, "boolean");
+				}
+				break;
+		}
+	}
+
+	public void function $throwUnknownColumnType(required string typeName) {
+		Throw(
+			type = "Wheels.UnknownColumnType",
+			message = "The column type `#arguments.typeName#` is not mapped to a CFML SQL type.",
+			extendedInfo = "Add a case for `#arguments.typeName#` to `$getType()` on this database adapter."
+		);
+	}
+
+	public void function $throwIdentityNotFound() {
+		Throw(
+			type = "Wheels.IdentityNotFound",
+			message = "Could not retrieve the generated identity for this INSERT.",
+			extendedInfo = "The driver-supplied key and the sequence / SCOPE_IDENTITY path both missed. Last-resort MAX(ROWID) and @@IDENTITY have been removed."
+		);
+	}
+
+	public void function $throwInvalidValue(required string str, required string expectedType) {
+		Throw(
+			type = "Wheels.InvalidValue",
+			message = "The value `#EncodeForHTML(arguments.str)#` is not a valid #arguments.expectedType#.",
+			extendedInfo = "Values bound to #arguments.expectedType# columns must be valid #arguments.expectedType# literals so they can be safely interpolated into the WHERE clause. This check protects every Wheels query path against SQL injection through typed-numeric/boolean payloads."
+		);
+	}
+
+	/**
+	 * Acquire a database advisory lock with the given name.
+	 * Advisory locks are application-level locks that don't lock rows or tables.
+	 * Individual database adapters override this with their specific implementation.
+	 *
+	 * @name A unique name identifying the lock.
+	 * @timeout Maximum seconds to wait for the lock.
+	 */
+	public void function $acquireAdvisoryLock(required string name, numeric timeout = 10) {
+		Throw(
+			type = "Wheels.AdvisoryLockNotSupported",
+			message = "Advisory locks are not supported for this database adapter.",
+			extendedInfo = "The #GetMetaData(this).name# adapter does not implement advisory locking. Use a database that supports advisory locks (PostgreSQL, MySQL, or SQL Server) or implement application-level locking."
+		);
+	}
+
+	/**
+	 * Release a previously acquired advisory lock.
+	 * Individual database adapters override this with their specific implementation.
+	 *
+	 * @name The name of the lock to release.
+	 */
+	public void function $releaseAdvisoryLock(required string name) {
+		Throw(
+			type = "Wheels.AdvisoryLockNotSupported",
+			message = "Advisory locks are not supported for this database adapter.",
+			extendedInfo = "The #GetMetaData(this).name# adapter does not implement advisory locking."
+		);
+	}
+
+	/**
+	 * Reports whether this adapter supports standalone advisory locks — i.e.,
+	 * `$acquireAdvisoryLock` / `$releaseAdvisoryLock` can be invoked directly
+	 * (no enclosing transaction or extension setup required) and will succeed.
+	 *
+	 * Adapters that throw `Wheels.AdvisoryLockNotSupported` from the lock
+	 * methods, or that require additional context (transaction wrapper,
+	 * DBMS package setup) should leave this default in place. Adapters that
+	 * accept a direct call override to return `true`. Used by the test suite
+	 * to skip lock specs on adapters where the primitive isn't standalone
+	 * callable; callers in application code can also consult it before
+	 * dispatching to `withAdvisoryLock`.
+	 */
+	public boolean function $supportsAdvisoryLocks() {
+		return false;
+	}
+
+	/**
+	 * Reports whether auto-derived property names should be lowercased.
+	 *
+	 * When a model declares no property() mappings, Wheels derives its
+	 * properties from the database column metadata. Most databases either
+	 * preserve the declared identifier case (SQL Server, MySQL, SQLite) or
+	 * fold unquoted identifiers to lowercase (PostgreSQL, CockroachDB); in
+	 * both cases the reported column name is the correct property name as-is,
+	 * so the default preserves it. Databases that fold unquoted identifiers to
+	 * a non-meaningful UPPERCASE default (Oracle, H2) override this to return
+	 * `true`, so Wheels lowercases the derived property name instead of
+	 * exposing e.g. `FIRSTNAME`.
+	 */
+	public boolean function $lowerCaseColumnNames() {
+		return false;
+	}
+
+	/**
+	 * Returns the SQL clause for pessimistic row locking (e.g., "FOR UPDATE").
+	 * Individual database adapters override this when the default is not appropriate.
+	 */
+	public string function $forUpdateClause() {
+		return "FOR UPDATE";
+	}
+
+	/**
+	 * Returns the SQL clause used to limit (and optionally offset) query results.
+	 * Individual database adapters override this when their dialect differs (e.g. Oracle
+	 * uses OFFSET/FETCH). The adapter type already identifies the database product, so
+	 * no per-query metadata probe is needed to choose the syntax.
+	 */
+	public string function $limitOffsetClause(required numeric limit, required numeric offset) {
+		local.rv = "LIMIT " & arguments.limit;
+		if (arguments.offset) {
+			local.rv &= Chr(13) & Chr(10) & "OFFSET " & arguments.offset;
+		}
+		return local.rv;
+	}
+
+	/**
+	 * Whether this adapter's OFFSET emulation needs the limit clamped to the rows remaining after the
+	 * offset (the query builder runs a COUNT first when it does). Native LIMIT/OFFSET dialects do not.
+	 */
+	public boolean function $offsetNeedsRowCount() {
+		return false;
 	}
 
 	/**
@@ -469,13 +897,23 @@ component output=false extends="wheels.Global"{
 		local.hasGroupBy = false;
 		local.havingPos = 0;
 		local.iEnd = ArrayLen(arguments.args.sql);
+
+		// Cheap GROUP BY scan first — the rewrite below is only needed when a GROUP BY
+		// is present, so skip the per-fragment aggregate regex entirely otherwise.
 		for (local.i = 1; local.i <= local.iEnd; local.i++) {
 			if (IsSimpleValue(arguments.args.sql[local.i]) && Left(arguments.args.sql[local.i], 8) == "GROUP BY") {
 				local.hasGroupBy = true;
 				local.havingPos = local.i + 1;
 			}
+		}
+		if (!local.hasGroupBy) {
+			return;
+		}
+
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
 			if (IsSimpleValue(arguments.args.sql[local.i]) && $isAggregateFunction(arguments.args.sql[local.i])) {
 				local.hasAggregate = true;
+				break;
 			}
 		}
 		if (local.hasGroupBy && local.hasAggregate) {
@@ -516,6 +954,10 @@ component output=false extends="wheels.Global"{
 
 	/**
 	 * Internal function.
+	 *
+	 * @$captureResult Pass `false` when the caller reads neither the cfquery result
+	 * struct nor a generated key (the bulk paths). The `result` attribute is then
+	 * omitted, which is what stops Lucee asking the driver for generated keys.
 	 */
 	public struct function $performQuery(
 		required array sql,
@@ -524,13 +966,24 @@ component output=false extends="wheels.Global"{
 		numeric offset = 0,
 		string dataSource = variables.dataSource,
 		string $primaryKey = "",
-		string $debugName = "query"
+		string $debugName = "query",
+		boolean $captureResult = true
 	) {
+		arguments.dataSource = $effectiveDataSource(arguments.dataSource);
+
 		local.queryAttributes = {};
 		local.queryAttributes.dataSource = arguments.dataSource;
 		local.queryAttributes.username = variables.username;
 		local.queryAttributes.password = variables.password;
-		local.queryAttributes.result = "local.wheels.result";
+		// A `result` attribute is not free: Lucee requests generated keys
+		// (Statement.RETURN_GENERATED_KEYS) for any cfquery that has one, and the
+		// Oracle driver implements that by appending `RETURNING ROWID INTO ?` to every
+		// INSERT. Oracle rejects that after `INSERT ... SELECT`, so insertAll() failed
+		// with ORA-03048 on Lucee (#3653). Callers that read neither the result nor a
+		// key opt out with $captureResult=false.
+		if (arguments.$captureResult) {
+			local.queryAttributes.result = "local.wheels.result";
+		}
 		local.queryAttributes.name = "local." & arguments.$debugName;
 		if (StructKeyExists(local.queryAttributes, "username") && !Len(local.queryAttributes.username)) {
 			StructDelete(local.queryAttributes, "username");
@@ -551,14 +1004,13 @@ component output=false extends="wheels.Global"{
 		}
 
 		// Overloaded arguments are settings for the query.
-		local.orgArgs = Duplicate(arguments);
-		StructDelete(local.orgArgs, "sql");
-		StructDelete(local.orgArgs, "parameterize");
-		StructDelete(local.orgArgs, "$debugName");
-		StructDelete(local.orgArgs, "limit");
-		StructDelete(local.orgArgs, "offset");
-		StructDelete(local.orgArgs, "$primaryKey");
-		StructAppend(local.queryAttributes, local.orgArgs);
+		// Copy only the non-excluded keys by reference — Duplicate(arguments) would
+		// deep-clone the entire SQL fragment array (including param structs) per query.
+		for (local.key in arguments) {
+			if (!ListFindNoCase("sql,parameterize,$debugName,limit,offset,$primaryKey,$captureResult", local.key)) {
+				local.queryAttributes[local.key] = arguments[local.key];
+			}
+		}
 		return $executeQuery(
 			queryAttributes = local.queryAttributes,
 			sql = arguments.sql,
@@ -571,5 +1023,106 @@ component output=false extends="wheels.Global"{
 		);
 	}
 
+	/**
+	 * Generates a multi-row INSERT statement as an array compatible with `$querySetup()`.
+	 * Default shape is `INSERT INTO ... VALUES (?,?), (?,?), ...` (SQL standard table value
+	 * constructor) — used by every adapter except Oracle, which overrides this method to
+	 * emit `INSERT INTO ... SELECT ... FROM dual UNION ALL ...` (see OracleModel).
+	 */
+	public array function $bulkInsertSQL(
+		required string tableName,
+		required array columns,
+		required array validProperties,
+		required array records,
+		required numeric batchStart,
+		required numeric batchEnd,
+		required struct propertyInfo
+	) {
+		local.sql = [];
+
+		local.colList = "";
+		for (local.col in arguments.columns) {
+			if (Len(local.colList)) {
+				local.colList &= ", ";
+			}
+			local.colList &= $quoteIdentifier(local.col);
+		}
+
+		ArrayAppend(local.sql, "INSERT INTO #arguments.tableName# (#local.colList#) VALUES ");
+
+		local.propCount = ArrayLen(arguments.validProperties);
+		for (local.r = arguments.batchStart; local.r <= arguments.batchEnd; local.r++) {
+			if (local.r > arguments.batchStart) {
+				ArrayAppend(local.sql, ", ");
+			}
+			ArrayAppend(local.sql, "(");
+			for (local.p = 1; local.p <= local.propCount; local.p++) {
+				if (local.p > 1) {
+					ArrayAppend(local.sql, ", ");
+				}
+				local.propName = arguments.validProperties[local.p];
+				local.val = StructKeyExists(arguments.records[local.r], local.propName) ? arguments.records[local.r][local.propName] : "";
+				ArrayAppend(local.sql, $buildBulkParam(
+					value = local.val,
+					propName = local.propName,
+					propertyInfo = arguments.propertyInfo
+				));
+			}
+			ArrayAppend(local.sql, ")");
+		}
+
+		return local.sql;
+	}
+
+	/**
+	 * Generates database-specific UPSERT SQL as an array compatible with `$querySetup()`.
+	 * Base implementation throws an error — each adapter must override with its own syntax.
+	 *
+	 * @tableName The quoted table name.
+	 * @columns Array of column names to insert/update.
+	 * @uniqueBy Array of column names forming the unique constraint.
+	 * @updateColumns Array of column names to update on conflict.
+	 * @validProperties Array of model property names corresponding to `columns`.
+	 * @records Array of record structs.
+	 * @batchStart Starting index in the records array.
+	 * @batchEnd Ending index in the records array.
+	 * @propertyInfo Struct of model property metadata.
+	 */
+	public array function $upsertSQL(
+		required string tableName,
+		required array columns,
+		required array uniqueBy,
+		required array updateColumns,
+		required array validProperties,
+		required array records,
+		required numeric batchStart,
+		required numeric batchEnd,
+		required struct propertyInfo
+	) {
+		Throw(
+			type = "Wheels.UpsertNotSupported",
+			message = "Upsert is not supported by this database adapter.",
+			extendedInfo = "Override `$upsertSQL()` in the specific database adapter to enable upsert support."
+		);
+	}
+
+	/**
+	 * Builds parameter struct for a single value in a bulk operation.
+	 * Used by adapter bulk insert and upsert implementations.
+	 */
+	public struct function $buildBulkParam(
+		required string value,
+		required string propName,
+		required struct propertyInfo
+	) {
+		local.propInfo = arguments.propertyInfo[arguments.propName];
+		return {
+			value: arguments.value,
+			type: local.propInfo.type,
+			dataType: local.propInfo.dataType,
+			scale: local.propInfo.scale,
+			null: (!Len(arguments.value) && local.propInfo.nullable)
+		};
+	}
 
 }

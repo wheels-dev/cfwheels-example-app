@@ -28,20 +28,39 @@ component extends="Base" {
 	/**
 	 * Adds a primary key definition to the table. this method also allows for multiple primary keys.
 	 *
+	 * Accepts `columnName` / `columnNames` as aliases for `name` (per #2803) so the
+	 * PK helper matches the argument-naming convention every other column helper
+	 * in this file uses. The legacy `name` parameter keeps working — it is still
+	 * what the body reads and what `init()` passes when adding the conventional
+	 * `id` primary key.
+	 *
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
+	 *
+	 * @name Legacy parameter for the primary-key column name. New code should prefer `columnName`.
+	 * @columnName Modern singular alias for `name` (matches sibling column helpers).
+	 * @columnNames Modern plural alias for `name`. Accepted for muscle-memory parity with `t.integer(columnNames=...)` etc. NOTE: unlike sibling helpers, this does NOT accept a comma-separated list — `primaryKey()` always creates one PK column, so `columnNames="a,b"` produces a single column literally named `a,b` (not two PKs). For composite PKs call `t.primaryKey()` multiple times.
 	 */
 	public any function primaryKey(
-		required string name,
+		string name,
+		string columnName,
+		string columnNames,
 		string type = "integer",
 		boolean autoIncrement = "false",
 		numeric limit,
 		numeric precision,
 		numeric scale,
 		string references,
+		string referenceColumn = "id",
 		string onUpdate = "",
 		string onDelete = ""
 	) {
+		// Accept columnName / columnNames as aliases for name (#2803). Precedence
+		// (per $combineArguments semantics): the later call wins, so when both
+		// columnName and columnNames are supplied, columnNames takes priority —
+		// matching addReference() / dropReference() in Migration.cfc.
+		$combineArguments(args = arguments, combine = "name,columnName", required = false);
+		$combineArguments(args = arguments, combine = "name,columnNames", required = true);
 		arguments.allowNull = false;
 		arguments.adapter = this.adapter;
 
@@ -60,7 +79,7 @@ component extends="Base" {
 				table = this.name,
 				referenceTable = local.referenceTable,
 				column = arguments.name,
-				referenceColumn = "id",
+				referenceColumn = arguments.referenceColumn,
 				onUpdate = arguments.onUpdate,
 				onDelete = arguments.onDelete
 			);
@@ -78,7 +97,7 @@ component extends="Base" {
 	public any function column(
 		required string columnName,
 		required string columnType,
-		string default,
+		default,
 		boolean allowNull,
 		any limit,
 		numeric precision,
@@ -106,21 +125,32 @@ component extends="Base" {
 	}
 
 	/**
+	 * Shared implementation for the typed column helpers below: resolves the
+	 * columnNames/columnName alias, stamps the column type, and adds one column
+	 * per (comma-delimited) name. `args` is the caller's arguments scope, so
+	 * type-specific options (limit, default, allowNull, precision, scale, size)
+	 * pass straight through to column().
+	 */
+	private any function $addTypedColumns(required string columnType, required struct args) {
+		$combineArguments(args = arguments.args, combine = "columnNames,columnName", required = true);
+		arguments.args.columnType = arguments.columnType;
+		local.columnNamesArray = ListToArray(arguments.args.columnNames);
+		local.iEnd = ArrayLen(local.columnNamesArray);
+		for (local.i = 1; local.i <= local.iEnd; local.i++) {
+			arguments.args.columnName = Trim(local.columnNamesArray[local.i]);
+			column(argumentCollection = arguments.args);
+		}
+		return this;
+	}
+
+	/**
 	 * Adds integer columns to table definition.
 	 *
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function bigInteger(string columnNames, numeric limit, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "biginteger";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function bigInteger(string columnNames, numeric limit, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "biginteger", args = arguments);
 	}
 
 	/**
@@ -129,16 +159,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function binary(string columnNames, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "binary";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function binary(string columnNames, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "binary", args = arguments);
 	}
 
 	/**
@@ -147,16 +169,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function boolean(string columnNames, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "boolean";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function boolean(string columnNames, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "boolean", args = arguments);
 	}
 
 	/**
@@ -165,16 +179,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function date(string columnNames, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "date";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function date(string columnNames, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "date", args = arguments);
 	}
 
 	/**
@@ -183,16 +189,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function datetime(string columnNames, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "datetime";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function datetime(string columnNames, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "datetime", args = arguments);
 	}
 
 	/**
@@ -201,16 +199,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function decimal(string columnNames, string default, boolean allowNull, numeric precision, numeric scale) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "decimal";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function decimal(string columnNames, default, boolean allowNull, numeric precision, numeric scale) {
+		return $addTypedColumns(columnType = "decimal", args = arguments);
 	}
 
 	/**
@@ -219,16 +209,12 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function float(string columnNames, string default = "", boolean allowNull = "true") {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "float";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function float(string columnNames, default = "", boolean allowNull = "true") {
+		// NOTE: the default=""/allowNull="true" parameter defaults are a
+		// long-standing outlier among these helpers — preserved as-is for
+		// backward compatibility (addColumnOptions renders default="" as
+		// DEFAULT NULL).
+		return $addTypedColumns(columnType = "float", args = arguments);
 	}
 
 	/**
@@ -237,16 +223,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function integer(string columnNames, numeric limit, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "integer";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function integer(string columnNames, numeric limit, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "integer", args = arguments);
 	}
 
 	/**
@@ -255,16 +233,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function string(string columnNames, any limit, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "string";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function string(string columnNames, any limit, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "string", args = arguments);
 	}
 
 	/**
@@ -273,16 +243,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function char(string columnNames, any limit, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "char";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function char(string columnNames, any limit, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "char", args = arguments);
 	}
 
 	/**
@@ -298,16 +260,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function text(string columnNames, string default, boolean allowNull, string size) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "text";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function text(string columnNames, default, boolean allowNull, string size) {
+		return $addTypedColumns(columnType = "text", args = arguments);
 	}
 
 	/**
@@ -316,16 +270,11 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function uniqueidentifier(string columnNames, string default = "newid()", boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "uniqueidentifier";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function uniqueidentifier(string columnNames, default = "newid()", boolean allowNull) {
+		// NOTE: the default="newid()" parameter default is MSSQL syntax — this
+		// helper is only registered by the MicrosoftSQLServer adapter, so the
+		// outlier default is preserved as-is.
+		return $addTypedColumns(columnType = "uniqueidentifier", args = arguments);
 	}
 
 	/**
@@ -334,16 +283,8 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function time(string columnNames, string default, boolean allowNull) {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		arguments.columnType = "time";
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function time(string columnNames, default, boolean allowNull) {
+		return $addTypedColumns(columnType = "time", args = arguments);
 	}
 
 	/**
@@ -352,15 +293,10 @@ component extends="Base" {
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
 	 */
-	public any function timestamp(string columnNames, string default, boolean allowNull, string columnType = "datetime") {
-		$combineArguments(args = arguments, combine = "columnNames,columnName", required = true);
-		local.columnNamesArray = ListToArray(arguments.columnNames);
-		local.iEnd = ArrayLen(local.columnNamesArray);
-		for (local.i = 1; local.i <= local.iEnd; local.i++) {
-			arguments.columnName = Trim(local.columnNamesArray[local.i]);
-			column(argumentCollection = arguments);
-		}
-		return this;
+	public any function timestamp(string columnNames, default, boolean allowNull, string columnType = "datetime") {
+		// columnType is caller-overridable here (defaults to "datetime") —
+		// unlike the sibling helpers, which stamp a fixed type.
+		return $addTypedColumns(columnType = arguments.columnType, args = arguments);
 	}
 
 	/**
@@ -376,20 +312,45 @@ component extends="Base" {
 	}
 
 	/**
-	 * adds integer reference columns to table definition and creates foreign key constraints
+	 * Adds integer reference columns to the table definition and (unless
+	 * `foreignKey=false` or `polymorphic=true`) registers a matching foreign-key
+	 * constraint. The column suffix depends on the `useUnderscoreReferenceColumns`
+	 * setting: `false` (framework default) → `<name>id`; `true` (default for
+	 * apps generated by `wheels new`) → `<name>_id`, matching Wheels model
+	 * `belongsTo` defaults. With `polymorphic=true`, a `<name>type` / `<name>_type`
+	 * companion column is added and no FK is registered.
+	 *
+	 * Accepts `columnNames` as an alias for `referenceNames` (per #2781) — both
+	 * are list-shaped (single name or comma-delimited). New code should use
+	 * `columnNames` for consistency with every other column helper here.
 	 *
 	 * [section: Migrator]
 	 * [category: Table Definition Functions]
+	 *
+	 * @referenceNames Comma-delimited list of reference base names (e.g. `"user,role"`). Each produces a `<name>_id` (or `<name>id`) column. Legacy parameter — `columnNames` is the modern alias.
+	 * @columnNames Modern alias for `referenceNames`. Pass one or the other — not both.
+	 * @default Default value for the generated integer column(s).
+	 * @allowNull If true, the generated column(s) allow NULL.
+	 * @polymorphic If true, also creates a `<name>type` / `<name>_type` companion column and skips the foreign-key constraint.
+	 * @foreignKey If true (default), registers a foreign key on the generated column. Ignored when `polymorphic=true`.
+	 * @onUpdate Foreign-key ON UPDATE clause. Engine-specific values; common: `"cascade"`, `"null"`, `"none"`.
+	 * @onDelete Foreign-key ON DELETE clause. Same value set as `onUpdate`.
+	 * @referenceColumn Referenced PK column. Default remains `"id"` (public API — do not flip).
 	 */
 	public any function references(
-		required string referenceNames,
-		string default,
+		string referenceNames,
+		string columnNames,
+		default,
 		boolean allowNull = "false",
 		boolean polymorphic = "false",
 		boolean foreignKey = "true",
 		string onUpdate = "",
-		string onDelete = ""
+		string onDelete = "",
+		string referenceColumn = "id"
 	) {
+		$combineArguments(args = arguments, combine = "referenceNames,columnNames", required = true);
+		local.idSuffix = $get("useUnderscoreReferenceColumns") ? "_id" : "id";
+		local.typeSuffix = $get("useUnderscoreReferenceColumns") ? "_type" : "type";
 		local.referenceNamesArray = ListToArray(arguments.referenceNames);
 		local.iEnd = ArrayLen(local.referenceNamesArray);
 		for (local.i = 1; local.i <= local.iEnd; local.i++) {
@@ -403,9 +364,9 @@ component extends="Base" {
 			// default the column to an integer if not provided
 			if (!StructKeyExists(local.columnArgs, "columnType")) local.columnArgs.columnType = "integer";
 
-			column(columnName = local.referenceName & "id", argumentCollection = local.columnArgs);
+			column(columnName = local.referenceName & local.idSuffix, argumentCollection = local.columnArgs);
 
-			if (arguments.polymorphic) column(columnName = local.referenceName & "type", columnType = "string");
+			if (arguments.polymorphic) column(columnName = local.referenceName & local.typeSuffix, columnType = "string");
 
 			if (arguments.foreignKey && !arguments.polymorphic) {
 				local.referenceTable = pluralize(local.referenceName);
@@ -413,8 +374,8 @@ component extends="Base" {
 					adapter = this.adapter,
 					table = this.name,
 					referenceTable = local.referenceTable,
-					column = "#local.referenceName#id",
-					referenceColumn = "id",
+					column = "#local.referenceName##local.idSuffix#",
+					referenceColumn = arguments.referenceColumn,
 					onUpdate = arguments.onUpdate,
 					onDelete = arguments.onDelete
 				);
