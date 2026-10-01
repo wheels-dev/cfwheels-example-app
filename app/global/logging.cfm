@@ -21,7 +21,8 @@ public void function addLogLine(required string type, required string message, s
 			arguments.createdBy=getSession().user.properties.firstname & ' ' & getSession().user.properties.lastname;
 		}
 		arguments.ipaddress=getIPAddress();
-		local.newLogLine=model("auditlog").create(arguments);
+		local.newLogLine=model("auditlog").newEntry(arguments);
+		local.newLogLine.save();
 	}
 }
 

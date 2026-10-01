@@ -16,7 +16,7 @@ component extends="tests.RocketUnit.Test" {
 	}
 
 	function test_validation_passes(){
-		log = model("auditlog").new(params);
+		log = model("auditlog").newEntry(params);
 		assert("log.valid()");
 	}
 
@@ -27,7 +27,7 @@ component extends="tests.RocketUnit.Test" {
 
 	function test_data_simpleValue(){
 		params.data = "I am a string";
-		log = model("auditlog").new(params);
+		log = model("auditlog").newEntry(params);
 		r = log.properties();
 		assert("log.valid()");
 		assert("isJSON(r.data)");
@@ -35,7 +35,7 @@ component extends="tests.RocketUnit.Test" {
 
 	function test_data_array(){
 		params.data = ["one", "two", "three"];
-		log = model("auditlog").new(params);
+		log = model("auditlog").newEntry(params);
 		r = log.properties();
 		assert("log.valid()");
 		assert("isJSON(r.data)");
@@ -45,7 +45,7 @@ component extends="tests.RocketUnit.Test" {
 		params.data = {
 			"one" = "foo", "two" = "bar", "three" = "baz"
 		};
-		log = model("auditlog").new(params);
+		log = model("auditlog").newEntry(params);
 		r = log.properties();
 		assert("log.valid()");
 		assert("isJSON(r.data)");
