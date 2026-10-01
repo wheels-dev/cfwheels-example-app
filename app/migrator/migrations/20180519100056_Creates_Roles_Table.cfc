@@ -32,7 +32,7 @@ component extends="wheels.migrator.Migration" hint="Creates Roles Table" {
 		transaction {
 			try {
 				t = createTable(name='roles');
-				t.string(columnNames="name,description", default='', null=false );
+				t.string(columnNames="name,description", null=false );
 				t.create();
 			} catch (any e) {
 				local.exception = e;

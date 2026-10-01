@@ -33,12 +33,12 @@ component extends="wheels.migrator.Migration" hint="Creates User Table" {
 			try {
 				t = createTable(name='users');
 				// User properties
-				t.string(columnNames='firstname,lastname', default='', null=false, limit=50);
-				t.string(columnNames='email', default='', null=false, limit=255);
-				t.text(columnNames='adminNotes', default='', null=true);
+				t.string(columnNames='firstname,lastname', null=false, limit=50);
+				t.string(columnNames='email', null=false, limit=255);
+				t.text(columnNames='adminNotes', null=true);
 				// Password fields
-				t.string(columnNames='passwordHash', default='', null=true, limit=500);
-				t.string(columnNames='passwordResetToken,verificationToken', default='', null=true, limit=500);
+				t.string(columnNames='passwordHash', null=true, limit=500);
+				t.string(columnNames='passwordResetToken,verificationToken', null=true, limit=500);
 				t.boolean(columnNames='passwordChangeRequired,verified', default=false);
 				// Other useful timestamps
 				t.datetime(columnNames='passwordResetTokenAt,passwordResetAt,loggedinAt', default='', null=true);

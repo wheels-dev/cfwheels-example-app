@@ -32,8 +32,8 @@ component extends="wheels.migrator.Migration" hint="Creates Settings Table" {
 		transaction {
 			try {
 				t = createTable(name='settings');
-				t.string(columnNames="name,description,type", default='', null=true );
-				t.text(columnNames="options,value,docs", default='', null=true );
+				t.string(columnNames="name,description,type", null=true );
+				t.text(columnNames="options,value,docs", null=true );
 				t.boolean(columnNames="editable", default=true);
 				t.create();
 			} catch (any e) {

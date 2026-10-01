@@ -32,7 +32,7 @@ component extends="wheels.migrator.Migration" hint="Creates Permissions Table" {
 		transaction {
 			try {
 				t = createTable(name='permissions');
-				t.string(columnNames="name,description", default='', null=true);
+				t.string(columnNames="name,description", null=true);
 				t.string(columnNames="type", default='controller', null=false); // One of controller | named
 				t.create();
 			} catch (any e) {
