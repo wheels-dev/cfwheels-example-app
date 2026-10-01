@@ -1,13 +1,14 @@
 {
     "name":"exampleapp",
     "web":{
+        "webroot":"public",
         "http":{
             "host":"localhost",
             "port":60050
         },
         "rewrites":{
             "enable":true,
-            "config":"urlrewrite.xml"
+            "config":"public/urlrewrite.xml"
         }
     },
     "app":{

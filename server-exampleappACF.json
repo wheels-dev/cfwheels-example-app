@@ -1,16 +1,17 @@
 {
     "name":"exampleappACF",
     "web":{
+        "webroot":"public",
         "http":{
             "host":"localhost",
             "port":60051
         },
         "rewrites":{
             "enable":true,
-            "config":"urlrewrite.xml"
+            "config":"public/urlrewrite.xml"
         }
     },
     "app":{
-        "cfengine":"adobe@2016"
+        "cfengine":"adobe@2018"
     }
 }
