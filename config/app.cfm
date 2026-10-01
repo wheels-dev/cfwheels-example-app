@@ -36,12 +36,11 @@
 	this.setDomainCookies = false;
 	this.setClientCookies = true;
 
-	this.sessioncookie.httponly = true;
-	this.sessioncookie.encodedvalue = true;
-	// Set cookies to SSL Only
-	// Set this to true if you're Using SSL!
-	// Only set to false for easy local development
-	this.sessioncookie.secure = false;
+	// public/Application.cfc (Wheels 4.1 template) already sets this.sessionCookie
+	// to httpOnly, sameSite=lax, and secure whenever the request arrives over HTTPS
+	// (directly or via X-Forwarded-Proto) or WHEELS_ENV=production. Only add what
+	// the template doesn't; don't force secure=false here or HTTPS loses the flag.
+	this.sessionCookie.encodedValue = true;
 
 	// max lifespan of a running request
 	this.requestTimeout=createTimeSpan(0,0,0,50);
