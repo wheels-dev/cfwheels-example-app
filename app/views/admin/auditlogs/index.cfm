@@ -35,7 +35,7 @@
 				</cfloop>
 			</tbody>
 		</table>
-		#paginationLinks(route="logs")#
+		#paginationNav(route="logs")#
 	<cfelse>
 		<div class="alert alert-info">
 			<strong>Sorry</strong><br /> there are no Logs to display

@@ -71,7 +71,7 @@
 				</cfloop>
 			</tbody>
 		</table>
-		#paginationLinks(route="users", params="status=#params.status#&roleid=#params.roleid#&q=#params.q#")#
+		#paginationNav(route="users", params="status=#params.status#&roleid=#params.roleid#&q=#params.q#")#
 	<cfelse>
 		<div class="alert alert-info">
 			<strong>Sorry</strong><br /> there are no Users to display

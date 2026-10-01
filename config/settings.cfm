@@ -62,7 +62,9 @@
 	set(functionName="dateTimeSelect,dateSelect", prepend="<div class='form-group'>", append="</div>", timeSeparator="", minuteStep="5", secondStep="10", dateOrder="day,month,year", dateSeparator="", separator="");
 
 	// Pagination
-	set(functionName="paginationLinks", prepend="<ul class='pagination'>", append="</ul>", prependToPage="<li class='page-item'>", appendToPage="</li>", linkToCurrentPage=true, classForCurrent="page-link active", class="page-link", anchorDivider="<li class='disabled'><a href='##''>...</a></li>", encode="attributes");
+	// paginationNav() replaces the deprecated paginationLinks() in Wheels 4; viewStyle="bootstrap4"
+	// renders <nav><ul class="pagination"><li class="page-item">... without hand-built wrappers.
+	set(functionName="paginationNav", viewStyle="bootstrap4");
 
 	// Error Messagss
 	set(functionName="errorMessagesFor", class="alert alert-dismissable alert-danger");
