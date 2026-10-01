@@ -1,6 +1,8 @@
 /**
- * This is the parent test component that all your test components should extend.
- * Do not delete this file (the functions can be safely deleted though).
+ * Base for the legacy RocketUnit tests. wheels.Test is deprecated in Wheels 4 and removed in 5.0,
+ * so `wheels upgrade check` keeps flagging the extends below until every test is converted.
+ * Run these at /wheels/tests/app (add ?format=json for JSON). New tests are WheelsTest BDD specs
+ * under tests/specs/ (run with `wheels test` or /wheels/app/tests); see tests/specs/models/AuditlogSpec.cfc.
  */
 component extends="wheels.Test" {
 
