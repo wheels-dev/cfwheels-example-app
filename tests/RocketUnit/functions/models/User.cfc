@@ -1,4 +1,4 @@
-component extends="app.tests.Test" {
+component extends="tests.RocketUnit.Test" {
 
 	function setup(){
 		super.setup();
