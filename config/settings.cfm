@@ -19,6 +19,13 @@
 	// disables URL reloads entirely: Wheels 4 fails closed rather than allowing them.
 	set(reloadPassword=env("WHEELS_RELOAD_PASSWORD", ""));
 
+	// CSRF tokens live in the session (the Wheels default), so no cookie key is needed today.
+	// If csrfStore is ever switched to "cookie", the key must be stable across deploys:
+	// Wheels 4 auto-generates (and rotates) an empty key outside production and throws
+	// Wheels.Security.MissingCsrfKey in production. It is read from the environment.
+	set(csrfStore="session");
+	set(csrfCookieEncryptionSecretKey=env("WHEELS_CSRF_KEY", ""));
+
 	// Your Apps datasource name
 	set(dataSourceName="exampleApp");
 
