@@ -32,12 +32,10 @@
     ],
     "dependencies":{
         "wheels-core":"4.1.2",
-        "cfwheels-flashmessages-bootstrap":"^1.0.2",
         "cfwheels-authenticateThis":"^1.0.1"
     },
     "installPaths":{
         "wheels-core":"vendor/wheels/",
-        "cfwheels-flashmessages-bootstrap":"plugins/FlashMessagesBootstrap",
         "cfwheels-authenticateThis":"plugins/authenticateThis"
     },
     "scripts":{

@@ -183,4 +183,31 @@
       return "<img src='https://www.gravatar.com/avatar/#local.email#?s=#arguments.size#&amp;r=#rating#' class='#arguments.class#', alt='Users Gravatar' border='0' />";
     }
   }
+
+  /**
+  * Renders the Flash as dismissible Bootstrap 4 alerts.
+  * Overrides the framework's flashMessages(), and the original is still there as superFlashMessages().
+  * Replaces the legacy FlashMessagesBootstrap plugin; the layout keeps calling #flashMessages()#.
+  *
+  * [section: Application]
+  * [category: View Helpers]
+  */
+  public string function flashMessages() {
+    local.rv = superFlashMessages(argumentCollection=arguments);
+    if (!len(local.rv)) {
+      return local.rv;
+    }
+    // Drop the wrapping <div class="flash-messages"> and turn each <p> into an alert <div>.
+    local.rv = reReplace(local.rv, '^<div class="flash-messages">(.*)</div>$', '\1');
+    local.rv = replace(local.rv, '<p', '<div', 'all');
+    local.rv = replace(local.rv, '</p>', '</div>', 'all');
+    local.close = ' role="alert"><button type="button" class="close" data-dismiss="alert" aria-label="Close"><span aria-hidden="true">&times;</span></button>';
+    // success/info/warning/danger map 1:1; "error" becomes danger; any other key becomes info.
+    for (local.type in ["success", "info", "warning", "danger"]) {
+      local.rv = replace(local.rv, 'class="#local.type#-message">', 'class="alert alert-#local.type# alert-dismissible"' & local.close, 'all');
+    }
+    local.rv = replaceNoCase(local.rv, 'class="error-message">', 'class="alert alert-danger alert-dismissible"' & local.close, 'all');
+    local.rv = reReplace(local.rv, 'class="[^"]*-message">', 'class="alert alert-info alert-dismissible"' & local.close, 'all');
+    return local.rv;
+  }
 </cfscript>
