@@ -86,7 +86,7 @@
 			text="Send a new password to this user via Email; they will be forced to change it when they login",
 			class="bg-light mb-3",
 			style="max-width: 18rem;",
-			footer=buttonTo(route="resetUser", method="put", key=user.id, text="Reset Password", confirm="Are you sure you wish to reset this user's password?", inputClass="btn btn-warning btn-xs"),
+			footer=buttonTo(route="resetUser", method="put", key=user.id, text="Reset Password", dataConfirm="Are you sure you wish to reset this user's password?", inputClass="btn btn-warning btn-xs"),
 			close=true)#
 	</cfif>
 </div>
@@ -104,7 +104,7 @@
 			text="Disable this user via the Soft Delete system. The account is recoverable.",
 			class="bg-light mb-3",
 			style="max-width: 18rem;",
-			footer=buttonTo(route="User", method="delete", key=user.id, text="Disable", confirm="Are you sure you wish to disable this account?", inputClass="btn btn-danger btn-xs"),
+			footer=buttonTo(route="User", method="delete", key=user.id, text="Disable", dataConfirm="Are you sure you wish to disable this account?", inputClass="btn btn-danger btn-xs"),
 			close=true)#
 	</cfif>
 </div>

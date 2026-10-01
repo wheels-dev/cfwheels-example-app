@@ -1,3 +1,15 @@
+// Confirm dialogs for any element with a data-confirm attribute, e.g.
+// buttonTo(..., dataConfirm="Are you sure?") or linkTo(..., dataConfirm="...").
+// Replaces the legacy jsconfirm plugin (see the Wheels 4.1 guide "Overriding
+// Core Methods" > "Before you override: the data-* pass-through").
+document.addEventListener("click", function (e) {
+	var el = e.target.closest("[data-confirm]");
+	if (el && !confirm(el.dataset.confirm)) {
+		e.preventDefault();
+		e.stopImmediatePropagation();
+	}
+}, true);
+
 $(document).ready(function($) {
 
 	// Logging modals
